@@ -54,7 +54,7 @@ def get_devices(dirs):
             if resolved in resolved_devices:
                 continue
             caps = get_device_capability(device)
-            card_str = caps.card.decode(errors='ignore') if hasattr(caps, 'card') else ''
+            card_str = caps.card.decode(errors='ignore').strip('"\'') if hasattr(caps, 'card') else ''
             driver_str = str(caps.driver) if hasattr(caps, 'driver') else ''
             if 'ipu6' in card_str.lower() or 'ipu6' in driver_str.lower():
                 continue
@@ -2105,8 +2105,8 @@ class AnkerWorkCtrls:
         return self.ctrls
 
 class IntelNPUCtrl(BaseCtrl):
-    def __init__(self, text_id, name, type, tooltip, value=None, default=None, min=None, max=None, menu=None):
-        super().__init__(text_id, name, type, value=value, default=default, min=min, max=max, tooltip=tooltip, menu=menu)
+    def __init__(self, text_id, name, type, tooltip, value=None, default=None, min=None, max=None, step=None, menu=None, inactive=False, readonly=False):
+        super().__init__(text_id, name, type, value=value, default=default, min=min, max=max, step=step, tooltip=tooltip, menu=menu, inactive=inactive, readonly=readonly)
 
 class IntelNPUCtrls:
     def __init__(self, device, fd):
@@ -2118,7 +2118,9 @@ class IntelNPUCtrls:
     def supported(self):
         dev_str = self.device.path if hasattr(self.device, 'path') else str(self.device)
         dev_name = self.device.name if hasattr(self.device, 'name') else ""
-        return 'video72' in dev_str or 'Intel NPU' in dev_name
+        if 'video72' in dev_str or 'Intel NPU' in dev_name:
+            return True
+        return os.path.exists(self.config_path) or os.path.exists('/dev/video72')
 
     def load_config(self):
         default_cfg = {
