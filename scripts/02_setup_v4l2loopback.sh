@@ -24,37 +24,32 @@ if ! sudo -v; then
 fi
 
 # 2. Instalar utilitários essenciais
-echo -e "${YELLOW}--> Verificando pacotes utilitários do V4L2 e DKMS...${NC}"
+echo -e "${YELLOW}--> Verificando pacotes utilitários do V4L2...${NC}"
 sudo apt-get update -qq
-sudo apt-get install -y -qq v4l2loopback-utils v4l-utils dkms || true
+sudo apt-get install -y -qq v4l2loopback-utils v4l-utils || true
 
-# 3. Verificar/Instalar v4l2loopback no DKMS compatível com o kernel atual
-echo -e "${YELLOW}--> Verificando módulo de kernel v4l2loopback para $KERNEL_VER...${NC}"
+# 3. Verificar suporte do kernel ao módulo v4l2loopback
+echo -e "${YELLOW}--> Verificando suporte do kernel ao módulo v4l2loopback ($KERNEL_VER)...${NC}"
 
-needs_patch=false
+# Se o kernel já fornece o módulo v4l2loopback oficialmente pré-compilado (ex: linux-modules-7.0.*)
+if modinfo v4l2loopback >/dev/null 2>&1; then
+    echo -e "${GREEN}✓ Módulo v4l2loopback oficial já fornecido nativamente pelo pacote de módulos do kernel!${NC}"
+    
+    # Se o pacote v4l2loopback-dkms ficou em estado quebrado (half-configured) por tentativas anteriores, removê-lo
+    if dpkg -s v4l2loopback-dkms 2>/dev/null | grep -q "Status: install ok"; then
+        echo -e "${CYAN}Limpando pacote v4l2loopback-dkms redundante para usar o módulo oficial do kernel...${NC}"
+        sudo dkms remove -m v4l2loopback -v 0.12.7 --all 2>/dev/null || true
+        sudo dpkg --purge --force-all v4l2loopback-dkms 2>/dev/null || true
+    fi
+else
+    # Caso o kernel em uso não inclua o módulo nativo, compilar via DKMS
+    echo -e "${YELLOW}Módulo nativo não encontrado no kernel. Configurando via DKMS...${NC}"
+    sudo apt-get install -y -qq dkms || true
 
-# Tentar instalar pacote apt padrão se não instalado
-if ! dpkg -s v4l2loopback-dkms >/dev/null 2>&1; then
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq v4l2loopback-dkms || true
-fi
-
-# Verificar se o módulo está compilado e instalado no kernel atual
-if ! dkms status 2>/dev/null | grep -E "v4l2loopback.*installed.*${KERNEL_VER}" >/dev/null 2>&1; then
-    needs_patch=true
-fi
-
-if [ "$needs_patch" = true ]; then
-    echo -e "${YELLOW}Detectado kernel recente ($KERNEL_VER) ou falha na compilação do pacote padrão do apt.${NC}"
-    echo -e "${CYAN}--> Aplicando versão moderna e compatível do v4l2loopback no DKMS...${NC}"
-
-    # Limpar qualquer build com erro do dkms para a versão 0.12.7
-    sudo dkms remove -m v4l2loopback -v 0.12.7 --all 2>/dev/null || true
-
-    # Garantir que o diretório de fontes no sistema exista
+    # Garantir que os fontes compatíveis estejam em /usr/src/v4l2loopback-0.12.7
     TARGET_SRC="/usr/src/v4l2loopback-0.12.7"
     sudo mkdir -p "$TARGET_SRC"
 
-    # Copiar código compatível bundled no projeto
     if [ -d "$SOURCE_DIR" ] && [ -f "$SOURCE_DIR/v4l2loopback.c" ]; then
         echo -e "${GREEN}Utilizando fontes do v4l2loopback otimizadas do projeto...${NC}"
         sudo cp -a "$SOURCE_DIR"/* "$TARGET_SRC/"
@@ -66,16 +61,12 @@ if [ "$needs_patch" = true ]; then
         rm -rf "$TMP_CLONE"
     fi
 
-    # Ajustar dkms.conf para reportar a versão esperada pelo pacote .deb do apt
     sudo sed -i 's/PACKAGE_VERSION=".*"/PACKAGE_VERSION="0.12.7"/' "$TARGET_SRC/dkms.conf"
-
-    # Registrar, compilar e instalar módulo no DKMS para o kernel atual
+    sudo dkms remove -m v4l2loopback -v 0.12.7 --all 2>/dev/null || true
     sudo dkms add -m v4l2loopback -v 0.12.7 2>/dev/null || true
     echo -e "${YELLOW}Compilando v4l2loopback para o kernel $KERNEL_VER...${NC}"
     sudo dkms build -m v4l2loopback -v 0.12.7 -k "$KERNEL_VER"
     sudo dkms install -m v4l2loopback -v 0.12.7 -k "$KERNEL_VER" --force
-
-    # Sanear status do dpkg
     sudo dpkg --configure -a 2>/dev/null || true
 fi
 
