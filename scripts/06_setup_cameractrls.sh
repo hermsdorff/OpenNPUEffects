@@ -16,13 +16,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(dirname "$SCRIPT_DIR")"
 SRC_CAMERACTRLS="$BASE_DIR/src/cameractrls"
 
+TARGET_USER="${SUDO_USER:-$USER}"
+TARGET_HOME=$(eval echo "~$TARGET_USER")
+
 OPT_DIR="/opt/npu-effects"
 CAMERACTRLS_DIR="$OPT_DIR/cameractrls"
 GLOBAL_BIN="/usr/local/bin"
 GLOBAL_DESKTOP="/usr/share/applications"
 
 sudo mkdir -p "$CAMERACTRLS_DIR" "$GLOBAL_BIN" "$GLOBAL_DESKTOP"
-mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
+[ -d "$TARGET_HOME" ] && sudo -u "$TARGET_USER" mkdir -p "$TARGET_HOME/.local/bin" "$TARGET_HOME/.local/share/applications" 2>/dev/null || true
 
 # 1. Instalar dependências GTK do Cameractrls via apt
 echo -e "${YELLOW}--> Verificando dependências GTK/PyGObject...${NC}"
@@ -35,9 +38,9 @@ sudo apt-get install -y -qq \
 
 # 2. Obter base do Cameractrls (reaproveitar local ou clonar)
 if [ ! -f "$CAMERACTRLS_DIR/cameraview.py" ]; then
-    if [ -f "$HOME/.local/share/cameractrls/cameraview.py" ]; then
+    if [ -f "$TARGET_HOME/.local/share/cameractrls/cameraview.py" ]; then
         echo -e "${GREEN}Copiando base do Cameractrls de ~/.local/share para $CAMERACTRLS_DIR...${NC}"
-        sudo cp -r "$HOME/.local/share/cameractrls"/* "$CAMERACTRLS_DIR/"
+        sudo cp -r "$TARGET_HOME/.local/share/cameractrls"/* "$CAMERACTRLS_DIR/"
     else
         echo -e "${YELLOW}--> Baixando base do Cameractrls do repositório oficial...${NC}"
         TMP_CLONE=$(mktemp -d)
@@ -63,7 +66,7 @@ sudo chmod -R a+rX "$CAMERACTRLS_DIR"
 echo -e "${YELLOW}--> Configurando executável global no PATH ($GLOBAL_BIN/cameractrls)...${NC}"
 sudo cp -a "$SRC_CAMERACTRLS/cameractrls" "$GLOBAL_BIN/cameractrls"
 sudo chmod +x "$GLOBAL_BIN/cameractrls"
-ln -sf "$GLOBAL_BIN/cameractrls" "$HOME/.local/bin/cameractrls" 2>/dev/null || true
+[ -d "$TARGET_HOME" ] && sudo -u "$TARGET_USER" ln -sf "$GLOBAL_BIN/cameractrls" "$TARGET_HOME/.local/bin/cameractrls" 2>/dev/null || true
 
 # 5. Instalar atalho de aplicativo no menu global (.desktop) para todos os usuários
 echo -e "${YELLOW}--> Configurando atalho no menu de aplicativos global ($GLOBAL_DESKTOP)...${NC}"

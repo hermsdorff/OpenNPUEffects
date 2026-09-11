@@ -61,7 +61,7 @@ print(f'  Status da NPU: {npu_str}')
     # 3. Services Status
     echo -e "\n${BLUE}[Serviços de Segundo Plano]${NC}"
     for s in npu-webcam npu-audio; do
-        if systemctl --user is-active --quiet "$s"; then
+        if systemctl --user is-active --quiet "$s" 2>/dev/null; then
             echo -e "  $s: ${GREEN}Ativo (Executando)${NC}"
         else
             echo -e "  $s: ${YELLOW}Parado${NC}"

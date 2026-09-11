@@ -11,7 +11,7 @@ NC='\033[0m'
 clear || true
 echo -e "${CYAN}${BOLD}"
 echo "================================================================"
-echo "    🚀 INSTALADOR COMPLETO: INTEL NPU AI STUDIO (METEOR LAKE)   "
+echo "    🚀 INSTALADOR COMPLETO: OPEN NPU EFFECTS (METEOR LAKE)   "
 echo "        Webcam 1080p + Áudio de Estúdio + Cameractrls GUI       "
 echo "================================================================"
 echo -e "${NC}"
@@ -43,10 +43,13 @@ echo "================================================================"
 echo -e "${NC}"
 
 # Exibir status do painel NPU
-if [ -x "/usr/local/bin/npu-ctl" ]; then
+TARGET_USER="${SUDO_USER:-$USER}"
+TARGET_UID=$(id -u "$TARGET_USER" 2>/dev/null || echo "1000")
+
+if [ "$(id -u)" -eq 0 ] && [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+    sudo -u "$TARGET_USER" XDG_RUNTIME_DIR="/run/user/$TARGET_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$TARGET_UID/bus" /usr/local/bin/npu-ctl status 2>/dev/null || true
+elif [ -x "/usr/local/bin/npu-ctl" ]; then
     /usr/local/bin/npu-ctl status || true
-elif [ -x "$HOME/.local/bin/npu-ctl" ]; then
-    "$HOME/.local/bin/npu-ctl" status || true
 fi
 
 echo -e "\n${CYAN}Dica Multi-Usuário:${NC}"
