@@ -10,7 +10,7 @@ Este documento descreve detalhadamente o passo a passo técnico de como toda a i
 A pasta foi montada de forma modular e autocontida:
 
 ```
-npu-studio-linux/
+OpenNPUEffects/
 ├── install_all.sh                    # Script mestre de instalação completa (1 clique)
 ├── PASSO_A_PASSO.md                  # Este manual técnico passo a passo
 ├── GUIA_NPU_STUDIO.md                # Manual do usuário com catálogo de efeitos e comandos
@@ -56,8 +56,8 @@ npu-studio-linux/
 ### Opção A: Instalação Completa Automática (Recomendado)
 Para rodar todas as etapas em sequência com verificações automáticas:
 ```bash
-git clone https://github.com/seu-usuario/npu-studio-linux.git
-cd npu-studio-linux
+git clone https://github.com/hermsdorff/OpenNPUEffects.git
+cd OpenNPUEffects
 ./install_all.sh
 ```
 

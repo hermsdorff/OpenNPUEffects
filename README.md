@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🚀 Intel NPU Studio Effects for Linux
+# 🚀 Open NPU Effects for Linux
 
 **Hardware-Accelerated AI Webcam & Broadcast Audio Suite for Linux on Intel Core Ultra (Meteor Lake, Lunar Lake, Arrow Lake) NPUs**
 
@@ -26,7 +26,7 @@ Modern AI PCs powered by **Intel Core Ultra** laptops (Samsung Galaxy Book4 Ultr
 
 Under **Linux**, the NPU has traditionally remained 100% idle. Existing Linux background removal tools run on the CPU (burning 60–90% CPU, generating heat, and spinning fans) or consume battery on the GPU.
 
-**Intel NPU Studio Effects** brings full hardware offloading to the Linux desktop:
+**Open NPU Effects** brings full hardware offloading to the Linux desktop:
 - **1080p @ 30 FPS video pipeline** running on the NPU via OpenVINO (~18 ms inference latency).
 - **Sub-watt power efficiency** — zero CPU fan spikes during Google Meet, Zoom, Teams, Discord, or OBS calls.
 - **Broadcast vocal chain** powered by Intel PoCoNet deep noise suppression directly inside PipeWire.
@@ -76,8 +76,8 @@ Under **Linux**, the NPU has traditionally remained 100% idle. Existing Linux ba
 Clone the repository and run the automated installer:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/npu-studio-linux.git
-cd npu-studio-linux
+git clone https://github.com/hermsdorff/OpenNPUEffects.git
+cd OpenNPUEffects
 chmod +x install_all.sh
 ./install_all.sh
 ```
@@ -132,7 +132,7 @@ npu-ctl dereverb on 40              # Room echo cancellation
 ## 📁 Project Architecture
 
 ```
-npu-studio-linux/
+OpenNPUEffects/
 ├── install_all.sh                    # Master 1-click automated installer
 ├── README.md                         # Project documentation
 ├── GUIA_NPU_STUDIO.md                # Full user guide and effect catalogue (Portuguese)
