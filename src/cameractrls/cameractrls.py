@@ -54,11 +54,13 @@ def get_devices(dirs):
             if resolved in resolved_devices:
                 continue
             caps = get_device_capability(device)
-            if not(caps.device_caps & V4L2_CAP_VIDEO_CAPTURE):
-                continue
-            card_str = caps.card.decode(errors='ignore')
-            driver_str = str(caps.driver)
+            card_str = caps.card.decode(errors='ignore') if hasattr(caps, 'card') else ''
+            driver_str = str(caps.driver) if hasattr(caps, 'driver') else ''
             if 'ipu6' in card_str.lower() or 'ipu6' in driver_str.lower():
+                continue
+            is_capture = bool(hasattr(caps, 'device_caps') and (caps.device_caps & V4L2_CAP_VIDEO_CAPTURE))
+            is_npu_vcam = ('video72' in resolved or 'video72' in device or 'Intel NPU' in card_str)
+            if not is_capture and not is_npu_vcam:
                 continue
             name = f'{card_str} ({resolved})'
             devices.append(Device(name, device, resolved, driver_str))

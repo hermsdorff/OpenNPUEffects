@@ -24,7 +24,8 @@ logging.basicConfig(
 )
 
 CONFIG_PATH = Path.home() / ".config/npu-effects/config.json"
-MODEL_DIR = Path.home() / ".local/share/npu-effects/models/video"
+OPT_MODEL_DIR = Path("/opt/npu-effects/models/video")
+MODEL_DIR = OPT_MODEL_DIR if OPT_MODEL_DIR.exists() else Path.home() / ".local/share/npu-effects/models/video"
 SEG_MULTICLASS_PATH = MODEL_DIR / "selfie_multiclass.xml"
 SEG_MODEL_PATH = MODEL_DIR / "selfie_segmentation_static.xml"
 YUNET_MODEL_PATH = MODEL_DIR / "face_detection_yunet_2023mar.onnx"
