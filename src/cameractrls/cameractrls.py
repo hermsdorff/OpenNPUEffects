@@ -56,8 +56,12 @@ def get_devices(dirs):
             caps = get_device_capability(device)
             if not(caps.device_caps & V4L2_CAP_VIDEO_CAPTURE):
                 continue
-            name = f'{caps.card.decode()} ({resolved})'
-            devices.append(Device(name, device, resolved, str(caps.driver)))
+            card_str = caps.card.decode(errors='ignore')
+            driver_str = str(caps.driver)
+            if 'ipu6' in card_str.lower() or 'ipu6' in driver_str.lower():
+                continue
+            name = f'{card_str} ({resolved})'
+            devices.append(Device(name, device, resolved, driver_str))
             resolved_devices.append(resolved)
     devices.sort()
     return devices
