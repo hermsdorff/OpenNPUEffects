@@ -127,6 +127,15 @@ npu-ctl studio on | off             # Toggle full vocal broadcast DSP chain
 npu-ctl dereverb on 40              # Room echo cancellation
 ```
 
+### 4. Uninstallation
+To cleanly stop background daemons and remove Open NPU Effects:
+```bash
+./uninstall.sh
+
+# Or for a full purge (including ~/.config/npu-effects and kernel module settings):
+./uninstall.sh --purge
+```
+
 ---
 
 ## 📁 Project Architecture
@@ -134,6 +143,7 @@ npu-ctl dereverb on 40              # Room echo cancellation
 ```
 OpenNPUEffects/
 ├── install_all.sh                    # Master 1-click automated installer
+├── uninstall.sh                      # Clean automated uninstaller
 ├── README.md                         # Project documentation
 ├── GUIA_NPU_STUDIO.md                # Full user guide and effect catalogue (Portuguese)
 ├── PASSO_A_PASSO.md                  # Technical architecture walkthrough

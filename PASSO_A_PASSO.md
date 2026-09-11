@@ -12,6 +12,7 @@ A pasta foi montada de forma modular e autocontida:
 ```
 OpenNPUEffects/
 ├── install_all.sh                    # Script mestre de instalação completa (1 clique)
+├── uninstall.sh                      # Script mestre de desinstalação e limpeza
 ├── PASSO_A_PASSO.md                  # Este manual técnico passo a passo
 ├── GUIA_NPU_STUDIO.md                # Manual do usuário com catálogo de efeitos e comandos
 ├── scripts/
@@ -276,6 +277,20 @@ npu-ctl mic-source
   ```bash
   npu-ctl cam-source notebook
   ```
+
+---
+
+## 🗑️ 6. Como Desinstalar o Open NPU Effects (`uninstall.sh`)
+
+Para remover a suíte, parar os serviços e restaurar o sistema:
+
+```bash
+# Desinstalação padrão (remove serviços, /opt/npu-effects e atalhos, preservando configs):
+./uninstall.sh
+
+# Desinstalação completa com expurgo (remove também ~/.config/npu-effects e regras de kernel):
+./uninstall.sh --purge
+```
 
 ---
 
