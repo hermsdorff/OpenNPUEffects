@@ -1,0 +1,16 @@
+[Unit]
+Description=Intel NPU AI ClearVoice Audio Noise Suppression
+After=pipewire.service wireplumber.service sound.target
+Wants=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=/opt/npu-effects/venv/bin/python3 /opt/npu-effects/bin/npu_audio_daemon.py
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

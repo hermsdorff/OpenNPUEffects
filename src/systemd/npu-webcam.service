@@ -1,0 +1,15 @@
+[Unit]
+Description=Intel NPU AI Webcam Effects (Blur & Auto-Framing)
+After=default.target sound.target
+
+[Service]
+Type=simple
+ExecStart=/opt/npu-effects/venv/bin/python3 /opt/npu-effects/bin/npu_webcam_daemon.py
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

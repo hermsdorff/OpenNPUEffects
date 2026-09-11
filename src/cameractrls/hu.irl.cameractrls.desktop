@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Cameractrls
+Comment=Camera controls for Linux (with Intel NPU AI Effects)
+Exec=/usr/local/bin/cameractrls
+Icon=hu.irl.cameractrls
+Terminal=false
+Categories=Settings;AudioVideo;Video;Office;Utility;GNOME;GTK;
+Keywords=picture;photos;camera;webcam;npu;ai;

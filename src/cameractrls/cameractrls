@@ -1,0 +1,8 @@
+#!/bin/bash
+if [ -f "/opt/npu-effects/cameractrls/cameractrlsgtk.py" ]; then
+    exec /usr/bin/python3 /opt/npu-effects/cameractrls/cameractrlsgtk.py "$@"
+elif [ -f "$HOME/.local/share/cameractrls/cameractrlsgtk.py" ]; then
+    exec /usr/bin/python3 "$HOME/.local/share/cameractrls/cameractrlsgtk.py" "$@"
+else
+    exec /usr/bin/python3 -m cameractrls.cameractrlsgtk "$@"
+fi

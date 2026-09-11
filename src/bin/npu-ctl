@@ -1,0 +1,1635 @@
+#!/usr/bin/env bash
+#
+# npu-ctl: CLI control utility for Intel NPU Webcam and Audio effects
+#
+CONFIG_FILE="$HOME/.config/npu-effects/config.json"
+VENV_PYTHON="$HOME/.local/share/npu-effects/venv/bin/python3"
+
+# Colors
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+ensure_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        mkdir -p "$(dirname "$CONFIG_FILE")"
+        echo '{"video":{"enabled":true,"blur_enabled":true,"blur_strength":35,"auto_framing":true,"framing_smoothness":0.04,"framing_smoothness_int":4,"framing_deadzone":0.10,"smooth_enabled":true,"smooth_strength":50,"background_image":""},"audio":{"enabled":true,"noise_suppression":true}}' > "$CONFIG_FILE"
+    fi
+}
+
+cmd_status() {
+    echo -e "${CYAN}====================================================${NC}"
+    echo -e "${CYAN}        INTEL CORE ULTRA 9 - PAINEL NPU AI          ${NC}"
+    echo -e "${CYAN}====================================================${NC}"
+    
+    # 1. NPU Hardware Check
+    echo -e "\n${BLUE}[Hardware NPU]${NC}"
+    if [ -e "/dev/accel/accel0" ]; then
+        echo -e "  Dispositivo: ${GREEN}/dev/accel/accel0 (Presente)${NC}"
+    else
+        echo -e "  Dispositivo: ${RED}/dev/accel/accel0 (Ausente)${NC}"
+    fi
+
+    if [ -x "$VENV_PYTHON" ]; then
+        $VENV_PYTHON -c "
+import openvino as ov
+c = ov.Core()
+devs = c.available_devices
+npu_str = 'Disponível (Intel AI Boost)' if 'NPU' in devs else 'Indisponível'
+print(f'  OpenVINO Backend: {devs}')
+print(f'  Status da NPU: {npu_str}')
+" 2>/dev/null
+    fi
+
+    # 2. Virtual Devices
+    echo -e "\n${BLUE}[Dispositivos Virtuais]${NC}"
+    if [ -e "/dev/video72" ]; then
+        echo -e "  Câmera Virtual: ${GREEN}/dev/video72 (Intel NPU Enhanced Webcam - 1080p)${NC}"
+    else
+        echo -e "  Câmera Virtual: ${RED}/dev/video72 (Não carregado)${NC}"
+    fi
+
+    if pactl list sources short 2>/dev/null | grep -q "npu_clearvoice"; then
+        echo -e "  Microfone Virtual: ${GREEN}npu_clearvoice (Ativo no PipeWire)${NC}"
+    else
+        echo -e "  Microfone Virtual: ${YELLOW}npu_clearvoice (Inativo)${NC}"
+    fi
+
+    # 3. Services Status
+    echo -e "\n${BLUE}[Serviços de Segundo Plano]${NC}"
+    for s in npu-webcam npu-audio; do
+        if systemctl --user is-active --quiet "$s"; then
+            echo -e "  $s: ${GREEN}Ativo (Executando)${NC}"
+        else
+            echo -e "  $s: ${YELLOW}Parado${NC}"
+        fi
+    done
+
+    # 4. Current Configuration
+    echo -e "\n${BLUE}[Configurações Atuais (~/.config/npu-effects/config.json)]${NC}"
+    if [ -f "$CONFIG_FILE" ]; then
+        $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE') as f:
+    cfg = json.load(f)
+v = cfg.get('video', {})
+a = cfg.get('audio', {})
+print(f'  Webcam Desfoque Fundo: {\"ATIVO\" if v.get(\"blur_enabled\") else \"DESATIVADO\"} (Modo: {v.get(\"blur_mode\", \"standard\").upper()}, Intensidade: {v.get(\"blur_strength\", 35)}, Borda: {v.get(\"mask_feather\", 40)}px)')
+print(f'  Webcam Auto-Framing:   {\"ATIVO\" if v.get(\"auto_framing\") else \"DESATIVADO\"} (Modo: {v.get(\"framing_mode\", \"single\").upper()}, Fluidez: {v.get(\"framing_smoothness_int\", 4)}/10, Zona Morta: {int(v.get(\"framing_deadzone\", 0.10) * 100)}%)')
+print(f'  Webcam Filtro Artístico: {v.get(\"artistic_filter\", \"off\").upper()} (Intensidade: {v.get(\"artistic_strength\", 70)})')
+print(f'  Webcam Cor Cinema:     {v.get(\"color_filter\", \"none\").upper()} (Intensidade: {v.get(\"color_strength\", 70)})')
+print(f'  Webcam Luz de Recorte: {\"ATIVO (\" + str(v.get(\"rim_light_color\", \"warm\")) + \", \" + str(v.get(\"rim_light_intensity\", 50)) + \"%)\" if v.get(\"rim_light_enabled\") else \"DESATIVADO\"}')
+print(f'  Webcam Reflexo de Tela:{\"ATIVO (\" + str(v.get(\"screen_glare_strength\", 50)) + \"%)\" if v.get(\"screen_glare_enabled\") else \"DESATIVADO\"}')
+print(f'  Webcam Parallax 3D:    {\"ATIVO (\" + str(v.get(\"parallax_strength\", 40)) + \"%)\" if v.get(\"parallax_enabled\") else \"DESATIVADO\"}')
+print(f'  Webcam Gestos Manuais: {\"ATIVO (\" + str(v.get(\"gesture_action\", \"all\")).upper() + \")\" if v.get(\"gesture_detection_enabled\", True) else \"DESATIVADO\"}')
+print(f'  Webcam Reter Objetos:  {\"ATIVO (\" + str(v.get(\"object_retention_strength\", 60)) + \"%)\" if v.get(\"object_retention_enabled\", True) else \"DESATIVADO\"}')
+print(f'  Webcam Reter Cadeira:  {\"ATIVO (Modelo Neural NPU - \" + str(v.get(\"chair_retention_strength\", 50)) + \"%)\" if v.get(\"chair_retention_enabled\", True) else \"DESATIVADO\"}')
+print(f'  Webcam Fade Ausência:  {\"ATIVO (Fade Suave)\" if v.get(\"privacy_fade_enabled\", True) else \"DESATIVADO (Corte Seco)\"}')
+print(f'  Webcam Suavização/Denoise: {\"ATIVO\" if v.get(\"smooth_enabled\") else \"DESATIVADO\"} (Nível: {v.get(\"smooth_strength\", 50)})')
+print(f'  Webcam Luz de Estúdio: {\"ATIVO\" if v.get(\"studio_light_enabled\") else \"DESATIVADO\"} (Ganho: {v.get(\"studio_light_gain\", 40)})')
+print(f'  Webcam Pouca Luz:      {\"ATIVO\" if v.get(\"low_light_enabled\") else \"DESATIVADO\"} (Ganho: {v.get(\"low_light_gain\", 45)})')
+print(f'  Webcam Nitidez/Sharpen:{\"ATIVO\" if v.get(\"sharpen_enabled\") else \"DESATIVADO\"} (Força: {v.get(\"sharpen_strength\", 35)})')
+print(f'  Webcam Contato Visual: {str(v.get(\"eye_contact_mode\", \"natural\" if v.get(\"eye_contact_enabled\") else \"off\")).upper()}')
+print(f'  Webcam Auto-Standby:   {\"ATIVO (Desliga ociosa)\" if v.get(\"auto_standby\", True) else \"DESATIVADO (Sempre ligada)\"}')
+print(f'  Webcam PTZ Park:       {\"ATIVO (Tilt: \" + str(v.get(\"standby_tilt_value\", -324000)) + \", Atraso: \" + str(v.get(\"standby_park_delay\", 1.0)) + \"s)\" if v.get(\"ptz_park_on_standby\", True) else \"DESATIVADO\"}')
+if v.get(\"standby_command\"):
+    print(f'  Standby Hook Cmd:      {v.get(\"standby_command\")}')
+if v.get(\"wakeup_command\"):
+    print(f'  Wakeup Hook Cmd:       {v.get(\"wakeup_command\")}')
+priv_img = v.get(\"privacy_image\", \"\")
+print(f'  Webcam Privacidade:    {\"ATIVO\" if v.get(\"privacy_enabled\") else \"DESATIVADO\"} (Imagem: {priv_img if priv_img else \"Tela gráfica padrão\"})')
+bg = v.get(\"background_image\", \"\")
+print(f'  Webcam Fundo Virtual:  {bg if bg else \"Nenhum (usando desfoque)\"}')
+print(f'  Áudio Cancelamento Ruído: {\"ATIVO (NPU PoCoNet)\" if a.get(\"noise_suppression\") else \"DESATIVADO\"}')
+print(f'  Áudio Pacote Estúdio:     {\"ATIVO\" if a.get(\"studio_mic_enabled\", True) else \"DESATIVADO\"}')
+print(f'  Áudio Low-Cut (80Hz):     {\"ATIVO\" if a.get(\"lowcut_enabled\", True) else \"DESATIVADO\"}')
+print(f'  Áudio EQ Presença Vocal:  {\"ATIVO\" if a.get(\"studio_eq_enabled\", True) else \"DESATIVADO\"}')
+print(f'  Áudio De-Esser (Sibil):   {\"ATIVO\" if a.get(\"deesser_enabled\", True) else \"DESATIVADO\"}')
+print(f'  Áudio Gate/VAD Silêncio:  {\"ATIVO (\" + str(a.get(\"gate_threshold_db\", -45.0)) + \" dB)\" if a.get(\"gate_enabled\", True) else \"DESATIVADO\"}')
+print(f'  Áudio Compressor/AGC:     {\"ATIVO (Alvo: \" + str(a.get(\"comp_target_db\", -18.0)) + \" dB)\" if a.get(\"compressor_enabled\", True) else \"DESATIVADO\"}')
+print(f'  Áudio Desreverberação:    {\"ATIVO (\" + str(a.get(\"dereverb_strength\", 40)) + \"%)\" if a.get(\"dereverb_enabled\", True) else \"DESATIVADO\"}')
+" 2>/dev/null
+    fi
+    echo -e "${CYAN}====================================================${NC}"
+}
+
+cmd_blur() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['video']['blur_enabled'] = True
+    print('Desfoque de fundo ATIVADO!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['blur_enabled'] = False
+    print('Desfoque de fundo DESATIVADO!')
+elif arg.isdigit():
+    val = max(5, min(99, int(arg)))
+    cfg['video']['blur_enabled'] = True
+    cfg['video']['blur_strength'] = val
+    print(f'Intensidade do desfoque ajustada para {val}!')
+else:
+    print('Uso: npu-ctl blur [on | off | <intensidade 5-99>]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_feather() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg.isdigit():
+    val = max(10, min(80, int(arg)))
+    cfg['video']['mask_feather'] = val
+    print(f'Faixa de transição da borda ajustada para {val}px!')
+else:
+    print('Uso: npu-ctl feather <largura 10-80px> (padrão: 40)')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_smooth() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['video']['smooth_enabled'] = True
+    print('Suavização / Remoção de ruído de imagem ATIVADA!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['smooth_enabled'] = False
+    print('Suavização / Remoção de ruído de imagem DESATIVADA!')
+elif arg.isdigit():
+    val = max(10, min(100, int(arg)))
+    cfg['video']['smooth_enabled'] = True
+    cfg['video']['smooth_strength'] = val
+    print(f'Nível de suavização/denoise ajustado para {val}!')
+else:
+    print('Uso: npu-ctl smooth [on | off | <nível 10-100>]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_framing() {
+    ensure_config
+    arg1="$1"
+    arg2="$2"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg1 = '$arg1'.lower()
+arg2 = '$arg2'.lower()
+
+if arg1 in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['video']['auto_framing'] = True
+    print('Auto-framing ATIVADO!')
+elif arg1 in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['auto_framing'] = False
+    print('Auto-framing DESATIVADO!')
+elif arg1 in ['smooth', 'fluidez', 'suavidade'] or (arg1.isdigit() and int(arg1) <= 10):
+    val = int(arg2) if arg1 in ['smooth', 'fluidez', 'suavidade'] and arg2.isdigit() else int(arg1)
+    val = max(1, min(10, val))
+    cfg['video']['auto_framing'] = True
+    cfg['video']['framing_smoothness_int'] = val
+    cfg['video']['framing_smoothness'] = round(val * 0.01, 3)
+    print(f'Fluidez do Auto-Framing ajustada para {val}/10 (smoothness={round(val * 0.01, 3)})!')
+elif arg1 in ['deadzone', 'zonamorta', 'zona']:
+    val = int(arg2) if arg2.isdigit() else 10
+    val = max(5, min(30, val))
+    cfg['video']['framing_deadzone'] = round(val / 100.0, 2)
+    print(f'Zona morta (deadzone) do Auto-Framing ajustada para {val}%!')
+else:
+    print('Uso: npu-ctl framing [on | off | smooth <1-10> | deadzone <5-30>]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_background() {
+    ensure_config
+    img_path="$1"
+    $VENV_PYTHON -c "
+import os, json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$img_path'
+if arg.lower() in ['none', 'off', 'remover', 'limpar', '']:
+    cfg['video']['background_image'] = ''
+    print('Fundo virtual removido. Voltando ao modo de desfoque!')
+else:
+    abs_path = os.path.abspath(os.path.expanduser(arg))
+    bg_dir = os.path.expanduser('~/.config/npu-effects/backgrounds')
+    pic_dir = os.path.expanduser('~/Pictures')
+    if not os.path.exists(abs_path):
+        if os.path.exists(os.path.join(bg_dir, arg)):
+            abs_path = os.path.join(bg_dir, arg)
+        elif os.path.exists(os.path.join(pic_dir, arg)):
+            abs_path = os.path.join(pic_dir, arg)
+        elif os.path.exists(os.path.join(pic_dir, os.path.basename(arg))):
+            abs_path = os.path.join(pic_dir, os.path.basename(arg))
+        elif os.path.exists(os.path.join(bg_dir, os.path.basename(arg))):
+            abs_path = os.path.join(bg_dir, os.path.basename(arg))
+
+    if os.path.exists(abs_path):
+        cfg['video']['background_image'] = abs_path
+        print(f'Fundo virtual definido para: {abs_path}')
+    else:
+        print(f'Erro: arquivo não encontrado: {abs_path}')
+        exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_studio() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['video']['studio_light_enabled'] = True
+    print('Luz de estúdio virtual ATIVADA!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['studio_light_enabled'] = False
+    print('Luz de estúdio virtual DESATIVADA!')
+elif arg.isdigit():
+    val = max(10, min(100, int(arg)))
+    cfg['video']['studio_light_enabled'] = True
+    cfg['video']['studio_light_gain'] = val
+    print(f'Intensidade da luz de estúdio ajustada para {val}!')
+else:
+    print('Uso: npu-ctl studio [on | off | <intensidade 10-100>]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_lowlight() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['video']['low_light_enabled'] = True
+    print('Modo pouca luz inteligente ATIVADO!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['low_light_enabled'] = False
+    print('Modo pouca luz inteligente DESATIVADO!')
+elif arg.isdigit():
+    val = max(10, min(100, int(arg)))
+    cfg['video']['low_light_enabled'] = True
+    cfg['video']['low_light_gain'] = val
+    print(f'Ganho de pouca luz ajustado para {val}!')
+else:
+    print('Uso: npu-ctl lowlight [on | off | <ganho 10-100>]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_sharpen() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['video']['sharpen_enabled'] = True
+    print('Super-resolução e realce de nitidez ATIVADOS!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['sharpen_enabled'] = False
+    print('Super-resolução e realce de nitidez DESATIVADOS!')
+elif arg.isdigit():
+    val = max(10, min(100, int(arg)))
+    cfg['video']['sharpen_enabled'] = True
+    cfg['video']['sharpen_strength'] = val
+    print(f'Intensidade de nitidez ajustada para {val}!')
+else:
+    print('Uso: npu-ctl sharpen [on | off | <nível 10-100>]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_blur_mode() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['portrait', 'retrato', 'depth', 'bokeh']:
+    cfg['video']['blur_mode'] = 'portrait_depth'
+    cfg['video']['blur_enabled'] = True
+    print('Modo de desfoque alterado para: RETRATO ÓPTICO (Profundidade / Bokeh)!')
+elif arg in ['standard', 'padrao', 'uniforme']:
+    cfg['video']['blur_mode'] = 'standard'
+    print('Modo de desfoque alterado para: PADRÃO (Uniforme)!')
+else:
+    print('Uso: npu-ctl blur-mode [standard | portrait]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_framing_mode() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['group', 'grupo', 'todos', 'all']:
+    cfg['video']['framing_mode'] = 'group'
+    cfg['video']['auto_framing'] = True
+    print('Modo de Auto-Framing alterado para: GRUPO (Todas as pessoas)!')
+elif arg in ['single', 'individual', 'um', 'pessoa']:
+    cfg['video']['framing_mode'] = 'single'
+    print('Modo de Auto-Framing alterado para: INDIVIDUAL (Pessoa principal)!')
+else:
+    print('Uso: npu-ctl framing-mode [single | group]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_artistic() {
+    ensure_config
+    arg1="$1"
+    arg2="$2"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg1 = '$arg1'.lower()
+arg2 = '$arg2'
+
+if arg1 in ['off', 'desativar', 'nao', '0']:
+    cfg['video']['artistic_filter'] = 'off'
+    print('Filtro artístico DESATIVADO!')
+elif arg1 in ['illustrated', 'ilustrado', 'hq', 'comic']:
+    cfg['video']['artistic_filter'] = 'illustrated'
+    print('Filtro artístico ILUSTRADO (HQ / Cel-Shading) ATIVADO!')
+elif arg1 in ['animated', 'animado', 'cartoon', 'anime']:
+    cfg['video']['artistic_filter'] = 'animated'
+    print('Filtro artístico ANIMADO (Cartoon / Anime) ATIVADO!')
+elif arg1 in ['watercolor', 'aquarela']:
+    cfg['video']['artistic_filter'] = 'watercolor'
+    print('Filtro artístico AQUARELA (Watercolor) ATIVADO!')
+else:
+    print('Uso: npu-ctl artistic [off | illustrated | animated | watercolor] [<intensidade 10-100>]')
+    exit(1)
+
+if arg2.isdigit():
+    val = max(10, min(100, int(arg2)))
+    cfg['video']['artistic_strength'] = val
+    print(f'Intensidade artística ajustada para {val}!')
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_color() {
+    ensure_config
+    arg1="$1"
+    arg2="$2"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg1 = '$arg1'.lower()
+arg2 = '$arg2'
+
+if arg1 in ['none', 'nenhum', 'off', 'desativar']:
+    cfg['video']['color_filter'] = 'none'
+    print('Filtro de cor cinematográfico DESATIVADO!')
+elif arg1 in ['teal_orange', 'teal', 'cinema']:
+    cfg['video']['color_filter'] = 'teal_orange'
+    print('Filtro de cor TEAL & ORANGE (Cinema) ATIVADO!')
+elif arg1 in ['warm_vintage', 'vintage', 'filme', 'warm']:
+    cfg['video']['color_filter'] = 'warm_vintage'
+    print('Filtro de cor VINTAGE AQUECIDO (Filme) ATIVADO!')
+elif arg1 in ['noir', 'pb', 'bw', 'pretoebranco']:
+    cfg['video']['color_filter'] = 'noir'
+    print('Filtro de cor NOIR (Preto & Branco) ATIVADO!')
+elif arg1 in ['vibrant', 'pop', 'vibrante']:
+    cfg['video']['color_filter'] = 'vibrant'
+    print('Filtro de cor VIBRANTE / POP ATIVADO!')
+else:
+    print('Uso: npu-ctl color [none | teal_orange | vintage | noir | vibrant] [<intensidade 10-100>]')
+    exit(1)
+
+if arg2.isdigit():
+    val = max(10, min(100, int(arg2)))
+    cfg['video']['color_strength'] = val
+    print(f'Intensidade da cor ajustada para {val}!')
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_rim() {
+    ensure_config
+    arg1="$1"
+    arg2="$2"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg1 = '$arg1'.lower()
+arg2 = '$arg2'.lower()
+
+if arg1 in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['video']['rim_light_enabled'] = True
+    print('Luz de recorte (Rim / Hair Light) ATIVADA!')
+elif arg1 in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['rim_light_enabled'] = False
+    print('Luz de recorte (Rim / Hair Light) DESATIVADA!')
+elif arg1.isdigit():
+    val = max(10, min(100, int(arg1)))
+    cfg['video']['rim_light_enabled'] = True
+    cfg['video']['rim_light_intensity'] = val
+    print(f'Intensidade da luz de recorte ajustada para {val}!')
+else:
+    print('Uso: npu-ctl rim [on | off | <intensidade 10-100>] [warm | white | cool]')
+    exit(1)
+
+if arg2 in ['warm', 'quente', 'ambar']:
+    cfg['video']['rim_light_color'] = 'warm'
+    print('Tonalidade da luz de recorte: ÂMBAR / QUENTE')
+elif arg2 in ['white', 'branco', 'neutro']:
+    cfg['video']['rim_light_color'] = 'white'
+    print('Tonalidade da luz de recorte: BRANCO NEUTRO')
+elif arg2 in ['cool', 'frio', 'azul', 'cyber']:
+    cfg['video']['rim_light_color'] = 'cool'
+    print('Tonalidade da luz de recorte: AZUL ESTÚDIO')
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_glare() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['video']['screen_glare_enabled'] = True
+    print('Supressão de reflexo de monitor ATIVADA!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['screen_glare_enabled'] = False
+    print('Supressão de reflexo de monitor DESATIVADA!')
+elif arg.isdigit():
+    val = max(10, min(100, int(arg)))
+    cfg['video']['screen_glare_enabled'] = True
+    cfg['video']['screen_glare_strength'] = val
+    print(f'Intensidade de supressão de reflexo ajustada para {val}!')
+else:
+    print('Uso: npu-ctl glare [on | off | <força 10-100>]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_parallax() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['video']['parallax_enabled'] = True
+    print('Efeito Parallax 3D no fundo virtual ATIVADO!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['parallax_enabled'] = False
+    print('Efeito Parallax 3D no fundo virtual DESATIVADO!')
+elif arg.isdigit():
+    val = max(10, min(100, int(arg)))
+    cfg['video']['parallax_enabled'] = True
+    cfg['video']['parallax_strength'] = val
+    print(f'Sensibilidade do Parallax 3D ajustada para {val}!')
+else:
+    print('Uso: npu-ctl parallax [on | off | <sensibilidade 10-100>]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_eyecontact() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['eye_contact_mode'] = 'off'
+    cfg['video']['eye_contact_enabled'] = False
+    print('Contato visual virtual DESATIVADO!')
+elif arg in ['teleprompter', 'leitura', 'alto']:
+    cfg['video']['eye_contact_mode'] = 'teleprompter'
+    cfg['video']['eye_contact_enabled'] = True
+    print('Contato visual modo TELEPROMPTER (Leitura / Elevado) ATIVADO!')
+elif arg in ['on', 'true', '1', 'ativar', 'sim', 'natural', '']:
+    cfg['video']['eye_contact_mode'] = 'natural'
+    cfg['video']['eye_contact_enabled'] = True
+    print('Contato visual modo NATURAL (Sutil) ATIVADO!')
+else:
+    print('Uso: npu-ctl eyecontact [off | natural | teleprompter]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_gesture() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim', '']:
+    cfg['video']['gesture_detection_enabled'] = True
+    print('Reconhecimento de gestos manuais ATIVADO!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['gesture_detection_enabled'] = False
+    print('Reconhecimento de gestos manuais DESATIVADO!')
+elif arg in ['reaction', 'reacao', 'visual', 'emoji']:
+    cfg['video']['gesture_detection_enabled'] = True
+    cfg['video']['gesture_action'] = 'reaction'
+    print('Ação de gestos: REAÇÕES VISUAIS NA TELA (👍, ✌️, 🖐️)!')
+elif arg in ['mute', 'mudo', 'microfone']:
+    cfg['video']['gesture_detection_enabled'] = True
+    cfg['video']['gesture_action'] = 'mute_toggle'
+    print('Ação de gestos: GATILHO DE MUDO COM MÃO ABERTA (🖐️)!')
+elif arg in ['all', 'todos', 'completo']:
+    cfg['video']['gesture_detection_enabled'] = True
+    cfg['video']['gesture_action'] = 'all'
+    print('Ação de gestos: REAÇÕES VISUAIS + GATILHO DE MUDO!')
+else:
+    print('Uso: npu-ctl gesture [on | off | reaction | mute | all]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_objects() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim', '']:
+    cfg['video']['object_retention_enabled'] = True
+    print('Preservação de objetos segurados na mão ATIVADA!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['object_retention_enabled'] = False
+    print('Preservação de objetos segurados na mão DESATIVADA!')
+elif arg.isdigit():
+    val = max(10, min(100, int(arg)))
+    cfg['video']['object_retention_enabled'] = True
+    cfg['video']['object_retention_strength'] = val
+    print(f'Sensibilidade de retenção de objetos ajustada para {val}!')
+else:
+    print('Uso: npu-ctl objects [on | off | <sensibilidade 10-100>]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_chair() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim', '']:
+    cfg['video']['chair_retention_enabled'] = True
+    print('Preservação de cadeira com Modelo Neural IA ATIVADA!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['chair_retention_enabled'] = False
+    print('Preservação de cadeira com Modelo Neural IA DESATIVADA!')
+elif arg.isdigit():
+    val = max(10, min(100, int(arg)))
+    cfg['video']['chair_retention_enabled'] = True
+    cfg['video']['chair_retention_strength'] = val
+    print(f'Sensibilidade do modelo neural de cadeira ajustada para {val}%!')
+else:
+    print('Uso: npu-ctl chair [on | off | <sensibilidade 10-100>]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_privacy_fade() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim', '']:
+    cfg['video']['privacy_fade_enabled'] = True
+    print('Transição suave (Fade-in / Fade-out) da tela de ausência ATIVADA!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['privacy_fade_enabled'] = False
+    print('Transição suave da tela de ausência DESATIVADA (usando corte seco)!')
+else:
+    print('Uso: npu-ctl privacy-fade [on | off]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_privacy() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import os, json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.strip()
+arg_lower = arg.lower()
+
+if arg_lower in ['on', 'true', '1', 'ativar', 'sim', '']:
+    cfg['video']['privacy_enabled'] = True
+    print('Modo de privacidade por ausência ATIVADO!')
+elif arg_lower in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['privacy_enabled'] = False
+    print('Modo de privacidade por ausência DESATIVADO!')
+elif arg_lower in ['none', 'remover', 'limpar', 'padrao', 'default']:
+    cfg['video']['privacy_image'] = ''
+    print('Imagem de privacidade customizada removida. Usando tela padrão!')
+else:
+    abs_path = os.path.abspath(os.path.expanduser(arg))
+    bg_dir = os.path.expanduser('~/.config/npu-effects/backgrounds')
+    pic_dir = os.path.expanduser('~/Pictures')
+    if not os.path.exists(abs_path):
+        if os.path.exists(os.path.join(bg_dir, arg)):
+            abs_path = os.path.join(bg_dir, arg)
+        elif os.path.exists(os.path.join(pic_dir, arg)):
+            abs_path = os.path.join(pic_dir, arg)
+        elif os.path.exists(os.path.join(pic_dir, os.path.basename(arg))):
+            abs_path = os.path.join(pic_dir, os.path.basename(arg))
+        elif os.path.exists(os.path.join(bg_dir, os.path.basename(arg))):
+            abs_path = os.path.join(bg_dir, os.path.basename(arg))
+
+    if os.path.exists(abs_path):
+        cfg['video']['privacy_enabled'] = True
+        cfg['video']['privacy_image'] = abs_path
+        print(f'Modo de privacidade ATIVADO com imagem: {abs_path}')
+    else:
+        print(f'Erro: arquivo de imagem não encontrado: {abs_path}')
+        print('Uso: npu-ctl privacy [on | off | /caminho/para/imagem.jpg]')
+        exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_standby() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim', '']:
+    cfg['video']['auto_standby'] = True
+    print('Modo Standby On-Demand ATIVADO! (Sensor físico desliga quando ocioso)')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['auto_standby'] = False
+    print('Modo Standby On-Demand DESATIVADO! (Câmera física permanece sempre ligada)')
+else:
+    print('Uso: npu-ctl standby [on | off]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_ptz_park() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim', '']:
+    cfg['video']['ptz_park_on_standby'] = True
+    print('Recolhimento automático PTZ em Standby ATIVADO! (Tilt: -324000 ao fechar)')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['ptz_park_on_standby'] = False
+    print('Recolhimento automático PTZ em Standby DESATIVADO!')
+else:
+    print('Uso: npu-ctl ptz-park [on | off]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_ptz_tilt() {
+    ensure_config
+    standby_val="$1"
+    wakeup_val="$2"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+s_val = '$standby_val'
+w_val = '$wakeup_val'
+
+if s_val.lstrip('-').isdigit():
+    cfg['video']['standby_tilt_value'] = int(s_val)
+    cfg['video']['ptz_park_on_standby'] = True
+    print(f'Tilt de fechamento/standby configurado para: {int(s_val)}')
+if w_val.lstrip('-').isdigit():
+    cfg['video']['wakeup_tilt_value'] = int(w_val)
+    print(f'Tilt de reabertura/wakeup configurado para: {int(w_val)}')
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_ptz_delay() {
+    ensure_config
+    val="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+v = '$val'.strip()
+if not v:
+    cur = cfg.get('video', {}).get('standby_park_delay', 1.0)
+    print(f'Atraso atual antes do recolhimento PTZ: {cur}s (câmera desliga primeiro)')
+    exit(0)
+
+try:
+    d = float(v)
+    if d < 0:
+        d = 0.0
+    cfg['video']['standby_park_delay'] = d
+    print(f'Atraso pré-parking PTZ configurado para: {d}s (câmera desliga primeiro, aguarda {d}s e recolhe)')
+    with open('$CONFIG_FILE', 'w') as f:
+        json.dump(cfg, f, indent=2)
+except Exception as e:
+    print('Uso: npu-ctl ptz-delay [segundos, ex: 1.0]')
+    exit(1)
+"
+}
+
+cmd_standby_cmd() {
+    ensure_config
+    cmd_str="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+cfg['video']['standby_command'] = '''$cmd_str'''
+if '''$cmd_str''':
+    print(f'Comando customizado de Standby configurado: $cmd_str')
+else:
+    print('Comando customizado de Standby desativado/removido.')
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_wakeup_cmd() {
+    ensure_config
+    cmd_str="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+cfg['video']['wakeup_command'] = '''$cmd_str'''
+if '''$cmd_str''':
+    print(f'Comando customizado de Wakeup configurado: $cmd_str')
+else:
+    print('Comando customizado de Wakeup desativado/removido.')
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_ptz_test() {
+    tilt_val="$1"
+    pan_val="$2"
+    dev="/dev/video1"
+    for l in /dev/v4l/by-id/*-video-index0; do
+        if [ -e "$l" ]; then
+            dev=$(realpath "$l")
+            break
+        fi
+    done
+    if [ -z "$tilt_val" ]; then
+        echo "Uso: npu-ctl ptz-test <tilt_valor> [pan_valor]"
+        echo "Exemplos:"
+        echo "  npu-ctl ptz-test -324000       # Inclina para baixo"
+        echo "  npu-ctl ptz-test 0             # Centraliza o tilt (reto)"
+        echo "  npu-ctl ptz-test 324000        # Inclina para cima"
+        echo "  npu-ctl ptz-test -324000 540000 # Inclina para baixo e gira pan"
+        return
+    fi
+    if [ -n "$pan_val" ]; then
+        echo "Ajustando Pan para $pan_val em $dev..."
+        v4l2-ctl -d "$dev" --set-ctrl="pan_absolute=$pan_val"
+    fi
+    echo "Ajustando Tilt para $tilt_val em $dev..."
+    v4l2-ctl -d "$dev" --set-ctrl="tilt_absolute=$tilt_val"
+    echo "Comando PTZ executado!"
+}
+
+cmd_ptz_pan() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg.lstrip('-').isdigit():
+    val = int(arg)
+    cfg['video']['standby_pan_value'] = val
+    cfg['video']['wakeup_pan_value'] = 0
+    print(f'Pan de standby configurado para {val} (e retorno para 0 ao acordar)!')
+elif arg in ['none', 'null', 'off', 'desativar']:
+    cfg['video']['standby_pan_value'] = None
+    cfg['video']['wakeup_pan_value'] = None
+    print('Pan de standby desativado (mantem pan atual e usa apenas tilt).')
+else:
+    print('Uso: npu-ctl ptz-pan [<valor -540000 a 540000> | off]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_mic_listen() {
+    arg="${1:-on}"
+    case "$arg" in
+        on|start|ativar)
+            if pactl list modules short 2>/dev/null | grep -q "module-loopback.*npu_clearvoice"; then
+                echo -e "${YELLOW}Monitoramento de áudio (escuta ao vivo) já está ATIVADO!${NC}"
+                return
+            fi
+            echo -e "${CYAN}====================================================${NC}"
+            echo -e "${CYAN}        ESCUTA AO VIVO (MONITORAMENTO NPU)          ${NC}"
+            echo -e "${CYAN}====================================================${NC}"
+            echo -e "${BLUE}Conectando 'npu_clearvoice' diretamente à sua saída de áudio...${NC}"
+            echo -e "${YELLOW}Atenção: Use fones de ouvido para evitar retorno de som (microfonia)!${NC}\n"
+            mod_id=$(pactl load-module module-loopback source=npu_clearvoice latency_msec=20 2>/dev/null)
+            if [ -n "$mod_id" ]; then
+                echo "$mod_id" > /tmp/.npu_loopback_id
+                echo -e "${GREEN}✓ Escuta ao vivo ATIVADA!${NC}"
+                echo -e "Fale, bata palmas, digite no teclado ou faça barulhos para ouvir a IA em tempo real."
+                echo -e "Para encerrar o monitoramento, digite: ${CYAN}npu-ctl mic-listen off${NC}"
+            else
+                echo -e "${RED}Falha ao iniciar o loopback de áudio.${NC}"
+            fi
+            ;;
+        off|stop|desativar)
+            echo "Desativando escuta ao vivo..."
+            if [ -f /tmp/.npu_loopback_id ]; then
+                id=$(cat /tmp/.npu_loopback_id)
+                pactl unload-module "$id" 2>/dev/null
+                rm -f /tmp/.npu_loopback_id
+            fi
+            for m in $(pactl list modules short 2>/dev/null | grep "module-loopback" | awk '{print $1}'); do
+                pactl unload-module "$m" 2>/dev/null
+            done
+            echo -e "${GREEN}✓ Escuta ao vivo DESATIVADA.${NC}"
+            ;;
+        *)
+            echo "Uso: npu-ctl mic-listen [on | off]"
+            ;;
+    esac
+}
+
+cmd_audio_test() {
+    dur="${1:-5}"
+    echo -e "${CYAN}====================================================${NC}"
+    echo -e "${CYAN}        TESTE DE GRAVAÇÃO E CANCELAMENTO NPU        ${NC}"
+    echo -e "${CYAN}====================================================${NC}"
+    echo -e "${BLUE}Gravando ${dur} segundos a partir do microfone limpo com IA ('npu_clearvoice')...${NC}"
+    echo -e "${YELLOW}Fale algo, bata palmas ou digite no teclado agora!${NC}"
+    
+    tmp_wav="/tmp/npu_test_recording.wav"
+    rm -f "$tmp_wav"
+    
+    timeout "${dur}" parecord -d npu_clearvoice --file-format=wav "$tmp_wav" 2>/dev/null
+    
+    if [ -f "$tmp_wav" ]; then
+        echo -e "\n${GREEN}✓ Gravação concluída! Reproduzindo áudio agora para você escutar:${NC}"
+        paplay "$tmp_wav" 2>/dev/null || aplay "$tmp_wav" 2>/dev/null
+        rm -f "$tmp_wav"
+        echo -e "\n${GREEN}Teste finalizado com sucesso!${NC}"
+    else
+        echo -e "${RED}Erro ao gravar áudio de teste. Verifique se o serviço npu-audio está ativo.${NC}"
+    fi
+}
+
+cmd_studio_mic() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['audio']['studio_mic_enabled'] = True
+    print('Pacote de Áudio Estúdio/Broadcast ATIVADO!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['audio']['studio_mic_enabled'] = False
+    print('Pacote de Áudio Estúdio/Broadcast DESATIVADO!')
+else:
+    print('Uso: npu-ctl studio-mic [on | off]')
+    exit(1)
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_mic_gate() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['audio']['gate_enabled'] = True
+    print('Portão de Ruído Inteligente (VAD - Silêncio nas Pausas) ATIVADO!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['audio']['gate_enabled'] = False
+    print('Portão de Ruído Inteligente (VAD) DESATIVADO!')
+elif arg.lstrip('-').replace('.', '', 1).isdigit():
+    val = float(arg)
+    val = max(-70.0, min(-20.0, -abs(val)))
+    cfg['audio']['gate_enabled'] = True
+    cfg['audio']['gate_threshold_db'] = val
+    print(f'Sensibilidade do Gate/VAD ajustada para {val} dB!')
+else:
+    print('Uso: npu-ctl mic-gate [on | off | <limiar em dB ex: -45>]')
+    exit(1)
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_mic_eq() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['audio']['studio_eq_enabled'] = True
+    print('Equalizador Vocal de Presença & Calor ATIVADO!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['audio']['studio_eq_enabled'] = False
+    print('Equalizador Vocal de Presença & Calor DESATIVADO!')
+else:
+    print('Uso: npu-ctl mic-eq [on | off]')
+    exit(1)
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_mic_deesser() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['audio']['deesser_enabled'] = True
+    print('De-Esser (Atenuação de Sibilâncias S/CH) ATIVADO!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['audio']['deesser_enabled'] = False
+    print('De-Esser (Atenuação de Sibilâncias S/CH) DESATIVADO!')
+else:
+    print('Uso: npu-ctl mic-deesser [on | off]')
+    exit(1)
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_mic_comp() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['audio']['compressor_enabled'] = True
+    print('Compressor Vocal e Auto Gain (AGC) ATIVADO!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['audio']['compressor_enabled'] = False
+    print('Compressor Vocal e Auto Gain (AGC) DESATIVADO!')
+elif arg.lstrip('-').replace('.', '', 1).isdigit():
+    val = float(arg)
+    val = max(-30.0, min(-10.0, -abs(val)))
+    cfg['audio']['compressor_enabled'] = True
+    cfg['audio']['comp_target_db'] = val
+    print(f'Nível alvo do Compressor/AGC ajustado para {val} dB!')
+else:
+    print('Uso: npu-ctl mic-comp [on | off | <alvo em dB ex: -18>]')
+    exit(1)
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_mic_dereverb() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['audio']['dereverb_enabled'] = True
+    print('Desreverberação de Sala (De-Reverb) ATIVADA!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['audio']['dereverb_enabled'] = False
+    print('Desreverberação de Sala (De-Reverb) DESATIVADA!')
+elif arg.isdigit():
+    val = max(10, min(100, int(arg)))
+    cfg['audio']['dereverb_enabled'] = True
+    cfg['audio']['dereverb_strength'] = val
+    print(f'Intensidade da Desreverberação ajustada para {val}%!')
+else:
+    print('Uso: npu-ctl mic-dereverb [on | off | <força 10-100>]')
+    exit(1)
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_mic_lowcut() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['audio']['lowcut_enabled'] = True
+    print('Filtro Low-Cut 80Hz (Corte de Ruído de Mesa/Vibrações) ATIVADO!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['audio']['lowcut_enabled'] = False
+    print('Filtro Low-Cut 80Hz DESATIVADO!')
+else:
+    print('Uso: npu-ctl mic-lowcut [on | off]')
+    exit(1)
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_mic_noise() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim']:
+    cfg['audio']['noise_suppression'] = True
+    print('Cancelamento de Ruído NPU (IA PoCoNet) ATIVADO!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['audio']['noise_suppression'] = False
+    print('Cancelamento de Ruído NPU DESATIVADO!')
+else:
+    print('Uso: npu-ctl mic-noise [on | off]')
+    exit(1)
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_cam_source() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import glob, json, os, subprocess
+from pathlib import Path
+
+CONFIG_FILE = '$CONFIG_FILE'
+with open(CONFIG_FILE, 'r') as f:
+    cfg = json.load(f)
+
+current_cam = cfg.get('video', {}).get('input_device', 'auto')
+
+# Discover cameras
+cameras = []
+by_id = Path('/dev/v4l/by-id')
+if by_id.exists():
+    for link in sorted(by_id.iterdir()):
+        if 'video-index0' in link.name:
+            try:
+                dev = str(link.resolve())
+                desc = link.name.split('-video-index0')[0].replace('usb-', '').replace('_', ' ')
+                cameras.append({'dev': dev, 'desc': desc, 'alias': 'pixy' if 'pixy' in desc.lower() else ''})
+            except Exception:
+                pass
+
+by_path = Path('/dev/v4l/by-path')
+if by_path.exists():
+    for link in sorted(by_path.iterdir()):
+        if 'video-index0' in link.name:
+            try:
+                dev = str(link.resolve())
+                if not any(c['dev'] == dev for c in cameras):
+                    name_file = Path(f'/sys/class/video4linux/{Path(dev).name}/name')
+                    name = name_file.read_text().strip() if name_file.exists() else Path(dev).name
+                    alias = 'notebook' if 'ipu6' in name.lower() else ''
+                    cameras.append({'dev': dev, 'desc': name, 'alias': alias})
+            except Exception:
+                pass
+
+for p in sorted(Path('/dev').glob('video*')):
+    num_str = p.name.replace('video', '')
+    if num_str.isdigit():
+        num = int(num_str)
+        if num in [70, 71, 72, 50]:
+            continue
+        dev_str = str(p)
+        if not any(c['dev'] == dev_str for c in cameras):
+            name_file = Path(f'/sys/class/video4linux/{p.name}/name')
+            name = name_file.read_text().strip() if name_file.exists() else p.name
+            if 'capture' in name.lower() or 'camera' in name.lower() or 'pixy' in name.lower() or num == 0:
+                if 'ipu6 isys capture' in name.lower() and num != 2:
+                    continue
+                cameras.append({'dev': dev_str, 'desc': name, 'alias': 'notebook' if 'ipu6' in name.lower() or num == 0 else ''})
+
+arg = '$arg'.strip()
+if not arg or arg in ['list', 'ls', 'status']:
+    print('\n\033[0;36m=== CÂMERAS FÍSICAS DISPONÍVEIS ===\033[0m')
+    for i, c in enumerate(cameras, 1):
+        is_active = (current_cam == c['dev']) or (current_cam == 'auto' and i == 1)
+        tag = ' \033[0;32m[ATIVA]\033[0m' if is_active else ''
+        alias_txt = f' (atalho: {c[\"alias\"]})' if c[\"alias\"] else ''
+        print(f'  [\033[1;33m{i}\033[0m] {c[\"dev\"]} - {c[\"desc\"]}{alias_txt}{tag}')
+    auto_tag = ' \033[0;32m[ATIVA]\033[0m' if current_cam == 'auto' else ''
+    print(f'  [\033[1;33mauto\033[0m] Detecção Automática{auto_tag}')
+    print('\nPara selecionar uma câmera:')
+    print('  npu-ctl cam-source <1, 2, ... | pixy | notebook | /dev/videoX | auto>')
+    exit(0)
+
+# Set camera
+chosen = None
+if arg.lower() == 'auto':
+    chosen = 'auto'
+elif arg.isdigit():
+    idx = int(arg) - 1
+    if 0 <= idx < len(cameras):
+        chosen = cameras[idx]['dev']
+elif arg.startswith('/dev/video'):
+    chosen = arg
+else:
+    for c in cameras:
+        if arg.lower() in c['alias'].lower() or arg.lower() in c['desc'].lower() or arg.lower() in c['dev'].lower():
+            chosen = c['dev']
+            break
+
+if chosen:
+    cfg['video']['input_device'] = chosen
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(cfg, f, indent=2)
+    print(f'\033[0;32m✓ Câmera de entrada NPU definida para: {chosen}!\033[0m')
+    print('Reiniciando serviço da webcam para aplicar a troca...')
+    subprocess.run(['systemctl', '--user', 'restart', 'npu-webcam.service'])
+    print('\033[0;32m✓ Webcam reiniciada e transmitindo a nova câmera em /dev/video72!\033[0m')
+else:
+    print(f'\033[0;31mCâmera \"{arg}\" não encontrada. Use \"npu-ctl cam-source\" para listar as disponíveis.\033[0m')
+    exit(1)
+"
+}
+
+cmd_mic_source() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json, os, subprocess
+
+CONFIG_FILE = '$CONFIG_FILE'
+with open(CONFIG_FILE, 'r') as f:
+    cfg = json.load(f)
+
+current_mic = cfg.get('audio', {}).get('input_device', 'auto')
+
+# Discover physical microphones from PipeWire
+out = subprocess.check_output('pactl list sources short', shell=True).decode(errors='ignore')
+mics = []
+for line in out.splitlines():
+    parts = line.split()
+    if len(parts) >= 2:
+        name = parts[1]
+        nl = name.lower()
+        if not (nl.startswith('npu') or 'clearvoice' in nl or '.monitor' in nl or 'null' in nl):
+            if 'pixy' in nl:
+                label = 'EMEET PIXY (Microfone da Câmera PTZ)'
+                alias = 'pixy'
+            elif 'generic_usb' in nl or 'usb2.0' in nl:
+                label = 'USB2.0 Device (Microfone USB Externo)'
+                alias = 'usb'
+            elif 'mic1' in nl:
+                label = 'Microfone Digital Interno (Samsung Galaxy Book)'
+                alias = 'notebook'
+            elif 'mic2' in nl:
+                label = 'Entrada P2/P3 Headset (Microfone de Fone)'
+                alias = 'fone'
+            else:
+                label = name
+                alias = ''
+            mics.append({'id': name, 'label': label, 'alias': alias})
+
+arg = '$arg'.strip()
+if not arg or arg in ['list', 'ls', 'status']:
+    print('\n\033[0;36m=== MICROFONES FÍSICOS DISPONÍVEIS ===\033[0m')
+    for i, m in enumerate(mics, 1):
+        is_active = (current_mic == m['id']) or (current_mic == 'auto' and i == 2)
+        tag = ' \033[0;32m[ATIVO]\033[0m' if is_active else ''
+        alias_txt = f' (atalho: {m[\"alias\"]})' if m[\"alias\"] else ''
+        print(f'  [\033[1;33m{i}\033[0m] {m[\"label\"]}{alias_txt}{tag}')
+        print(f'      ID: \033[0;34m{m[\"id\"]}\033[0m')
+    auto_tag = ' \033[0;32m[ATIVO]\033[0m' if current_mic == 'auto' else ''
+    print(f'  [\033[1;33mauto\033[0m] Detecção Automática (prioriza USB, depois interno){auto_tag}')
+    print('\nPara selecionar um microfone:')
+    print('  npu-ctl mic-source <1, 2, ... | pixy | usb | notebook | fone | auto>')
+    exit(0)
+
+# Set mic
+chosen = None
+if arg.lower() == 'auto':
+    chosen = 'auto'
+elif arg.isdigit():
+    idx = int(arg) - 1
+    if 0 <= idx < len(mics):
+        chosen = mics[idx]['id']
+else:
+    for m in mics:
+        if arg.lower() in m['alias'].lower() or arg.lower() in m['label'].lower() or arg.lower() in m['id'].lower():
+            chosen = m['id']
+            break
+
+if chosen:
+    cfg['audio']['input_device'] = chosen
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(cfg, f, indent=2)
+    print(f'\033[0;32m✓ Microfone de entrada NPU definido para: {chosen}!\033[0m')
+    print('Reiniciando serviço de áudio para aplicar a troca...')
+    subprocess.run(['systemctl', '--user', 'restart', 'npu-audio.service'])
+    print('\033[0;32m✓ Microfone reiniciado e transmitindo via npu_clearvoice!\033[0m')
+else:
+    print(f'\033[0;31mMicrofone \"{arg}\" não encontrado. Use \"npu-ctl mic-source\" para listar os disponíveis.\033[0m')
+    exit(1)
+"
+}
+
+cmd_restore_cameractrls() {
+    echo -e "${CYAN}Restaurando integração Intel NPU no Cameractrls...${NC}"
+    c_dir="$HOME/.local/share/cameractrls"
+    if [ -f "$c_dir/cameractrls.py.npu_backup" ]; then
+        cp "$c_dir/cameractrls.py.npu_backup" "$c_dir/cameractrls.py"
+        echo -e "${GREEN}✓ cameractrls.py restaurado!${NC}"
+    fi
+    if [ -f "$c_dir/cameractrlsgtk.py.npu_backup" ]; then
+        cp "$c_dir/cameractrlsgtk.py.npu_backup" "$c_dir/cameractrlsgtk.py"
+        echo -e "${GREEN}✓ cameractrlsgtk.py restaurado!${NC}"
+    fi
+    echo -e "${GREEN}✓ Cameractrls atualizado com a aba Intel NPU e barra de rolagem permanente.${NC}"
+}
+
+case "$1" in
+    status|"")
+        cmd_status
+        ;;
+    blur)
+        cmd_blur "$2"
+        ;;
+    feather|borda)
+        cmd_feather "$2"
+        ;;
+    smooth|denoise)
+        cmd_smooth "$2"
+        ;;
+    framing|frame)
+        cmd_framing "$2" "$3"
+        ;;
+    studio|ringlight)
+        cmd_studio "$2"
+        ;;
+    lowlight|night)
+        cmd_lowlight "$2"
+        ;;
+    sharpen|sharp)
+        cmd_sharpen "$2"
+        ;;
+    eyecontact|eyes)
+        cmd_eyecontact "$2"
+        ;;
+    standby)
+        cmd_standby "$2"
+        ;;
+    ptz-park|ptz)
+        cmd_ptz_park "$2"
+        ;;
+    ptz-delay)
+        cmd_ptz_delay "$2"
+        ;;
+    ptz-tilt)
+        cmd_ptz_tilt "$2" "$3"
+        ;;
+    ptz-pan)
+        cmd_ptz_pan "$2"
+        ;;
+    ptz-test)
+        cmd_ptz_test "$2" "$3"
+        ;;
+    standby-cmd)
+        cmd_standby_cmd "$2"
+        ;;
+    wakeup-cmd)
+        cmd_wakeup_cmd "$2"
+        ;;
+    privacy|privacy-image)
+        cmd_privacy "$2"
+        ;;
+    mic-listen|audio-listen|listen)
+        cmd_mic_listen "$2"
+        ;;
+    mic-test|audio-test)
+        cmd_audio_test "$2"
+        ;;
+    studio-mic|mic-studio)
+        cmd_studio_mic "$2"
+        ;;
+    mic-gate|gate)
+        cmd_mic_gate "$2"
+        ;;
+    mic-eq|eq)
+        cmd_mic_eq "$2"
+        ;;
+    mic-deesser|deesser)
+        cmd_mic_deesser "$2"
+        ;;
+    mic-comp|comp|agc)
+        cmd_mic_comp "$2"
+        ;;
+    mic-dereverb|dereverb)
+        cmd_mic_dereverb "$2"
+        ;;
+    mic-lowcut|lowcut)
+        cmd_mic_lowcut "$2"
+        ;;
+    mic-noise|denoise-mic)
+        cmd_mic_noise "$2"
+        ;;
+    cam-source|camera|cam)
+        cmd_cam_source "$2"
+        ;;
+    mic-source|mic)
+        cmd_mic_source "$2"
+        ;;
+    restore-cameractrls|patch-cameractrls)
+        cmd_restore_cameractrls
+        ;;
+    background|bg)
+        cmd_background "$2"
+        ;;
+    blur-mode|blurmode)
+        cmd_blur_mode "$2"
+        ;;
+    framing-mode|framingmode)
+        cmd_framing_mode "$2"
+        ;;
+    artistic|arte|art)
+        cmd_artistic "$2" "$3"
+        ;;
+    color|lut|grading)
+        cmd_color "$2" "$3"
+        ;;
+    rim|rimlight|hairlight)
+        cmd_rim "$2" "$3"
+        ;;
+    glare|screenglare)
+        cmd_glare "$2"
+        ;;
+    parallax|3d)
+        cmd_parallax "$2"
+        ;;
+    gesture|gestures|gesto|gestos)
+        cmd_gesture "$2"
+        ;;
+    objects|object|objetos|objeto)
+        cmd_objects "$2"
+        ;;
+    chair|cadeira)
+        cmd_chair "$2"
+        ;;
+    privacy-fade|fade)
+        cmd_privacy_fade "$2"
+        ;;
+    start)
+        systemctl --user start npu-webcam npu-audio
+        echo "Serviços iniciados."
+        cmd_status
+        ;;
+    stop)
+        systemctl --user stop npu-webcam npu-audio
+        echo "Serviços finalizados."
+        ;;
+    restart)
+        systemctl --user restart npu-webcam npu-audio
+        echo "Serviços reiniciados."
+        cmd_status
+        ;;
+    logs)
+        case "$2" in
+            audio)
+                journalctl --user -u npu-audio -f -n 30
+                ;;
+            webcam|cam)
+                journalctl --user -u npu-webcam -f -n 30
+                ;;
+            *)
+                journalctl --user -u npu-webcam -u npu-audio -f -n 30
+                ;;
+        esac
+        ;;
+    help|--help|-h)
+        echo "Uso do npu-ctl:"
+        echo "  npu-ctl status                   Exibe status da NPU, dispositivos e serviços"
+        echo "  npu-ctl cam-source [<1,2..|auto>] Seleciona qual webcam física (PIXY ou Notebook) alimenta a NPU"
+        echo "  npu-ctl mic-source [<1,2..|auto>] Seleciona qual microfone físico (PIXY, USB, Notebook) alimenta a NPU"
+        echo "  npu-ctl blur [on|off|<5-99>]     Ativa, desativa ou ajusta nível do desfoque"
+        echo "  npu-ctl feather <10-80>          Ajusta a largura da borda de transição suave (padrão: 40px)"
+        echo "  npu-ctl chair [on|off|<10-100>]  Ativa/desativa retenção de cadeira com modelo neural IA na NPU"
+        echo "  npu-ctl smooth [on|off|<10-100>] Ativa, desativa ou ajusta nível de suavização/denoise"
+        echo "  npu-ctl studio [on|off|<10-100>] Ativa, desativa ou ajusta luz de estúdio (ring light)"
+        echo "  npu-ctl lowlight [on|off|<10-100>] Ativa, desativa ou ajusta modo pouca luz"
+        echo "  npu-ctl sharpen [on|off|<10-100>] Ativa, desativa ou ajusta realce de nitidez"
+        echo "  npu-ctl eyecontact [on|off]      Ativa ou desativa correção de contato visual"
+        echo "  npu-ctl standby [on|off]         Ativa ou desativa modo on-demand (LED/sensor desligado em espera)"
+        echo "  npu-ctl ptz-park [on|off]        Ativa ou desativa recolhimento PTZ (tilt -324000) no standby"
+        echo "  npu-ctl ptz-delay [segundos]     Atraso após desativar câmera antes do recolhimento PTZ (padrão: 1.0s)"
+        echo "  npu-ctl ptz-tilt <fechar> [abrir] Calibra valor de tilt do standby (fechar) e wakeup (abrir)"
+        echo "  npu-ctl ptz-pan [<val>|off]      Define giro horizontal (pan) para virar para trás (-540000 a 540000)"
+        echo "  npu-ctl ptz-test [tilt] [pan]    Move imediatamente a câmera física para testar os motores"
+        echo "  npu-ctl standby-cmd \"<comando>\"  Define comando shell executado ao entrar em standby"
+        echo "  npu-ctl wakeup-cmd \"<comando>\"   Define comando shell executado ao sair do standby"
+        echo "  npu-ctl studio-mic [on|off]      Ativa ou desativa o pacote de estúdio vocal (EQ+Comp+Gate+De-Esser)"
+        echo "  npu-ctl mic-noise [on|off]       Ativa ou desativa supressão de ruído IA na NPU (PoCoNet)"
+        echo "  npu-ctl mic-gate [on|off|<dB>]   Ativa/desativa silêncio absoluto nas pausas da fala (VAD -45dB)"
+        echo "  npu-ctl mic-comp [on|off|<dB>]   Ativa/desativa compressor vocal e auto-gain (AGC -18dB)"
+        echo "  npu-ctl mic-eq [on|off]          Ativa/desativa equalizador vocal de presença e calor"
+        echo "  npu-ctl mic-deesser [on|off]     Ativa/desativa atenuador de sibilâncias estridentes (S/CH)"
+        echo "  npu-ctl mic-dereverb [on|off|<%>] Ativa/desativa desreverberação para salas com eco"
+        echo "  npu-ctl mic-lowcut [on|off]      Ativa/desativa corte de ruídos de mesa e vibração (80Hz)"
+        echo "  npu-ctl mic-listen [on|off]      Escuta ao vivo o áudio tratado pela NPU no fone (loopback)"
+        echo "  npu-ctl audio-test [segundos]    Grava X segundos e reproduz para você ouvir a qualidade da IA"
+        echo "  npu-ctl restore-cameractrls      Restaura a aba NPU no Cameractrls caso seja sobrescrito por update"
+        echo "  npu-ctl privacy [on|off|foto.jpg]  Ativa/desativa privacidade ou define foto de ausência"
+        echo "  npu-ctl privacy-image <foto|padrao> Define imagem de ausência (ou 'padrao' para tela gráfica)"
+        echo "  npu-ctl framing [on|off|smooth <1-10>|deadzone <5-30>] Ativa, desativa ou calibra o auto-framing"
+        echo "  npu-ctl background <img|none>    Define imagem de fundo virtual ou remove"
+        echo "  npu-ctl start                    Inicia os serviços de segundo plano"
+        echo "  npu-ctl stop                     Para os serviços de segundo plano"
+        echo "  npu-ctl restart                  Reinicia os serviços"
+        echo "  npu-ctl logs [cam|audio]         Acompanha logs em tempo real"
+        ;;
+    *)
+        echo "Comando desconhecido: $1. Use 'npu-ctl help' para ajuda."
+        exit 1
+        ;;
+esac

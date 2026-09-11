@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# PyTorch / Training / Temporary models
+*.pt
+*.pth
+runs/
+.ultralytics/
+
+# Logs & runtime artifacts
+*.log
+*.pid
+*.tmp
+.system_generated/
+
+# OS and Editor files
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
