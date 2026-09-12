@@ -42,7 +42,7 @@ OpenNPUEffects/
 │       └── hu.irl.cameractrls.desktop # Atalho do menu de aplicativos
 ├── models/                           # Modelos de IA pré-otimizados
 │   ├── audio/                        # Intel PoCoNet FP16 para remoção de ruído
-│   └── video/                        # YuNet (rosto) + Selfie Segmentation + YOLO11-seg (Cadeira/Objetos)
+│   └── video/                        # YuNet (rosto) + Selfie Segmentation + YOLACT (Cadeira/Objetos)
 └── drivers/                          # Pacotes .deb oficiais dos drivers da Intel NPU
     ├── libze1_1.28.2.deb
     ├── intel-fw-npu_*.deb

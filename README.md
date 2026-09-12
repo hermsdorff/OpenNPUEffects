@@ -38,7 +38,7 @@ Under **Linux**, the NPU has traditionally remained 100% idle. Existing Linux ba
 
 ### 📹 Video Effects (1080p @ 30 FPS on NPU)
 - **Neural Person Silhouette**: High-fidelity multiclass segmentation with hand and skin recovery.
-- **Precise Chair & Furniture Retention (YOLO11-seg)**: Instance segmentation detects the exact curves, headrest wings, leather stitching, and backrest of gaming/office chairs — **zero convex-hull blobs**.
+- **Precise Chair & Furniture Retention (YOLACT)**: Instance segmentation detects the exact curves, headrest wings, leather stitching, and backrest of gaming/office chairs — **zero convex-hull blobs**.
 - **Edge-Snapping Guided Filter**: 1080p camera luminance edge-refinement eliminates white boundary halos and preserves loose hair and finger gestures.
 - **Cinematic Depth Blur & Virtual Backgrounds**: Configurable blur strength or custom photo/video backgrounds.
 - **Auto-Framing / Face Tracking**: Smooth kinematic subject centering powered by YuNet face detection.
@@ -86,7 +86,7 @@ The installer automatically:
 1. Verifies and installs official Intel NPU Level Zero drivers and compiler UMDs.
 2. Configures `v4l2loopback` (`/dev/video72`) with persistent kernel module settings.
 3. Sets up a centralized Python virtual environment in `/opt/npu-effects/venv` with OpenVINO runtime.
-4. Prepares pre-optimized OpenVINO IR neural models (Selfie Multiclass, YOLO11-seg, PoCoNet, YuNet).
+4. Prepares pre-optimized OpenVINO IR neural models (Selfie Multiclass, YOLACT, PoCoNet, YuNet).
 5. Installs and starts systemd user daemons (`npu-webcam.service` and `npu-audio.service`).
 6. Integrates control sliders directly into `cameractrls` and links `npu-ctl` to `/usr/local/bin`.
 
@@ -114,7 +114,7 @@ npu-ctl status
 
 # Camera Controls
 npu-ctl blur on | off | 20          # Toggle / adjust background blur
-npu-ctl chair on | off | 60         # Toggle exact chair retention (YOLO11 NPU)
+npu-ctl chair on | off | 60         # Toggle exact chair retention (YOLACT NPU)
 npu-ctl framing on | off            # Auto-framing face tracking
 npu-ctl eye-contact on | off        # Teleprompter gaze correction
 npu-ctl bg "/path/to/image.jpg"     # Set virtual background
@@ -171,7 +171,7 @@ OpenNPUEffects/
 │   ├── LICENSE.md                    # Individual licenses for all neural models
 │   ├── README.md                     # Model specifications and architectures
 │   ├── audio/                        # Intel PoCoNet FP16
-│   └── video/                        # YuNet, Selfie Multiclass, YOLO11-seg
+│   └── video/                        # YuNet, Selfie Multiclass, YOLACT
 └── assets/                           # Default privacy and background assets
 ```
 
@@ -211,7 +211,7 @@ The neural network models bundled or downloaded by this project are subject to t
 - **MediaPipe Selfie Segmentation**: [Apache License 2.0](models/LICENSE.md#3-mediapipe-selfie-segmentation-google-llc) (Google LLC)
 - **MediaPipe Selfie Multiclass**: [Apache License 2.0](models/LICENSE.md#4-mediapipe-selfie-multiclass-google-llc) (Google LLC)
 - **MobileNetV3 LRASPP Segmenter**: [BSD 3-Clause License](models/LICENSE.md#5-mobilenetv3-lraspp-segmenter-pytorch--torchvision) (TorchVision / PyTorch Contributors)
-- **YOLO11 Instance Segmenter**: [GNU AGPL-3.0](models/LICENSE.md#6-yolo11-instance-segmenter-ultralytics) (Ultralytics LLC)
+- **YOLACT Instance Segmenter**: [MIT License](models/LICENSE.md#6-yolact-resnet-50-fpn-instance-segmenter-uc-davis--intel-omz) (Daniel Bolya et al. / UC Davis)
 
 For full license texts and copyright notices, see [`models/LICENSE.md`](models/LICENSE.md).
 

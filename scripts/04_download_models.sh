@@ -81,9 +81,9 @@ print("Modelo de segmentação estático gerado com sucesso!")
 PYCONV
 fi
 
-echo -e "${YELLOW}--> Verificando modelo de Segmentação de Instâncias (Cadeira/Objetos YOLO11)...${NC}"
+echo -e "${YELLOW}--> Verificando modelo de Segmentação de Instâncias (Cadeira/Objetos YOLACT)...${NC}"
 if [ -f "$LOCAL_MODELS/video/chair_instance_segmenter.xml" ] && [ -f "$LOCAL_MODELS/video/chair_instance_segmenter.bin" ]; then
-    echo -e "${GREEN}Copiando modelo de segmentação de cadeira (YOLO11-seg) para $TARGET_VIDEO...${NC}"
+    echo -e "${GREEN}Copiando modelo de segmentação de cadeira (YOLACT) para $TARGET_VIDEO...${NC}"
     sudo cp -u "$LOCAL_MODELS/video/chair_instance_segmenter".* "$TARGET_VIDEO/"
 fi
 
@@ -110,6 +110,12 @@ if video_m.exists():
     m = core.read_model(str(video_m))
     compiled = core.compile_model(m, device)
     print(f"\033[0;32m✓ Modelo de Vídeo Selfie compilado com sucesso no dispositivo '{device}'!\033[0m")
+
+chair_m = base / "video/chair_instance_segmenter.xml"
+if chair_m.exists():
+    m = core.read_model(str(chair_m))
+    compiled = core.compile_model(m, device)
+    print(f"\033[0;32m✓ Modelo de Segmentação de Cadeira YOLACT compilado com sucesso no dispositivo '{device}'!\033[0m")
 PYTEST
 
 # Garantir permissão de leitura para todos os usuários

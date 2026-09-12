@@ -14,7 +14,7 @@ Para detalhes completos de direitos autorais e licenças individuais de cada mod
 | `video/face_detection_yunet_2023mar.onnx` | YuNet (Face Detection & Landmarks) | Dinâmico / Adaptativo | FP32 | [OpenCV Zoo](https://github.com/opencv/opencv_zoo) | Apache 2.0 |
 | `video/selfie_segmentation_static.*` | MediaPipe Selfie Landscape | `[1, 3, 144, 256]` (NPU Shave Core optimized) | FP16 | [Google MediaPipe](https://github.com/google/mediapipe) / PINTO Zoo | Apache 2.0 |
 | `video/selfie_multiclass.*` | MediaPipe Selfie Multiclass | `[1, 256, 256, 3]` (6 classes) | FP16 | [Google MediaPipe](https://github.com/google/mediapipe) / PINTO Zoo | Apache 2.0 |
-| `video/chair_instance_segmenter.*` | YOLO11-seg Instance Segmenter | `[1, 3, 384, 640]` | FP16 | [Ultralytics](https://github.com/ultralytics/ultralytics) | AGPL-3.0 |
+| `video/chair_instance_segmenter.*` | YOLACT ResNet-50 FPN Instance Segmenter | `[1, 3, 550, 550]` | FP16 | [Daniel Bolya et al. (UC Davis)](https://github.com/dbolya/yolact) / Intel OMZ | MIT |
 | `video/chair_segmenter.*` | MobileNetV3 LRASPP Segmenter | `[1, 3, 256, 256]` (21 classes VOC) | FP16 | [TorchVision](https://github.com/pytorch/vision) | BSD-3-Clause |
 
 ---

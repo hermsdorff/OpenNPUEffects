@@ -76,7 +76,7 @@ Todos os efeitos de vídeo rodam com aceleração de hardware na NPU e CPU com v
 | **Desfoque de Fundo (AI Blur)** | Isola a pessoa usando segmentação neural na NPU e aplica desfoque bokeh no fundo. | `npu-ctl blur [on/off/0-100]` ou slider no Cameractrls |
 | **Modo Retrato Óptico (Depth-Aware)** | Simula lente DSLR física com desfoque de profundidade gradativo (bokeh mais forte em áreas distantes). | `npu-ctl blur-mode [standard/portrait]` |
 | **Transição Suave de Borda (Feathering)** | Suavização contínua (*Hermite Smoothstep*) eliminando recortes duros ou bordas brancas. | `npu-ctl feather [10-80]` ou slider no Cameractrls |
-| **Preservação de Cadeira (Modelo IA NPU)** | Identifica a cadeira (escritório/gamer/sofá) usando rede neural dedicada na NPU (MobileNetV3 LRASPP) e retém o encosto no primeiro plano. | `npu-ctl chair [on/off/10-100]` ou no Cameractrls |
+| **Preservação de Cadeira (Modelo IA NPU)** | Identifica a cadeira (escritório/gamer/sofá) usando rede neural de segmentação de instâncias na NPU (YOLACT) e retém o encosto no primeiro plano. | `npu-ctl chair [on/off/10-100]` ou no Cameractrls |
 | **Fundo Virtual (Substituição de Imagem)** | Substitui o cenário real por qualquer imagem da pasta `~/.config/npu-effects/backgrounds/`. | `npu-ctl background /caminho/foto.jpg` |
 | **Efeito Parallax 3D no Fundo** | Desloca o plano de fundo sutilmente de acordo com o movimento da cabeça, criando sensação tridimensional realista. | `npu-ctl parallax [on/off/10-100]` |
 | **Reconhecimento de Gestos (AI)** | Identifica gestos em tempo real (**👍 Joinha**, **✌️ Vitória**, **🖐️ Mão Aberta**) para reações visuais animadas ou atalho de microfone. | `npu-ctl gesture [on/off/reaction/mute/all]` ou no Cameractrls |
@@ -340,7 +340,7 @@ Os modelos de inteligência artificial incluídos ou preparados pelo instalador 
 - **MediaPipe Selfie Segmentation**: [Apache 2.0](models/LICENSE.md#3-mediapipe-selfie-segmentation-google-llc) (Google LLC)
 - **MediaPipe Selfie Multiclass**: [Apache 2.0](models/LICENSE.md#4-mediapipe-selfie-multiclass-google-llc) (Google LLC)
 - **MobileNetV3 LRASPP Segmenter**: [BSD 3-Clause](models/LICENSE.md#5-mobilenetv3-lraspp-segmenter-pytorch--torchvision) (TorchVision / PyTorch)
-- **YOLO11 Instance Segmenter (Cadeira)**: [GNU AGPL-3.0](models/LICENSE.md#6-yolo11-instance-segmenter-ultralytics) (Ultralytics LLC)
+- **YOLACT Instance Segmenter (Cadeira)**: [MIT](models/LICENSE.md#6-yolact-resnet-50-fpn-instance-segmenter-uc-davis--intel-omz) (Daniel Bolya et al. / UC Davis)
 
 Para visualizar os textos completos das licenças e avisos de atribuição, consulte o documento [`models/LICENSE.md`](models/LICENSE.md).
 

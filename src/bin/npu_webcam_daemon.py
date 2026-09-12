@@ -24,14 +24,28 @@ logging.basicConfig(
 )
 
 CONFIG_PATH = Path.home() / ".config/npu-effects/config.json"
+USER_MODEL_DIR = Path.home() / ".local/share/npu-effects/models/video"
 OPT_MODEL_DIR = Path("/opt/npu-effects/models/video")
-MODEL_DIR = OPT_MODEL_DIR if OPT_MODEL_DIR.exists() else Path.home() / ".local/share/npu-effects/models/video"
+REPO_MODEL_DIR = Path(__file__).resolve().parent.parent.parent / "models/video"
+
+MODEL_DIR = OPT_MODEL_DIR if OPT_MODEL_DIR.exists() else (USER_MODEL_DIR if USER_MODEL_DIR.exists() else Path("/opt/npu-effects/models/video"))
 SEG_MULTICLASS_PATH = MODEL_DIR / "selfie_multiclass.xml"
 SEG_MODEL_PATH = MODEL_DIR / "selfie_segmentation_static.xml"
 YUNET_MODEL_PATH = MODEL_DIR / "face_detection_yunet_2023mar.onnx"
-SEG_CHAIR_PATH = MODEL_DIR / "chair_instance_segmenter.xml"
-if not SEG_CHAIR_PATH.exists():
-    SEG_CHAIR_PATH = MODEL_DIR / "chair_segmenter.xml"
+
+SEG_CHAIR_PATH = None
+for p in [
+    USER_MODEL_DIR / "chair_instance_segmenter.xml",
+    REPO_MODEL_DIR / "chair_instance_segmenter.xml",
+    OPT_MODEL_DIR / "chair_instance_segmenter.xml",
+    MODEL_DIR / "chair_instance_segmenter.xml",
+    MODEL_DIR / "chair_segmenter.xml"
+]:
+    if p.exists():
+        SEG_CHAIR_PATH = p
+        break
+if SEG_CHAIR_PATH is None:
+    SEG_CHAIR_PATH = MODEL_DIR / "chair_instance_segmenter.xml"
 
 running = True
 
@@ -607,14 +621,14 @@ def check_audio_muted():
     except Exception:
         return False
 
-def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_inp_name=None, strength=50, cached_chair_mask=None, run_inference=True):
+def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_inp_name=None, strength=50, cached_chair_mask=None, run_inference=True, inp_w=550, inp_h=550):
     """
-    Retencao Neural Exata de Cadeira & Encosto com Segmentacao de Instancias (YOLO11-seg) na NPU:
+    Retencao Neural Exata de Cadeira & Encosto com Segmentacao de Instancias (YOLACT - MIT License) na NPU:
     Detecta os contornos e bordas anatomicas reais da cadeira (encosto, apoio de cabeca, abas e bracos),
     sem aproximacoes poligonais ou convexHull artificiais.
-    1. Pre-processamento letterbox (384x640) preservando aspect ratio.
-    2. Inferencia na NPU do modelo de segmentacao de instancias YOLO11-seg.
-    3. NMS por classe e decodificacao vetorial das mascaras de alta precisao.
+    1. Pre-processamento letterbox preservando aspect ratio.
+    2. Inferencia na NPU do modelo de segmentacao de instancias YOLACT (MIT License).
+    3. NMS por classe e combinacao linear dos coeficientes com os mapas prototipo (Protonet).
     4. Ancoragem espacial: retem apenas a cadeira conectada/apoiada ao corpo do usuario.
     5. Suavizacao temporal e fusao limpa na mascara p_person.
     """
@@ -626,7 +640,6 @@ def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_i
         if not run_inference and cached_chair_mask is not None:
             return np.maximum(p_person, cached_chair_mask), cached_chair_mask
 
-        inp_w, inp_h = 640, 384
         h_orig, w_orig = framed.shape[:2]
         scale = min(inp_w / float(w_orig), inp_h / float(h_orig))
         scaled_w = int(round(w_orig * scale))
@@ -643,68 +656,133 @@ def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_i
         blob = rgb.transpose(2, 0, 1)[np.newaxis, ...]
 
         res = chair_infer_req.infer({chair_inp_name: blob})
-        out_boxes = None
-        out_protos = None
-        for v in res.values():
-            if v.ndim == 3:
-                out_boxes = v
-            elif v.ndim == 4:
-                out_protos = v
+        out_dict = {}
+        for k, v in res.items():
+            name = k.get_any_name() if hasattr(k, "get_any_name") else str(k)
+            out_dict[name] = v
 
-        if out_boxes is None or out_protos is None:
-            # Fallback seguro caso um modelo legado de segmentacao semantica seja fornecido
-            return p_person, cached_chair_mask
-
-        preds = np.squeeze(out_boxes, axis=0).T  # (5040, 116)
-        scores_chair = preds[:, 4 + 56]
-        scores_couch = preds[:, 4 + 57]
-        c_scores = np.maximum(scores_chair, scores_couch)
-
-        # Limiar adaptativo conforme sensibilidade configurada (strength 10..100)
+        is_yolact = ("conf" in out_dict and "proto" in out_dict and "mask" in out_dict and "boxes" in out_dict)
         thr_chair = max(0.12, 0.36 - (float(strength) / 100.0) * 0.24)
-        c_mask = c_scores > thr_chair
 
-        if not np.any(c_mask):
-            return p_person, None
+        if is_yolact:
+            conf = np.squeeze(out_dict["conf"], axis=0)          # (19248, 81)
+            mask_coeffs = np.squeeze(out_dict["mask"], axis=0)   # (19248, 32)
+            proto = np.squeeze(out_dict["proto"], axis=0)        # (138, 138, 32)
+            boxes = np.squeeze(out_dict["boxes"], axis=0)        # (19248, 4)
 
-        c_preds = preds[c_mask]
-        cx = c_preds[:, 0]
-        cy = c_preds[:, 1]
-        w = c_preds[:, 2]
-        h = c_preds[:, 3]
-        x1 = cx - w / 2.0
-        y1 = cy - h / 2.0
-        boxes = np.stack([x1, y1, w, h], axis=1).tolist()
-        confs = c_scores[c_mask].tolist()
+            # Em YOLACT COCO (81 classes com fundo em 0): 57 = cadeira, 58 = sofa/poltrona
+            chair_scores = conf[:, 57]
+            couch_scores = conf[:, 58]
+            c_scores = np.maximum(chair_scores, couch_scores)
 
-        nms_idx = cv2.dnn.NMSBoxes(boxes, confs, score_threshold=thr_chair, nms_threshold=0.45)
-        if len(nms_idx) == 0:
-            return p_person, None
+            c_mask = c_scores > thr_chair
+            if not np.any(c_mask):
+                return p_person, None
 
-        nms_idx = np.array(nms_idx).flatten()
-        sel_preds = c_preds[nms_idx]
-        sel_boxes = np.array(boxes)[nms_idx]
+            sel_indices = np.where(c_mask)[0]
+            sel_boxes = boxes[sel_indices]
+            sel_confs = c_scores[sel_indices]
 
-        protos = np.squeeze(out_protos, axis=0)  # (32, 96, 160)
-        c, mh, mw = protos.shape
-        mask_coeffs = sel_preds[:, 84:]
+            x1 = sel_boxes[:, 0] * inp_w
+            y1 = sel_boxes[:, 1] * inp_h
+            x2 = sel_boxes[:, 2] * inp_w
+            y2 = sel_boxes[:, 3] * inp_h
+            bw = np.maximum(0.0, x2 - x1)
+            bh = np.maximum(0.0, y2 - y1)
+            nms_boxes = np.stack([x1, y1, bw, bh], axis=1).tolist()
 
-        raw_masks = (mask_coeffs @ protos.reshape(c, -1)).reshape(-1, mh, mw)
-        sig_masks = 1.0 / (1.0 + np.exp(-raw_masks))
+            nms_res = cv2.dnn.NMSBoxes(nms_boxes, sel_confs.tolist(), score_threshold=thr_chair, nms_threshold=0.45)
+            if len(nms_res) == 0:
+                return p_person, None
 
-        rx = mw / float(inp_w)
-        ry = mh / float(inp_h)
+            nms_keep = np.array(nms_res).flatten()
+            final_sel_idx = sel_indices[nms_keep]
+            final_boxes = sel_boxes[nms_keep]
 
-        proto_chair = np.zeros((mh, mw), dtype=np.float32)
-        for i in range(len(nms_idx)):
-            bx1 = max(0, int(sel_boxes[i, 0] * rx))
-            by1 = max(0, int(sel_boxes[i, 1] * ry))
-            bx2 = min(mw, int(np.ceil((sel_boxes[i, 0] + sel_boxes[i, 2]) * rx)))
-            by2 = min(mh, int(np.ceil((sel_boxes[i, 1] + sel_boxes[i, 3]) * ry)))
+            if proto.ndim == 3 and proto.shape[-1] == 32:
+                mh, mw, c = proto.shape
+                proto_flat = proto.reshape(-1, c)
+                coeffs = mask_coeffs[final_sel_idx]
+                raw_masks = (coeffs @ proto_flat.T).reshape(-1, mh, mw)
+            else:
+                c, mh, mw = proto.shape
+                coeffs = mask_coeffs[final_sel_idx]
+                raw_masks = (coeffs @ proto.reshape(c, -1)).reshape(-1, mh, mw)
 
-            m = np.zeros((mh, mw), dtype=np.float32)
-            m[by1:by2, bx1:bx2] = sig_masks[i, by1:by2, bx1:bx2]
-            proto_chair = np.maximum(proto_chair, m)
+            sig_masks = 1.0 / (1.0 + np.exp(-raw_masks))
+
+            proto_chair = np.zeros((mh, mw), dtype=np.float32)
+            for i in range(len(final_boxes)):
+                bx1 = max(0, int(final_boxes[i, 0] * mw))
+                by1 = max(0, int(final_boxes[i, 1] * mh))
+                bx2 = min(mw, int(np.ceil(final_boxes[i, 2] * mw)))
+                by2 = min(mh, int(np.ceil(final_boxes[i, 3] * mh)))
+
+                m = np.zeros((mh, mw), dtype=np.float32)
+                m[by1:by2, bx1:bx2] = sig_masks[i, by1:by2, bx1:bx2]
+                proto_chair = np.maximum(proto_chair, m)
+
+            rx = mw / float(inp_w)
+            ry = mh / float(inp_h)
+        else:
+            out_boxes = None
+            out_protos = None
+            for v in res.values():
+                if v.ndim == 3:
+                    out_boxes = v
+                elif v.ndim == 4:
+                    out_protos = v
+
+            if out_boxes is None or out_protos is None:
+                return p_person, cached_chair_mask
+
+            preds = np.squeeze(out_boxes, axis=0).T  # (5040, 116)
+            scores_chair = preds[:, 4 + 56]
+            scores_couch = preds[:, 4 + 57]
+            c_scores = np.maximum(scores_chair, scores_couch)
+
+            c_mask = c_scores > thr_chair
+            if not np.any(c_mask):
+                return p_person, None
+
+            c_preds = preds[c_mask]
+            cx = c_preds[:, 0]
+            cy = c_preds[:, 1]
+            w = c_preds[:, 2]
+            h = c_preds[:, 3]
+            x1 = cx - w / 2.0
+            y1 = cy - h / 2.0
+            boxes_list = np.stack([x1, y1, w, h], axis=1).tolist()
+            confs_list = c_scores[c_mask].tolist()
+
+            nms_idx = cv2.dnn.NMSBoxes(boxes_list, confs_list, score_threshold=thr_chair, nms_threshold=0.45)
+            if len(nms_idx) == 0:
+                return p_person, None
+
+            nms_idx = np.array(nms_idx).flatten()
+            sel_preds = c_preds[nms_idx]
+            sel_boxes = np.array(boxes_list)[nms_idx]
+
+            protos = np.squeeze(out_protos, axis=0)  # (32, 96, 160)
+            c, mh, mw = protos.shape
+            mask_coeffs = sel_preds[:, 84:]
+
+            raw_masks = (mask_coeffs @ protos.reshape(c, -1)).reshape(-1, mh, mw)
+            sig_masks = 1.0 / (1.0 + np.exp(-raw_masks))
+
+            rx = mw / float(inp_w)
+            ry = mh / float(inp_h)
+
+            proto_chair = np.zeros((mh, mw), dtype=np.float32)
+            for i in range(len(nms_idx)):
+                bx1 = max(0, int(sel_boxes[i, 0] * rx))
+                by1 = max(0, int(sel_boxes[i, 1] * ry))
+                bx2 = min(mw, int(np.ceil((sel_boxes[i, 0] + sel_boxes[i, 2]) * rx)))
+                by2 = min(mh, int(np.ceil((sel_boxes[i, 1] + sel_boxes[i, 3]) * ry)))
+
+                m = np.zeros((mh, mw), dtype=np.float32)
+                m[by1:by2, bx1:bx2] = sig_masks[i, by1:by2, bx1:bx2]
+                proto_chair = np.maximum(proto_chair, m)
 
         p_top = int(round(pad_top * ry))
         p_bottom = mh - int(round(pad_bottom * ry))
@@ -1067,24 +1145,34 @@ def main():
     is_multiclass = (active_seg_path == SEG_MULTICLASS_PATH) or (len(seg_inp_shape) == 4 and seg_inp_shape[-1] == 3)
     logging.info(f"NPU segmentation model compiled successfully! Type: {'Multiclass (6-class + Hand/Skin)' if is_multiclass else 'Legacy Landscape'}, In: {seg_inp_shape}")
 
-    # Load Neural Chair Segmentation Model (MobileNetV3 LRASPP 21-classes)
+    # Load Neural Chair Segmentation Model (YOLACT Instance Segmenter - MIT License)
     chair_infer_req = None
     chair_inp_name = None
-    if SEG_CHAIR_PATH.exists():
+    chair_inp_w = 550
+    chair_inp_h = 550
+    if SEG_CHAIR_PATH and SEG_CHAIR_PATH.exists():
         try:
             logging.info(f"Loading neural chair model {SEG_CHAIR_PATH}...")
             chair_model = core.read_model(str(SEG_CHAIR_PATH))
             chair_compiled = core.compile_model(chair_model, npu_device)
             chair_infer_req = chair_compiled.create_infer_request()
             chair_inp_name = chair_model.inputs[0].get_any_name()
-            logging.info(f"Neural chair segmentation model compiled successfully on {npu_device}!")
+            c_shape = chair_model.inputs[0].shape
+            if len(c_shape) >= 4:
+                chair_inp_h = int(c_shape[2])
+                chair_inp_w = int(c_shape[3])
+            logging.info(f"Neural chair model (YOLACT) compiled successfully on {npu_device} ({chair_inp_w}x{chair_inp_h})!")
         except Exception as e:
             logging.warning(f"Could not compile chair model on {npu_device}: {e}. Retrying on CPU...")
             try:
                 chair_compiled = core.compile_model(chair_model, "CPU")
                 chair_infer_req = chair_compiled.create_infer_request()
                 chair_inp_name = chair_model.inputs[0].get_any_name()
-                logging.info("Neural chair segmentation model compiled successfully on CPU!")
+                c_shape = chair_model.inputs[0].shape
+                if len(c_shape) >= 4:
+                    chair_inp_h = int(c_shape[2])
+                    chair_inp_w = int(c_shape[3])
+                logging.info(f"Neural chair model compiled successfully on CPU ({chair_inp_w}x{chair_inp_h})!")
             except Exception as e2:
                 logging.error(f"Failed to load neural chair model: {e2}")
 
@@ -1361,7 +1449,7 @@ def main():
                         retained_candidate = np.where(interaction_zone > 0, closed_mask, p_person)
                         p_person = np.maximum(p_person, retained_candidate)
 
-                    # 2.1 Neural Chair & Headrest Retention (Modelo de Segmentacao de Instancias na NPU)
+                    # 2.1 Neural Chair & Headrest Retention (Modelo de Segmentacao de Instancias YOLACT na NPU)
                     if cfg.get("chair_retention_enabled", True):
                         chair_str = int(cfg.get("chair_retention_strength", 50))
                         should_infer_chair = (chair_frame_counter % 2 == 0) or (cached_chair_mask is None)
@@ -1371,7 +1459,9 @@ def main():
                             chair_inp_name=chair_inp_name,
                             strength=chair_str,
                             cached_chair_mask=cached_chair_mask,
-                            run_inference=should_infer_chair
+                            run_inference=should_infer_chair,
+                            inp_w=chair_inp_w,
+                            inp_h=chair_inp_h
                         )
                         chair_frame_counter += 1
                     else:

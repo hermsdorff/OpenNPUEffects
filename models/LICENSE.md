@@ -15,7 +15,7 @@ O código-fonte do projeto Open NPU Effects é distribuído sob a **Licença MIT
 | **MediaPipe Selfie Segmentation** | `video/selfie_segmentation_static.*` | Segmentação estática de pessoa (144x256 FP16 NPU) | [Google LLC / MediaPipe](https://github.com/google/mediapipe) | [Apache 2.0](#3-mediapipe-selfie-segmentation-google-llc) |
 | **MediaPipe Selfie Multiclass** | `video/selfie_multiclass.*` | Segmentação multiclasse (pele, cabelo, roupas, corpo) | [Google LLC / MediaPipe](https://github.com/google/mediapipe) | [Apache 2.0](#4-mediapipe-selfie-multiclass-google-llc) |
 | **MobileNetV3 LRASPP** | `video/chair_segmenter.*` | Segmentação semântica 21 classes (fallback cadeira) | [PyTorch / TorchVision Contributors](https://github.com/pytorch/vision) | [BSD 3-Clause](#5-mobilenetv3-lraspp-segmenter-pytorch--torchvision) |
-| **YOLO11-seg Instance** | `video/chair_instance_segmenter.*` | Segmentação de instâncias para retenção de cadeira | [Ultralytics LLC](https://github.com/ultralytics/ultralytics) | [AGPL-3.0](#6-yolo11-instance-segmenter-ultralytics) |
+| **YOLACT ResNet-50 FPN** | `video/chair_instance_segmenter.*` | Segmentação de instâncias para retenção de cadeira | [Daniel Bolya et al. (UC Davis)](https://github.com/dbolya/yolact) | [MIT](#6-yolact-resnet-50-fpn-instance-segmenter-uc-davis--intel-omz) |
 
 ---
 
@@ -143,46 +143,35 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ---
 
-## 6. YOLO11 Instance Segmenter (Ultralytics)
+## 6. YOLACT ResNet-50 FPN Instance Segmenter (UC Davis / Intel OMZ)
 - **Arquivos:** `video/chair_instance_segmenter.xml`, `video/chair_instance_segmenter.bin`
-- **Origem:** [Ultralytics YOLO11](https://github.com/ultralytics/ultralytics)
-- **Copyright:** Copyright (c) 2024 Ultralytics LLC
-- **Licença:** **GNU Affero General Public License v3.0 (AGPL-3.0)**
+- **Origem:** [dbolya/yolact](https://github.com/dbolya/yolact) / [Intel Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/yolact-resnet50-fpn-pytorch)
+- **Autores:** Daniel Bolya, Chong Zhou, Fanyi Xiao, Yong Jae Lee (University of California, Davis)
+- **Copyright:** Copyright (c) 2019 Daniel Bolya
+- **Licença:** **MIT License**
 
 ```text
-                    GNU AFFERO GENERAL PUBLIC LICENSE
-                       Version 3, 19 November 2007
+MIT License
 
- Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
- Everyone is permitted to copy and distribute verbatim copies
- of this license document, but changing it is not allowed.
+Copyright (c) 2019 Daniel Bolya
 
-                            Preamble
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-  The GNU Affero General Public License is a free, copyleft license for
-software and other kinds of works, specifically designed to ensure
-cooperation with the community in the case of network server software.
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-  The licenses for most software and other practical works are designed
-to take away your freedom to share and change the works.  By contrast,
-our General Public Licenses are intended to guarantee your freedom to
-share and change all versions of a program--to make sure it remains free
-software for all its users.
-
-  When we speak of free software, we are referring to freedom, not
-price.  Our General Public Licenses are designed to make sure that you
-have the freedom to distribute copies of free software (and charge for
-them if you wish), that you receive source code or can get it if you
-want it, that you can change the software or use pieces of it in new
-free programs, and that you know you can do these things.
-
-  Developers that use our licenses protect your rights with two steps:
-(1) assert copyright on the software, and (2) offer you this License
-which gives you legal permission to copy, distribute and/or modify the
-software.
-
-  A complete copy of the GNU Affero General Public License v3.0 can be found at:
-  https://www.gnu.org/licenses/agpl-3.0.txt
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
 
 ---
