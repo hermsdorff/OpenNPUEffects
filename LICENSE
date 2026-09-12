@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 NPU Studio Linux Contributors
+Copyright (c) 2026 Kleber Faria Sales <kleber.sales@salviasaude.com.br>, Open NPU Effects Contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,53 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+================================================================================
+Third-Party Neural Models and Component Licenses
+================================================================================
+
+The Open NPU Effects software incorporates or downloads pre-trained deep learning
+neural models and external components, each governed by their respective open-source
+licenses. Detailed license terms and notices can be found in `models/LICENSE.md`.
+
+Summary of individual model licenses:
+
+1. Intel PoCoNet Noise Suppression
+   - Model Files: models/audio/noise-suppression-poconetlike-0001.*
+   - Source: Intel Open Model Zoo (Intel Corporation)
+   - License: Apache License, Version 2.0 (Apache-2.0)
+   - https://github.com/openvinotoolkit/open_model_zoo
+
+2. YuNet Face Detection
+   - Model File: models/video/face_detection_yunet_2023mar.onnx
+   - Source: OpenCV Zoo (Shiqi Yu & OpenCV Team)
+   - License: Apache License, Version 2.0 (Apache-2.0)
+   - https://github.com/opencv/opencv_zoo
+
+3. Google MediaPipe Selfie Segmentation (Static FP16)
+   - Model Files: models/video/selfie_segmentation_static.*
+   - Source: Google MediaPipe (Google LLC)
+   - License: Apache License, Version 2.0 (Apache-2.0)
+   - https://github.com/google/mediapipe
+
+4. Google MediaPipe Selfie Multiclass Segmentation
+   - Model Files: models/video/selfie_multiclass.*
+   - Source: Google MediaPipe (Google LLC)
+   - License: Apache License, Version 2.0 (Apache-2.0)
+   - https://github.com/google/mediapipe
+
+5. MobileNetV3 LRASPP Chair Segmenter
+   - Model Files: models/video/chair_segmenter.*
+   - Source: PyTorch TorchVision (TorchVision Contributors)
+   - License: BSD 3-Clause License (BSD-3-Clause)
+   - https://github.com/pytorch/vision
+
+6. YOLO11 Instance Segmenter (Chair Retention)
+   - Model Files: models/video/chair_instance_segmenter.*
+   - Source: Ultralytics YOLO11 (Ultralytics LLC)
+   - License: GNU Affero General Public License v3.0 (AGPL-3.0)
+   - https://github.com/ultralytics/ultralytics
+
+Other bundled components:
+- cameractrls: Gergo Koteles (LGPL-3.0 / GPL-3.0)
+- v4l2loopback: v4l2loopback project (GPL-2.0+)

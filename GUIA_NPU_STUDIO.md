@@ -327,7 +327,24 @@ Ao fazer login na conta do novo usuário:
 - O comando `npu-ctl` estará disponível no terminal.
 - Basta executar `npu-ctl start` para iniciar os efeitos de áudio e vídeo na sessão dele!
 
+---
+
+## 11. Licença de Uso e Licenças dos Modelos de IA
+
+O código-fonte do **Open NPU Effects** é distribuído livremente sob a **Licença MIT** (veja [`LICENSE`](LICENSE)).
+
+### Licenças Individuais dos Modelos Neurais
+Os modelos de inteligência artificial incluídos ou preparados pelo instalador possuem termos de licenciamento próprios:
+- **Intel PoCoNet (Redução de Ruído)**: [Apache 2.0](models/LICENSE.md#1-intel-poconet-noise-suppression) (Intel Open Model Zoo)
+- **YuNet (Rastreamento Facial)**: [Apache 2.0](models/LICENSE.md#2-yunet-face-detector-opencv-zoo) (Shiqi Yu / OpenCV Zoo)
+- **MediaPipe Selfie Segmentation**: [Apache 2.0](models/LICENSE.md#3-mediapipe-selfie-segmentation-google-llc) (Google LLC)
+- **MediaPipe Selfie Multiclass**: [Apache 2.0](models/LICENSE.md#4-mediapipe-selfie-multiclass-google-llc) (Google LLC)
+- **MobileNetV3 LRASPP Segmenter**: [BSD 3-Clause](models/LICENSE.md#5-mobilenetv3-lraspp-segmenter-pytorch--torchvision) (TorchVision / PyTorch)
+- **YOLO11 Instance Segmenter (Cadeira)**: [GNU AGPL-3.0](models/LICENSE.md#6-yolo11-instance-segmenter-ultralytics) (Ultralytics LLC)
+
+Para visualizar os textos completos das licenças e avisos de atribuição, consulte o documento [`models/LICENSE.md`](models/LICENSE.md).
 
 ---
 
-*Desenvolvido e calibrado sob medida para o Samsung Galaxy Book 4 Ultra.*
+*Desenvolvido e calibrado sob medida para a comunidade Linux & Intel Core Ultra.*
+

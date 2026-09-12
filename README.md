@@ -168,6 +168,8 @@ OpenNPUEffects/
 │   │   └── npu-audio.service         # Systemd user unit for audio
 │   └── cameractrls/                  # Enhanced Cameractrls GUI & backend
 ├── models/                           # Pre-compiled static OpenVINO IR models
+│   ├── LICENSE.md                    # Individual licenses for all neural models
+│   ├── README.md                     # Model specifications and architectures
 │   ├── audio/                        # Intel PoCoNet FP16
 │   └── video/                        # YuNet, Selfie Multiclass, YOLO11-seg
 └── assets/                           # Default privacy and background assets
@@ -198,9 +200,20 @@ Contributions, issues, and feature requests are welcome!
 
 ---
 
-## 📜 License
+## 📜 License & Third-Party AI Models
 
-Distributed under the **MIT License**. See [`LICENSE`](LICENSE) for more information.
+This project source code is distributed under the **MIT License**. See [`LICENSE`](LICENSE) for complete terms.
+
+### Neural Network Model Licenses
+The neural network models bundled or downloaded by this project are subject to their respective open-source licenses:
+- **Intel PoCoNet Noise Suppression**: [Apache License 2.0](models/LICENSE.md#1-intel-poconet-noise-suppression) (Intel Corporation)
+- **YuNet Face Detector**: [Apache License 2.0](models/LICENSE.md#2-yunet-face-detector-opencv-zoo) (Shiqi Yu / OpenCV Zoo)
+- **MediaPipe Selfie Segmentation**: [Apache License 2.0](models/LICENSE.md#3-mediapipe-selfie-segmentation-google-llc) (Google LLC)
+- **MediaPipe Selfie Multiclass**: [Apache License 2.0](models/LICENSE.md#4-mediapipe-selfie-multiclass-google-llc) (Google LLC)
+- **MobileNetV3 LRASPP Segmenter**: [BSD 3-Clause License](models/LICENSE.md#5-mobilenetv3-lraspp-segmenter-pytorch--torchvision) (TorchVision / PyTorch Contributors)
+- **YOLO11 Instance Segmenter**: [GNU AGPL-3.0](models/LICENSE.md#6-yolo11-instance-segmenter-ultralytics) (Ultralytics LLC)
+
+For full license texts and copyright notices, see [`models/LICENSE.md`](models/LICENSE.md).
 
 ---
 
