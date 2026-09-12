@@ -2117,10 +2117,18 @@ class IntelNPUCtrls:
 
     def supported(self):
         dev_str = self.device.path if hasattr(self.device, 'path') else str(self.device)
+        dev_real = self.device.real_path if hasattr(self.device, 'real_path') else ""
         dev_name = self.device.name if hasattr(self.device, 'name') else ""
-        if 'video72' in dev_str or 'Intel NPU' in dev_name:
+        if 'video72' in dev_str or 'video72' in dev_real or 'Intel NPU' in dev_name:
             return True
-        return os.path.exists(self.config_path) or os.path.exists('/dev/video72')
+        try:
+            cfg = self.load_config()
+            out_dev = cfg.get("video", {}).get("output_device", "/dev/video72")
+            if out_dev and (out_dev in dev_str or out_dev in dev_real or out_dev in dev_name):
+                return True
+        except Exception:
+            pass
+        return False
 
     def load_config(self):
         default_cfg = {
