@@ -310,7 +310,7 @@ class CameraCtrlsWindow(Gtk.ApplicationWindow):
             for cat in page.categories:
                 if page.target != 'footer':
                     c_label = Gtk.Label(xalign=0, margin_bottom=10, margin_top=10)
-                    c_label.set_markup(f'<b>{cat.title}</b>')
+                    c_label.set_markup(f'<b>{GLib.markup_escape_text(cat.title)}</b>')
                     page_box.pack_start(c_label, False, False, 0)
                 
                 ctrls_frame = Gtk.Frame()

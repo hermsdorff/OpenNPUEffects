@@ -68,11 +68,50 @@ sudo cp -a "$SRC_CAMERACTRLS/cameractrls" "$GLOBAL_BIN/cameractrls"
 sudo chmod +x "$GLOBAL_BIN/cameractrls"
 [ -d "$TARGET_HOME" ] && sudo -u "$TARGET_USER" ln -sf "$GLOBAL_BIN/cameractrls" "$TARGET_HOME/.local/bin/cameractrls" 2>/dev/null || true
 
-# 5. Instalar atalho de aplicativo no menu global (.desktop) para todos os usuários
-echo -e "${YELLOW}--> Configurando atalho no menu de aplicativos global ($GLOBAL_DESKTOP)...${NC}"
+# 5. Instalar ícone oficial e atalho de aplicativo no menu (.desktop) para todos os usuários
+echo -e "${YELLOW}--> Configurando atalhos de aplicativo e ícones no sistema...${NC}"
+ICON_SRC="$SRC_CAMERACTRLS/hu.irl.cameractrls.svg"
+[ ! -f "$ICON_SRC" ] && ICON_SRC="$CAMERACTRLS_DIR/pkg/hu.irl.cameractrls.svg"
+
+if [ -f "$ICON_SRC" ]; then
+    sudo mkdir -p /usr/share/icons/hicolor/scalable/apps
+    sudo cp -a "$ICON_SRC" /usr/share/icons/hicolor/scalable/apps/hu.irl.cameractrls.svg 2>/dev/null || true
+    if [ -d "$TARGET_HOME" ]; then
+        sudo -u "$TARGET_USER" mkdir -p "$TARGET_HOME/.local/share/icons/hicolor/scalable/apps" 2>/dev/null || true
+        sudo -u "$TARGET_USER" cp -a "$ICON_SRC" "$TARGET_HOME/.local/share/icons/hicolor/scalable/apps/hu.irl.cameractrls.svg" 2>/dev/null || true
+    fi
+fi
+
+# Instalar .desktop global e no perfil do usuário (para ter prioridade absoluta sobre Flatpaks)
 sudo cp -a "$SRC_CAMERACTRLS/hu.irl.cameractrls.desktop" "$GLOBAL_DESKTOP/hu.irl.cameractrls.desktop"
+sudo mkdir -p /usr/local/share/applications
+sudo cp -a "$SRC_CAMERACTRLS/hu.irl.cameractrls.desktop" /usr/local/share/applications/hu.irl.cameractrls.desktop 2>/dev/null || true
+
+if [ -d "$TARGET_HOME" ]; then
+    sudo -u "$TARGET_USER" mkdir -p "$TARGET_HOME/.local/share/applications" 2>/dev/null || true
+    sudo -u "$TARGET_USER" cp -a "$SRC_CAMERACTRLS/hu.irl.cameractrls.desktop" "$TARGET_HOME/.local/share/applications/hu.irl.cameractrls.desktop" 2>/dev/null || true
+    
+    # Se houver autostart do Flatpak antigo apontando para o sandbox, atualizar para o binário nativo
+    if [ -f "$TARGET_HOME/.config/autostart/hu.irl.cameractrls.desktop" ]; then
+        if grep -q "flatpak" "$TARGET_HOME/.config/autostart/hu.irl.cameractrls.desktop"; then
+            echo -e "${YELLOW}--> Atualizando autostart de Flatpak para o Cameractrls nativo da NPU...${NC}"
+            sudo -u "$TARGET_USER" sed -i 's|Exec=flatpak run.*|Exec=/usr/local/bin/cameractrls|g' "$TARGET_HOME/.config/autostart/hu.irl.cameractrls.desktop" 2>/dev/null || true
+        fi
+    fi
+fi
+
 if command -v update-desktop-database > /dev/null 2>&1; then
-    sudo update-desktop-database "$GLOBAL_DESKTOP" || true
+    sudo update-desktop-database "$GLOBAL_DESKTOP" 2>/dev/null || true
+    sudo update-desktop-database /usr/local/share/applications 2>/dev/null || true
+    [ -d "$TARGET_HOME" ] && sudo -u "$TARGET_USER" update-desktop-database "$TARGET_HOME/.local/share/applications" 2>/dev/null || true
+fi
+
+# Detectar se o Cameractrls Flatpak está instalado e avisar sobre conflito potencial
+if command -v flatpak >/dev/null 2>&1 && flatpak list 2>/dev/null | grep -q "hu.irl.cameractrls"; then
+    echo -e "${YELLOW}⚠️  Atenção: Foi detectada uma instalação anterior do Cameractrls via Flatpak.${NC}"
+    echo -e "${YELLOW}   O atalho do usuário em ~/.local/share/applications foi configurado com prioridade máxima.${NC}"
+    echo -e "${YELLOW}   Para evitar qualquer conflito, recomenda-se desinstalar o pacote Flatpak:${NC}"
+    echo -e "${BOLD}   flatpak uninstall hu.irl.cameractrls${NC}"
 fi
 
 # 6. Testar sintaxe dos arquivos modificados
