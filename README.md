@@ -14,7 +14,7 @@
 *The open-source alternative to Windows Studio Effects on Linux.*  
 Run background blur, exact chair contour retention, auto-framing, eye contact correction, 3D parallax, and deep neural noise suppression natively on the **Intel NPU** with near-zero CPU and GPU overhead!
 
-[English](README.md) • [Português (Guia Completo)](GUIA_NPU_STUDIO.md) • [Passo a Passo Técnico](PASSO_A_PASSO.md)
+[Documentation](README.md) • [User Guide & Effects Catalogue](NPU_STUDIO_GUIDE.md) • [Technical Step-by-Step](STEP_BY_STEP.md)
 
 </div>
 
@@ -145,8 +145,8 @@ OpenNPUEffects/
 ├── install_all.sh                    # Master 1-click automated installer
 ├── uninstall.sh                      # Clean automated uninstaller
 ├── README.md                         # Project documentation
-├── GUIA_NPU_STUDIO.md                # Full user guide and effect catalogue (Portuguese)
-├── PASSO_A_PASSO.md                  # Technical architecture walkthrough
+├── NPU_STUDIO_GUIDE.md               # Full user guide and effect catalogue
+├── STEP_BY_STEP.md                   # Technical architecture walkthrough
 ├── LICENSE                           # MIT License
 ├── scripts/
 │   ├── 01_install_npu_drivers.sh     # Intel NPU Level Zero UMD drivers

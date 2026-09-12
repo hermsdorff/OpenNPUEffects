@@ -1,29 +1,29 @@
-# Licenças dos Modelos de Inteligência Artificial (AI Model Licenses)
+# AI Model Licenses
 
-Este documento descreve as licenças individuais, origens e termos de uso de todos os modelos neurais pré-treinados utilizados pelo projeto **Open NPU Effects**.
+This document details the individual licenses, origins, and terms of use for all pre-trained neural network models used by the **Open NPU Effects** project.
 
-O código-fonte do projeto Open NPU Effects é distribuído sob a **Licença MIT** (consulte [`../LICENSE`](../LICENSE)). Os modelos de redes neurais incluídos ou baixados pelo projeto possuem suas próprias licenças de software livre e código aberto, conforme detalhado abaixo.
+The source code of the Open NPU Effects project is distributed under the **MIT License** (see [`../LICENSE`](../LICENSE)). The neural network models bundled or downloaded by the project are subject to their respective open-source licenses, as described in detail below.
 
 ---
 
-## Sumário dos Modelos e Licenças
+## Summary of Models and Licenses
 
-| Modelo | Arquivos | Finalidade | Autor / Projeto Original | Licença |
+| Model | Files | Purpose | Original Author / Project | License |
 | :--- | :--- | :--- | :--- | :--- |
-| **Intel PoCoNet** | `audio/noise-suppression-poconetlike-0001.*` | Supressão de ruído profundo em tempo real para voz | [Intel Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo) | [Apache 2.0](#1-intel-poconet-noise-suppression) |
-| **YuNet Face Detector** | `video/face_detection_yunet_2023mar.onnx` | Detecção facial rápida para Auto-Framing | [Shiqi Yu / OpenCV Zoo](https://github.com/opencv/opencv_zoo) | [Apache 2.0](#2-yunet-face-detector-opencv-zoo) |
-| **MediaPipe Selfie Segmentation** | `video/selfie_segmentation_static.*` | Segmentação estática de pessoa (144x256 FP16 NPU) | [Google LLC / MediaPipe](https://github.com/google/mediapipe) | [Apache 2.0](#3-mediapipe-selfie-segmentation-google-llc) |
-| **MediaPipe Selfie Multiclass** | `video/selfie_multiclass.*` | Segmentação multiclasse (pele, cabelo, roupas, corpo) | [Google LLC / MediaPipe](https://github.com/google/mediapipe) | [Apache 2.0](#4-mediapipe-selfie-multiclass-google-llc) |
-| **MobileNetV3 LRASPP** | `video/chair_segmenter.*` | Segmentação semântica 21 classes (fallback cadeira) | [PyTorch / TorchVision Contributors](https://github.com/pytorch/vision) | [BSD 3-Clause](#5-mobilenetv3-lraspp-segmenter-pytorch--torchvision) |
-| **YOLACT ResNet-50 FPN** | `video/chair_instance_segmenter.*` | Segmentação de instâncias para retenção de cadeira | [Daniel Bolya et al. (UC Davis)](https://github.com/dbolya/yolact) | [MIT](#6-yolact-resnet-50-fpn-instance-segmenter-uc-davis--intel-omz) |
+| **Intel PoCoNet** | `audio/noise-suppression-poconetlike-0001.*` | Real-time deep noise suppression for voice | [Intel Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo) | [Apache 2.0](#1-intel-poconet-noise-suppression) |
+| **YuNet Face Detector** | `video/face_detection_yunet_2023mar.onnx` | Fast face detection for Auto-Framing | [Shiqi Yu / OpenCV Zoo](https://github.com/opencv/opencv_zoo) | [Apache 2.0](#2-yunet-face-detector-opencv-zoo) |
+| **MediaPipe Selfie Segmentation** | `video/selfie_segmentation_static.*` | Static person segmentation (144x256 FP16 NPU) | [Google LLC / MediaPipe](https://github.com/google/mediapipe) | [Apache 2.0](#3-mediapipe-selfie-segmentation-google-llc) |
+| **MediaPipe Selfie Multiclass** | `video/selfie_multiclass.*` | Multiclass segmentation (skin, hair, clothes, body) | [Google LLC / MediaPipe](https://github.com/google/mediapipe) | [Apache 2.0](#4-mediapipe-selfie-multiclass-google-llc) |
+| **MobileNetV3 LRASPP** | `video/chair_segmenter.*` | 21-class semantic segmentation (chair fallback) | [PyTorch / TorchVision Contributors](https://github.com/pytorch/vision) | [BSD 3-Clause](#5-mobilenetv3-lraspp-segmenter-pytorch--torchvision) |
+| **YOLACT ResNet-50 FPN** | `video/chair_instance_segmenter.*` | Instance segmentation for precise chair retention | [Daniel Bolya et al. (UC Davis)](https://github.com/dbolya/yolact) | [MIT](#6-yolact-resnet-50-fpn-instance-segmenter-uc-davis--intel-omz) |
 
 ---
 
 ## 1. Intel PoCoNet Noise Suppression
-- **Arquivos:** `audio/noise-suppression-poconetlike-0001.xml`, `audio/noise-suppression-poconetlike-0001.bin`
-- **Origem:** [Intel Open Model Zoo](https://storage.openvinotoolkit.org/repositories/open_model_zoo/2023.0/models_bin/1/noise-suppression-poconetlike-0001/FP16/)
+- **Files:** `audio/noise-suppression-poconetlike-0001.xml`, `audio/noise-suppression-poconetlike-0001.bin`
+- **Source:** [Intel Open Model Zoo](https://storage.openvinotoolkit.org/repositories/open_model_zoo/2023.0/models_bin/1/noise-suppression-poconetlike-0001/FP16/)
 - **Copyright:** Copyright (c) 2021-2024 Intel Corporation
-- **Licença:** **Apache License, Version 2.0**
+- **License:** **Apache License, Version 2.0**
 
 ```text
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,11 +42,11 @@ limitations under the License.
 ---
 
 ## 2. YuNet Face Detector (OpenCV Zoo)
-- **Arquivo:** `video/face_detection_yunet_2023mar.onnx`
-- **Origem:** [OpenCV Zoo - Face Detection YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet)
-- **Autores:** Shiqi Yu (Shenzhen University) & OpenCV Team
+- **File:** `video/face_detection_yunet_2023mar.onnx`
+- **Source:** [OpenCV Zoo - Face Detection YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet)
+- **Authors:** Shiqi Yu (Shenzhen University) & OpenCV Team
 - **Copyright:** Copyright (c) OpenCV Team and contributors
-- **Licença:** **Apache License, Version 2.0**
+- **License:** **Apache License, Version 2.0**
 
 ```text
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -65,10 +65,10 @@ limitations under the License.
 ---
 
 ## 3. MediaPipe Selfie Segmentation (Google LLC)
-- **Arquivos:** `video/selfie_segmentation_static.xml`, `video/selfie_segmentation_static.bin`
-- **Origem:** [Google MediaPipe](https://github.com/google/mediapipe) / [PINTO_model_zoo](https://github.com/PINTO0309/PINTO_model_zoo)
+- **Files:** `video/selfie_segmentation_static.xml`, `video/selfie_segmentation_static.bin`
+- **Source:** [Google MediaPipe](https://github.com/google/mediapipe) / [PINTO_model_zoo](https://github.com/PINTO0309/PINTO_model_zoo)
 - **Copyright:** Copyright (c) 2020-2024 Google LLC
-- **Licença:** **Apache License, Version 2.0**
+- **License:** **Apache License, Version 2.0**
 
 ```text
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -87,10 +87,10 @@ limitations under the License.
 ---
 
 ## 4. MediaPipe Selfie Multiclass (Google LLC)
-- **Arquivos:** `video/selfie_multiclass.xml`, `video/selfie_multiclass.bin`
-- **Origem:** [Google MediaPipe](https://github.com/google/mediapipe) / [PINTO_model_zoo](https://github.com/PINTO0309/PINTO_model_zoo)
+- **Files:** `video/selfie_multiclass.xml`, `video/selfie_multiclass.bin`
+- **Source:** [Google MediaPipe](https://github.com/google/mediapipe) / [PINTO_model_zoo](https://github.com/PINTO0309/PINTO_model_zoo)
 - **Copyright:** Copyright (c) 2021-2024 Google LLC
-- **Licença:** **Apache License, Version 2.0**
+- **License:** **Apache License, Version 2.0**
 
 ```text
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -109,10 +109,10 @@ limitations under the License.
 ---
 
 ## 5. MobileNetV3 LRASPP Segmenter (PyTorch / TorchVision)
-- **Arquivos:** `video/chair_segmenter.xml`, `video/chair_segmenter.bin`
-- **Origem:** [PyTorch TorchVision](https://github.com/pytorch/vision)
+- **Files:** `video/chair_segmenter.xml`, `video/chair_segmenter.bin`
+- **Source:** [PyTorch TorchVision](https://github.com/pytorch/vision)
 - **Copyright:** Copyright (c) Soumith Chintala 2016, PyTorch and TorchVision Contributors
-- **Licença:** **BSD 3-Clause License**
+- **License:** **BSD 3-Clause License**
 
 ```text
 Redistribution and use in source and binary forms, with or without
@@ -144,11 +144,11 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ---
 
 ## 6. YOLACT ResNet-50 FPN Instance Segmenter (UC Davis / Intel OMZ)
-- **Arquivos:** `video/chair_instance_segmenter.xml`, `video/chair_instance_segmenter.bin`
-- **Origem:** [dbolya/yolact](https://github.com/dbolya/yolact) / [Intel Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/yolact-resnet50-fpn-pytorch)
-- **Autores:** Daniel Bolya, Chong Zhou, Fanyi Xiao, Yong Jae Lee (University of California, Davis)
+- **Files:** `video/chair_instance_segmenter.xml`, `video/chair_instance_segmenter.bin`
+- **Source:** [dbolya/yolact](https://github.com/dbolya/yolact) / [Intel Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/yolact-resnet50-fpn-pytorch)
+- **Authors:** Daniel Bolya, Chong Zhou, Fanyi Xiao, Yong Jae Lee (University of California, Davis)
 - **Copyright:** Copyright (c) 2019 Daniel Bolya
-- **Licença:** **MIT License**
+- **License:** **MIT License**
 
 ```text
 MIT License
@@ -176,7 +176,7 @@ SOFTWARE.
 
 ---
 
-## Texto Completo da Licença Apache 2.0 (Apache License, Version 2.0)
+## Full Text of the Apache License, Version 2.0
 
 ```text
                               Apache License
