@@ -112,14 +112,14 @@ dmesg | grep -i vpu
 
 #### What it does:
 1. Installs dynamic kernel module support (`v4l2loopback-dkms`) and video utilities (`v4l-utils`).
-2. Creates persistent kernel module options at `/etc/modprobe.d/v4l2loopback.conf`:
+2. Safely configures persistent kernel module options at `/etc/modprobe.d/v4l2loopback.conf` (preserving any existing virtual cameras without modifying them):
    ```ini
-   options v4l2loopback devices=3 video_nr=70,71,72 card_label="Iriun Webcam","OBS Virtual Cam","Intel NPU Enhanced Webcam" exclusive_caps=1,1,1 max_buffers=6
+   options v4l2loopback devices=... video_nr=... card_label="...,Intel NPU Enhanced Webcam" exclusive_caps=... max_buffers=6
    ```
-   - **`video_nr=70,71,72`**: Allocates high, deterministic minor numbers to prevent collisions with physical USB webcams on `/dev/video0` or `/dev/video1`.
-   - **`card_label`**: Sets the human-readable display name *"Intel NPU Enhanced Webcam"*, making device selection seamless in Google Meet, Zoom, Teams, OBS, and Slack.
+   - **`video_nr=72`**: Allocates a high, deterministic minor number to prevent collisions with physical USB webcams on `/dev/video0` or `/dev/video1`.
+   - **`card_label`**: Adds *"Intel NPU Enhanced Webcam"*, making device selection seamless in Google Meet, Zoom, Teams, OBS, and Slack.
    - **`max_buffers=6`**: **Critical requirement!** Cameractrls (`cameraview.py:509`) strictly requires 6 streaming queue buffers. Without this setting, Cameractrls fails with an *insufficient buffer memory* error.
-   - **`exclusive_caps=1`**: Prevents web browsers from attempting to open the virtual camera as an output device instead of a capture device.
+   - **`exclusive_caps=1`**: Ensures Chromium and WebRTC recognize the virtual device strictly as a capture camera.
 3. Adds `v4l2loopback` to `/etc/modules-load.d/v4l2loopback.conf` to guarantee loading on every system boot.
 
 #### How to audit/verify:

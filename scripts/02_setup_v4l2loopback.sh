@@ -71,10 +71,71 @@ else
 fi
 
 # 4. Configurar parâmetros do v4l2loopback (/etc/modprobe.d/v4l2loopback.conf)
-echo -e "${YELLOW}--> Configurando /etc/modprobe.d/v4l2loopback.conf...${NC}"
-sudo tee /etc/modprobe.d/v4l2loopback.conf > /dev/null << 'CONF'
-options v4l2loopback devices=3 video_nr=70,71,72 card_label="Iriun Webcam","OBS Virtual Cam","Intel NPU Enhanced Webcam" exclusive_caps=1,1,1 max_buffers=6
-CONF
+echo -e "${YELLOW}--> Configurando /etc/modprobe.d/v4l2loopback.conf (preservando câmeras virtuais existentes)...${NC}"
+sudo python3 -c '
+import re
+from pathlib import Path
+
+conf_path = Path("/etc/modprobe.d/v4l2loopback.conf")
+target_label = "Intel NPU Enhanced Webcam"
+target_nr = 72
+
+lines = []
+if conf_path.exists():
+    try:
+        lines = conf_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        lines = []
+
+opt_idx = -1
+for idx, line in enumerate(lines):
+    if line.strip().startswith("options v4l2loopback"):
+        opt_idx = idx
+        break
+
+if opt_idx == -1:
+    lines.append(f"options v4l2loopback devices=1 video_nr={target_nr} card_label=\"{target_label}\" exclusive_caps=1 max_buffers=6")
+else:
+    opt_line = lines[opt_idx]
+    m_card = re.search(r"card_label=(.*?)(?=\s+[a-z_]+|\s*$)", opt_line)
+    existing_labels = []
+    if m_card:
+        existing_labels = [l.strip(" \"'\t") for l in m_card.group(1).split(",") if l.strip(" \"'\t")]
+    
+    m_nr = re.search(r"video_nr=([0-9,]+)", opt_line)
+    existing_nrs = [int(n) for n in m_nr.group(1).split(",") if n] if m_nr else []
+    
+    m_caps = re.search(r"exclusive_caps=([0-9,]+)", opt_line)
+    existing_caps = [c for c in m_caps.group(1).split(",") if c] if m_caps else []
+
+    m_buf = re.search(r"max_buffers=(\d+)", opt_line)
+    max_buf = max(6, int(m_buf.group(1))) if m_buf else 6
+
+    if target_label not in existing_labels:
+        existing_labels.append(target_label)
+        if target_nr in existing_nrs:
+            target_nr = max(existing_nrs) + 1 if existing_nrs else target_nr
+        existing_nrs.append(target_nr)
+        while len(existing_caps) < len(existing_labels):
+            existing_caps.append("1")
+    else:
+        if not existing_nrs:
+            existing_nrs = [target_nr]
+        while len(existing_caps) < len(existing_labels):
+            existing_caps.append("1")
+
+    dev_count = len(existing_labels)
+    lines[opt_idx] = (
+        f"options v4l2loopback devices={dev_count} "
+        f"video_nr={\",\".join(map(str, existing_nrs))} "
+        f"card_label=\"{\",\".join(existing_labels)}\" "
+        f"exclusive_caps={\",\".join(existing_caps)} "
+        f"max_buffers={max_buf}"
+    )
+
+conf_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+print("    ✓ /etc/modprobe.d/v4l2loopback.conf configurado preservando dispositivos existentes.")
+'
 
 # 5. Configurar inicialização automática no boot (/etc/modules-load.d/v4l2loopback.conf)
 echo -e "${YELLOW}--> Garantindo carregamento automático do módulo no boot...${NC}"

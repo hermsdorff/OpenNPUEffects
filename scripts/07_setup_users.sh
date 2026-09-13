@@ -55,6 +55,74 @@ setup_one_user() {
         echo -e "    ${BOLD}npu-ctl start${NC}"
     fi
 
+    # 4. Configurar câmera e microfone virtuais como padrão do usuário (Navegadores e Áudio)
+    echo -e "    Configurando dispositivos virtuais como padrão..."
+    python3 -c "
+import json
+from pathlib import Path
+
+user_home = Path('$user_home')
+
+# 1. Atualizar navegadores Chromium/Chrome/Brave/Edge
+browser_roots = [
+    user_home / '.config/google-chrome',
+    user_home / '.config/chromium',
+    user_home / '.config/BraveSoftware/Brave-Browser',
+    user_home / '.config/microsoft-edge',
+    user_home / '.config/microsoft-edge-dev',
+]
+cam_name = 'Intel NPU Enhanced Webcam'
+for b_dir in browser_roots:
+    if not b_dir.exists():
+        continue
+    for pref_file in b_dir.glob('**/Preferences'):
+        try:
+            with open(pref_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            media = data.setdefault('media', {})
+            # Video: NPU virtual webcam top priority
+            v_in = media.setdefault('video_input', {})
+            v_rank = v_in.setdefault('user_preference_ranking', [])
+            if cam_name in v_rank:
+                v_rank.remove(cam_name)
+            v_rank.insert(0, cam_name)
+            # Audio: default top priority (inherits npu_clearvoice)
+            a_in = media.setdefault('audio_input', {})
+            a_rank = a_in.setdefault('user_preference_ranking', [])
+            if 'default' in a_rank:
+                a_rank.remove('default')
+            a_rank.insert(0, 'default')
+            with open(pref_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+# 2. Atualizar WirePlumber default-nodes state se existir
+wp_nodes = user_home / '.local/state/wireplumber/default-nodes'
+if wp_nodes.exists():
+    try:
+        content = wp_nodes.read_text(encoding='utf-8')
+        lines = []
+        has_src = False
+        for line in content.splitlines():
+            if line.startswith('default.configured.audio.source='):
+                lines.append('default.configured.audio.source=npu_clearvoice')
+                has_src = True
+            else:
+                lines.append(line)
+        if not has_src:
+            lines.append('default.configured.audio.source=npu_clearvoice')
+        wp_nodes.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    except Exception:
+        pass
+" 2>/dev/null || true
+
+    local target_uid=$(id -u "$target_user" 2>/dev/null || echo "1000")
+    if [ -d "/run/user/$target_uid" ]; then
+        sudo -u "$target_user" XDG_RUNTIME_DIR="/run/user/$target_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$target_uid/bus" pactl set-default-source npu_clearvoice 2>/dev/null || true
+    fi
+    echo -e "    Câmera e microfone padrão: ${GREEN}Configurados${NC}"
+
     echo -e "${GREEN}✓ Usuário '$target_user' pronto para usar a Intel NPU!${NC}\n"
 }
 

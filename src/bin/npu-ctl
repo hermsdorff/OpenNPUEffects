@@ -1430,6 +1430,74 @@ cmd_restore_cameractrls() {
     echo -e "${GREEN}✓ Cameractrls atualizado com a aba Intel NPU e barra de rolagem permanente.${NC}"
 }
 
+cmd_make_default() {
+    echo -e "${CYAN}======================================================${NC}"
+    echo -e "${CYAN}  Definindo Câmera e Microfone Intel NPU como Padrão  ${NC}"
+    echo -e "${CYAN}======================================================${NC}"
+
+    # 1. Microfone padrão no PipeWire / PulseAudio
+    if pactl set-default-source npu_clearvoice 2>/dev/null; then
+        echo -e "  - Microfone padrão PipeWire: ${GREEN}npu_clearvoice [OK]${NC}"
+    else
+        echo -e "  - Microfone padrão PipeWire: ${YELLOW}Aguardando início do npu-audio.service...${NC}"
+    fi
+
+    # 2. WirePlumber default nodes
+    wp_nodes="$HOME/.local/state/wireplumber/default-nodes"
+    if [ -f "$wp_nodes" ]; then
+        sed -i 's/^default\.configured\.audio\.source=.*/default.configured.audio.source=npu_clearvoice/' "$wp_nodes"
+        echo -e "  - WirePlumber estado de áudio: ${GREEN}npu_clearvoice [OK]${NC}"
+    fi
+
+    # 3. Navegadores Chromium, Chrome, Brave, Edge
+    python3 -c "
+import json
+from pathlib import Path
+
+user_home = Path.home()
+browser_roots = [
+    user_home / '.config/google-chrome',
+    user_home / '.config/chromium',
+    user_home / '.config/BraveSoftware/Brave-Browser',
+    user_home / '.config/microsoft-edge',
+    user_home / '.config/microsoft-edge-dev',
+]
+cam_name = 'Intel NPU Enhanced Webcam'
+count = 0
+for b_dir in browser_roots:
+    if not b_dir.exists():
+        continue
+    for pref_file in b_dir.glob('**/Preferences'):
+        try:
+            with open(pref_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            media = data.setdefault('media', {})
+            # Video: NPU virtual webcam top priority
+            v_in = media.setdefault('video_input', {})
+            v_rank = v_in.setdefault('user_preference_ranking', [])
+            if cam_name in v_rank:
+                v_rank.remove(cam_name)
+            v_rank.insert(0, cam_name)
+            # Audio: default top priority (inherits npu_clearvoice)
+            a_in = media.setdefault('audio_input', {})
+            a_rank = a_in.setdefault('user_preference_ranking', [])
+            if 'default' in a_rank:
+                a_rank.remove('default')
+            a_rank.insert(0, 'default')
+            with open(pref_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+            count += 1
+        except Exception:
+            pass
+if count > 0:
+    print(f'  - Perfis de navegadores web atualizados: \033[0;32m{count} perfis (Google Meet / Teams / Zoom) [OK]\033[0m')
+else:
+    print('  - Perfis de navegadores web: \033[0;33mNenhum perfil Chromium detectado ainda\033[0m')
+" 2>/dev/null || true
+
+    echo -e "${GREEN}✓ Câmera e microfone virtuais da Intel NPU definidos como padrão com sucesso!${NC}\n"
+}
+
 case "$1" in
     status|"")
         cmd_status
@@ -1574,6 +1642,9 @@ case "$1" in
         echo "Serviços reiniciados."
         cmd_status
         ;;
+    make-default|padrao|set-default)
+        cmd_make_default
+        ;;
     logs)
         case "$2" in
             audio)
@@ -1590,6 +1661,7 @@ case "$1" in
     help|--help|-h)
         echo "Uso do npu-ctl:"
         echo "  npu-ctl status                   Exibe status da NPU, dispositivos e serviços"
+        echo "  npu-ctl make-default             Define câmera e microfone virtuais NPU como padrão (sistema e navegadores)"
         echo "  npu-ctl cam-source [<1,2..|auto>] Seleciona qual webcam física (PIXY ou Notebook) alimenta a NPU"
         echo "  npu-ctl mic-source [<1,2..|auto>] Seleciona qual microfone físico (PIXY, USB, Notebook) alimenta a NPU"
         echo "  npu-ctl blur [on|off|<5-99>]     Ativa, desativa ou ajusta nível do desfoque"

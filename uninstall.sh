@@ -174,12 +174,73 @@ if [ "$PURGE_ALL" = true ]; then
         fi
     done < /etc/passwd
 
-    # Remover regras do v4l2loopback criadas pelo projeto
+    # Remover regras do v4l2loopback criadas pelo projeto (preservando outras câmeras se houver)
     if [ -f "/etc/modprobe.d/v4l2loopback.conf" ]; then
-        echo -e "    Removendo /etc/modprobe.d/v4l2loopback.conf"
-        sudo rm -f "/etc/modprobe.d/v4l2loopback.conf"
+        echo -e "    Removendo Intel NPU Enhanced Webcam de /etc/modprobe.d/v4l2loopback.conf..."
+        sudo python3 -c '
+import re
+from pathlib import Path
+
+conf_path = Path("/etc/modprobe.d/v4l2loopback.conf")
+target_label = "Intel NPU Enhanced Webcam"
+target_nr = 72
+
+if conf_path.exists():
+    lines = conf_path.read_text(encoding="utf-8").splitlines()
+    new_lines = []
+    has_other_cameras = False
+    for line in lines:
+        if line.strip().startswith("options v4l2loopback"):
+            opt_line = line.strip()
+            m_card = re.search(r"card_label=(.*?)(?=\s+[a-z_]+|\s*$)", opt_line)
+            existing_labels = []
+            if m_card:
+                existing_labels = [l.strip(" \"'\t") for l in m_card.group(1).split(",") if l.strip(" \"'\t")]
+            
+            if target_label in existing_labels:
+                idx = existing_labels.index(target_label)
+                existing_labels.pop(idx)
+                
+                m_nr = re.search(r"video_nr=([0-9,]+)", opt_line)
+                existing_nrs = [int(n) for n in m_nr.group(1).split(",") if n] if m_nr else []
+                if idx < len(existing_nrs):
+                    existing_nrs.pop(idx)
+                elif target_nr in existing_nrs:
+                    existing_nrs.remove(target_nr)
+                    
+                m_caps = re.search(r"exclusive_caps=([0-9,]+)", opt_line)
+                existing_caps = [c for c in m_caps.group(1).split(",") if c] if m_caps else []
+                if idx < len(existing_caps):
+                    existing_caps.pop(idx)
+                    
+                m_buf = re.search(r"max_buffers=(\d+)", opt_line)
+                max_buf = max(2, int(m_buf.group(1))) if m_buf else 2
+
+                if existing_labels:
+                    has_other_cameras = True
+                    dev_count = len(existing_labels)
+                    new_lines.append(
+                        f"options v4l2loopback devices={dev_count} "
+                        f"video_nr={\",\".join(map(str, existing_nrs))} "
+                        f"card_label=\"{\",\".join(existing_labels)}\" "
+                        f"exclusive_caps={\",\".join(existing_caps)} "
+                        f"max_buffers={max_buf}"
+                    )
+            else:
+                new_lines.append(line)
+                has_other_cameras = True
+        else:
+            new_lines.append(line)
+            
+    if has_other_cameras:
+        conf_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        print("    ✓ Outras câmeras virtuais foram preservadas em /etc/modprobe.d/v4l2loopback.conf.")
+    else:
+        conf_path.unlink(missing_ok=True)
+        print("    ✓ Removido /etc/modprobe.d/v4l2loopback.conf (nenhuma outra câmera restante).")
+'
     fi
-    if [ -f "/etc/modules-load.d/v4l2loopback.conf" ]; then
+    if [ ! -f "/etc/modprobe.d/v4l2loopback.conf" ] && [ -f "/etc/modules-load.d/v4l2loopback.conf" ]; then
         echo -e "    Removendo /etc/modules-load.d/v4l2loopback.conf"
         sudo rm -f "/etc/modules-load.d/v4l2loopback.conf"
     fi

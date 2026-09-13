@@ -163,6 +163,7 @@ The `npu-ctl` command-line utility provides instant control from any terminal:
 ```bash
 # === STATUS & DIAGNOSTICS ===
 npu-ctl status                  # Comprehensive status of NPU, devices, and effects
+npu-ctl make-default            # Set virtual camera & mic as system & browser defaults
 npu-ctl logs [cam|audio]        # Follow live service logs
 
 # === SERVICE MANAGEMENT ===
