@@ -57,11 +57,12 @@ setup_one_user() {
 
     # 4. Configurar câmera e microfone virtuais como padrão do usuário (Navegadores e Áudio)
     echo -e "    Configurando dispositivos virtuais como padrão..."
-    python3 -c "
+    python3 - "$user_home" << 'PYEOF' 2>/dev/null || true
+import sys
 import json
 from pathlib import Path
 
-user_home = Path('$user_home')
+user_home = Path(sys.argv[1])
 
 # 1. Atualizar navegadores Chromium/Chrome/Brave/Edge
 browser_roots = [
@@ -115,7 +116,7 @@ if wp_nodes.exists():
         wp_nodes.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     except Exception:
         pass
-" 2>/dev/null || true
+PYEOF
 
     local target_uid=$(id -u "$target_user" 2>/dev/null || echo "1000")
     if [ -d "/run/user/$target_uid" ]; then

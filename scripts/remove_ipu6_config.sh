@@ -26,7 +26,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(dirname "$SCRIPT_DIR")"
 
-# 1. Parar e remover serviço systemd de rotação Samsung se existir
+# 1. Parar e remover serviços systemd residuais (ipu-bridge-check-upstream e galaxy-webcam)
 echo -e "${YELLOW}--> Verificando serviços residuais da IPU6...${NC}"
 if systemctl is-active --quiet ipu-bridge-check-upstream.service 2>/dev/null; then
     systemctl stop ipu-bridge-check-upstream.service 2>/dev/null || true
@@ -38,6 +38,21 @@ if [ -f "/etc/systemd/system/ipu-bridge-check-upstream.service" ]; then
     systemctl daemon-reload
     echo -e "    Serviço 'ipu-bridge-check-upstream': ${GREEN}Removido${NC}"
 fi
+
+# Remover serviço do usuário galaxy-webcam se existir em qualquer pasta de usuário
+for u_home in /home/*; do
+    if [ -f "$u_home/.config/systemd/user/galaxy-webcam.service" ]; then
+        u_name=$(basename "$u_home")
+        u_uid=$(id -u "$u_name" 2>/dev/null || echo "")
+        if [ -n "$u_uid" ] && [ -d "/run/user/$u_uid" ]; then
+            sudo -u "$u_name" XDG_RUNTIME_DIR="/run/user/$u_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$u_uid/bus" systemctl --user stop galaxy-webcam.service 2>/dev/null || true
+            sudo -u "$u_name" XDG_RUNTIME_DIR="/run/user/$u_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$u_uid/bus" systemctl --user disable galaxy-webcam.service 2>/dev/null || true
+        fi
+        rm -f "$u_home/.config/systemd/user/galaxy-webcam.service"
+        rm -f "$u_home/.config/systemd/user/default.target.wants/galaxy-webcam.service"
+        echo -e "    Serviço 'galaxy-webcam' do usuário $u_name: ${GREEN}Removido${NC}"
+    fi
+done
 
 # 2. Remover módulos DKMS do sensor e bridge da câmera do notebook
 echo -e "${YELLOW}--> Verificando módulos DKMS (ipu-bridge-fix e ov02c10)...${NC}"

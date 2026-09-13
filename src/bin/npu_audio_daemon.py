@@ -63,7 +63,9 @@ def load_config():
             "compressor_enabled": True,
             "comp_target_db": -18.0,
             "dereverb_enabled": True,
-            "dereverb_strength": 40
+            "dereverb_strength": 40,
+            "auto_standby": True,
+            "standby_timeout": 3.0
         }
     }
     try:
@@ -124,6 +126,34 @@ def get_current_default_sink():
             if "npu" not in s_name.lower() and "null" not in s_name.lower():
                 return s_name
     return None
+
+def get_pactl_object_id(list_cmd, target_name):
+    """Percorre a saida 'curta' do pactl (id \t nome \t ...) e retorna o id
+    numerico do objeto (source, sink, etc.) cujo nome bate com target_name."""
+    out = run_cmd(list_cmd)
+    for line in out.splitlines():
+        parts = line.split('\t')
+        if len(parts) >= 2 and parts[1] == target_name:
+            return parts[0]
+    return None
+
+def count_active_source_consumers(source_name):
+    """Conta quantos source-outputs (consumidores reais, ex.: Zoom/Teams/Meet)
+    estao conectados ao microfone virtual da NPU. A propria injecao de audio
+    do daemon (out_proc via pw-play) entra como sink-input no null-sink, e nao
+    como source-output, entao nao precisa ser excluida do resultado."""
+    src_id = get_pactl_object_id("pactl list sources short", source_name)
+    if src_id is None:
+        return 0
+    out = run_cmd("pactl list source-outputs")
+    consumer_count = 0
+    for raw_line in out.splitlines():
+        line = raw_line.strip()
+        if line.startswith("Source:"):
+            current_source_id = line.split(":", 1)[1].strip()
+            if current_source_id == src_id:
+                consumer_count += 1
+    return consumer_count
 
 def setup_pipewire_virtual_devices(source_name="npu_clearvoice"):
     global loaded_modules
@@ -367,6 +397,12 @@ def main():
     out_proc = spawn_out_proc()
     in_proc = spawn_in_proc(hw_mic)
 
+    # Standby automatico: libera o microfone fisico (LED apagado) quando nenhum
+    # aplicativo estiver de fato consumindo o microfone virtual da NPU.
+    last_consumer_check = 0.0
+    last_active_time = time.time()
+    in_standby = False
+
     try:
         while running:
             now = time.time()
@@ -396,6 +432,41 @@ def main():
                     hw_mic = best_mic
                     in_proc = spawn_in_proc(hw_mic)
                     states = {n: np.zeros(inp_shapes[n], dtype=np.float32) for n in state_names}
+
+            # Standby automatico de audio (on-demand): libera o microfone fisico
+            # quando nenhum app (Zoom/Teams/Meet/etc.) estiver consumindo o
+            # microfone virtual 'npu_clearvoice' por mais que standby_timeout.
+            if cfg.get("auto_standby", True):
+                if now - last_consumer_check > 0.5:
+                    last_consumer_check = now
+                    active_consumers = count_active_source_consumers(source_name)
+                    if active_consumers > 0:
+                        last_active_time = now
+                        if in_standby:
+                            logging.info("Consumidor detectado no microfone virtual. Saindo do standby de audio...")
+                            in_standby = False
+
+                    standby_timeout = float(cfg.get("standby_timeout", 3.0))
+                    if active_consumers == 0 and not in_standby and (now - last_active_time) > standby_timeout:
+                        logging.info(f"Nenhum consumidor do microfone virtual ha {standby_timeout:.1f}s. Entrando em standby de audio (liberando microfone fisico)...")
+                        in_standby = True
+                        if in_proc:
+                            try:
+                                in_proc.terminate()
+                                in_proc.wait(timeout=0.3)
+                            except Exception:
+                                pass
+                            in_proc = None
+
+                if in_standby:
+                    # Mantem o stream vivo com silencio limpo, sem tocar no microfone fisico
+                    time.sleep(frame_duration)
+                    try:
+                        out_proc.stdin.write(silence_chunk)
+                        out_proc.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        out_proc = spawn_out_proc()
+                    continue
 
             # Safeguard: prevent illegal loopback (pw-record connected to npu_clearvoice)
             if in_proc and (now - last_loopback_check > 3.0):

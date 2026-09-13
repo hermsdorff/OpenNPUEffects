@@ -1,0 +1,1094 @@
+diff --git a/scripts/05_setup_pipeline_daemons.sh b/scripts/05_setup_pipeline_daemons.sh
+index 0117972..6693610 100755
+--- a/scripts/05_setup_pipeline_daemons.sh
++++ b/scripts/05_setup_pipeline_daemons.sh
+@@ -23,11 +23,12 @@ TARGET_UID=$(id -u "$TARGET_USER" 2>/dev/null || echo "1000")
+ OPT_DIR="/opt/npu-effects"
+ BIN_DEST="$OPT_DIR/bin"
+ CONFIG_DEFAULT="$OPT_DIR/config"
++ASSETS_DEST="$OPT_DIR/assets"
+ SYSTEMD_GLOBAL="/etc/systemd/user"
+ USER_CONFIG="$TARGET_HOME/.config/npu-effects"
+ 
+ echo -e "${YELLOW}--> Preparando diretórios do sistema e do usuário ($TARGET_USER)...${NC}"
+-sudo mkdir -p "$BIN_DEST" "$CONFIG_DEFAULT" "$SYSTEMD_GLOBAL"
++sudo mkdir -p "$BIN_DEST" "$CONFIG_DEFAULT" "$ASSETS_DEST" "$SYSTEMD_GLOBAL"
+ sudo mkdir -p "$USER_CONFIG/backgrounds"
+ sudo chown -R "$TARGET_USER:$TARGET_USER" "$USER_CONFIG"
+ [ -d "$TARGET_HOME/.local/bin" ] || sudo -u "$TARGET_USER" mkdir -p "$TARGET_HOME/.local/bin" 2>/dev/null || true
+@@ -45,6 +46,12 @@ sudo -u "$TARGET_USER" ln -sf "$BIN_DEST/npu-ctl" "$TARGET_HOME/.local/bin/npu-c
+ # 3. Instalar arquivo de configuração padrão em /opt e na home do usuário
+ echo -e "${YELLOW}--> Instalando templates de configuração padrão...${NC}"
+ sudo cp -a "$SRC_DIR/config/config.json" "$CONFIG_DEFAULT/config.json"
++
++# 3b. Instalar assets padrão (ex.: imagem de ausência/privacidade) em /opt
++if [ -d "$BASE_DIR/assets" ]; then
++    echo -e "${YELLOW}--> Instalando assets padrão em $ASSETS_DEST...${NC}"
++    sudo cp -a "$BASE_DIR/assets/"* "$ASSETS_DEST/" 2>/dev/null || true
++fi
+ if [ ! -f "$USER_CONFIG/config.json" ]; then
+     sudo cp -a "$SRC_DIR/config/config.json" "$USER_CONFIG/config.json"
+     sudo chown "$TARGET_USER:$TARGET_USER" "$USER_CONFIG/config.json"
+diff --git a/src/bin/npu_audio_daemon.py b/src/bin/npu_audio_daemon.py
+index 2c8bc5d..fbc6572 100755
+--- a/src/bin/npu_audio_daemon.py
++++ b/src/bin/npu_audio_daemon.py
+@@ -63,7 +63,9 @@ def load_config():
+             "compressor_enabled": True,
+             "comp_target_db": -18.0,
+             "dereverb_enabled": True,
+-            "dereverb_strength": 40
++            "dereverb_strength": 40,
++            "auto_standby": True,
++            "standby_timeout": 3.0
+         }
+     }
+     try:
+@@ -125,6 +127,34 @@ def get_current_default_sink():
+                 return s_name
+     return None
+ 
++def get_pactl_object_id(list_cmd, target_name):
++    """Percorre a saida 'curta' do pactl (id \t nome \t ...) e retorna o id
++    numerico do objeto (source, sink, etc.) cujo nome bate com target_name."""
++    out = run_cmd(list_cmd)
++    for line in out.splitlines():
++        parts = line.split('\t')
++        if len(parts) >= 2 and parts[1] == target_name:
++            return parts[0]
++    return None
++
++def count_active_source_consumers(source_name):
++    """Conta quantos source-outputs (consumidores reais, ex.: Zoom/Teams/Meet)
++    estao conectados ao microfone virtual da NPU. A propria injecao de audio
++    do daemon (out_proc via pw-play) entra como sink-input no null-sink, e nao
++    como source-output, entao nao precisa ser excluida do resultado."""
++    src_id = get_pactl_object_id("pactl list sources short", source_name)
++    if src_id is None:
++        return 0
++    out = run_cmd("pactl list source-outputs")
++    consumer_count = 0
++    for raw_line in out.splitlines():
++        line = raw_line.strip()
++        if line.startswith("Source:"):
++            current_source_id = line.split(":", 1)[1].strip()
++            if current_source_id == src_id:
++                consumer_count += 1
++    return consumer_count
++
+ def setup_pipewire_virtual_devices(source_name="npu_clearvoice"):
+     global loaded_modules
+     # 1. Clean up legacy intermediate sinks (NPU_Mic_Sink) or filters if present
+@@ -367,6 +397,12 @@ def main():
+     out_proc = spawn_out_proc()
+     in_proc = spawn_in_proc(hw_mic)
+ 
++    # Standby automatico: libera o microfone fisico (LED apagado) quando nenhum
++    # aplicativo estiver de fato consumindo o microfone virtual da NPU.
++    last_consumer_check = 0.0
++    last_active_time = time.time()
++    in_standby = False
++
+     try:
+         while running:
+             now = time.time()
+@@ -397,6 +433,41 @@ def main():
+                     in_proc = spawn_in_proc(hw_mic)
+                     states = {n: np.zeros(inp_shapes[n], dtype=np.float32) for n in state_names}
+ 
++            # Standby automatico de audio (on-demand): libera o microfone fisico
++            # quando nenhum app (Zoom/Teams/Meet/etc.) estiver consumindo o
++            # microfone virtual 'npu_clearvoice' por mais que standby_timeout.
++            if cfg.get("auto_standby", True):
++                if now - last_consumer_check > 0.5:
++                    last_consumer_check = now
++                    active_consumers = count_active_source_consumers(source_name)
++                    if active_consumers > 0:
++                        last_active_time = now
++                        if in_standby:
++                            logging.info("Consumidor detectado no microfone virtual. Saindo do standby de audio...")
++                            in_standby = False
++
++                    standby_timeout = float(cfg.get("standby_timeout", 3.0))
++                    if active_consumers == 0 and not in_standby and (now - last_active_time) > standby_timeout:
++                        logging.info(f"Nenhum consumidor do microfone virtual ha {standby_timeout:.1f}s. Entrando em standby de audio (liberando microfone fisico)...")
++                        in_standby = True
++                        if in_proc:
++                            try:
++                                in_proc.terminate()
++                                in_proc.wait(timeout=0.3)
++                            except Exception:
++                                pass
++                            in_proc = None
++
++                if in_standby:
++                    # Mantem o stream vivo com silencio limpo, sem tocar no microfone fisico
++                    time.sleep(frame_duration)
++                    try:
++                        out_proc.stdin.write(silence_chunk)
++                        out_proc.stdin.flush()
++                    except (BrokenPipeError, OSError):
++                        out_proc = spawn_out_proc()
++                    continue
++
+             # Safeguard: prevent illegal loopback (pw-record connected to npu_clearvoice)
+             if in_proc and (now - last_loopback_check > 3.0):
+                 last_loopback_check = now
+diff --git a/src/bin/npu_webcam_daemon.py b/src/bin/npu_webcam_daemon.py
+index 156e143..218167a 100755
+--- a/src/bin/npu_webcam_daemon.py
++++ b/src/bin/npu_webcam_daemon.py
+@@ -47,6 +47,20 @@ for p in [
+ if SEG_CHAIR_PATH is None:
+     SEG_CHAIR_PATH = MODEL_DIR / "chair_instance_segmenter.xml"
+ 
++USER_ASSETS_DIR = Path.home() / ".local/share/npu-effects/assets"
++OPT_ASSETS_DIR = Path("/opt/npu-effects/assets")
++REPO_ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "assets"
++
++DEFAULT_PRIVACY_IMAGE = None
++for p in [
++    OPT_ASSETS_DIR / "default_privacy.png",
++    USER_ASSETS_DIR / "default_privacy.png",
++    REPO_ASSETS_DIR / "default_privacy.png",
++]:
++    if p.exists():
++        DEFAULT_PRIVACY_IMAGE = p
++        break
++
+ running = True
+ 
+ def handle_signal(sig, frame):
+@@ -204,6 +218,14 @@ class AutoFramer:
+             self.detector.setInputSize((self.det_w, self.det_h))
+             retval, faces = self.detector.detect(small)
+ 
++        # Sempre atualiza o instante do ultimo rosto visto quando ha deteccao,
++        # mesmo com o Auto-Framing desativado (enabled=False). Sem isso,
++        # desligar o enquadramento congelava last_face_time no valor anterior
++        # e o detector de ausencia (Smart Auto-Privacy) passava a marcar o
++        # usuario como ausente poucos segundos depois, mesmo com ele presente.
++        if faces is not None and len(faces) > 0:
++            self.last_face_time = now
++
+         full_frame_box = np.array([0.0, 0.0, float(self.in_w), float(self.in_h)], dtype=np.float32)
+ 
+         if not enabled:
+@@ -594,6 +616,16 @@ def draw_privacy_screen(w, h, custom_path=None):
+             except Exception:
+                 pass
+ 
++    # Imagem padrao empacotada com o projeto (assets/default_privacy.png),
++    # usada quando o usuario nao configurou nenhuma imagem propria.
++    if DEFAULT_PRIVACY_IMAGE is not None:
++        try:
++            img = cv2.imread(str(DEFAULT_PRIVACY_IMAGE))
++            if img is not None:
++                return cv2.resize(img, (w, h))
++        except Exception as e:
++            logging.warning(f"Erro ao carregar imagem padrao de privacidade {DEFAULT_PRIVACY_IMAGE}: {e}")
++
+     screen = np.full((h, w, 3), 26, dtype=np.uint8)
+     cx, cy = w // 2, h // 2
+     cv2.circle(screen, (cx, cy - 35), 65, (45, 45, 55), -1)
+diff --git a/src/cameractrls/cameractrls.py b/src/cameractrls/cameractrls.py
+index 97930b5..3e5e7ee 100755
+--- a/src/cameractrls/cameractrls.py
++++ b/src/cameractrls/cameractrls.py
+@@ -2104,9 +2104,251 @@ class AnkerWorkCtrls:
+     def get_ctrls(self):
+         return self.ctrls
+ 
++# --- Suporte a idiomas (Portugues / English) para o painel Intel NPU Effects ---
++# Todas as strings PT permanecem no local original de cada IntelNPUCtrl/BaseCtrlMenu
++# como o texto "padrao"/fallback; NPU_TR guarda apenas as traducoes para 'en'.
++# npu_translate() e npu_detect_system_language() decidem, em tempo real, qual
++# texto exibir (ver uso do helper local T(...) dentro de get_device_controls()).
++
++def npu_detect_system_language():
++    for var in ('LC_ALL', 'LC_MESSAGES', 'LANGUAGE', 'LANG'):
++        val = os.environ.get(var, '')
++        if val:
++            val = val.lower()
++            if val.startswith('en'):
++                return 'en'
++            if val.startswith('pt'):
++                return 'pt'
++    return 'pt'
++
++NPU_TR = {
++    'npu_language': {
++        'name': 'Panel Language',
++        'tooltip': 'Select the display language for the Intel NPU Effects control panel (Portuguese or English).',
++        'menu': {'pt': 'Portugues', 'en': 'English'},
++    },
++    'npu_bg_mode': {
++        'name': 'Background Effect (AI)',
++        'tooltip': 'Select the NPU AI-generated background mode: Off, Blur, or Virtual Background (Image).',
++        'menu': {'off': 'Off', 'blur': 'Blur', 'image': 'Virtual Background'},
++    },
++    'npu_blur_mode': {
++        'name': 'Blur Type',
++        'tooltip': 'Choose between classic uniform blur or optical depth blur (gradual bokeh).',
++        'menu': {'standard': 'Standard (Uniform)', 'portrait_depth': 'Optical Portrait (Depth / Bokeh)'},
++    },
++    'npu_bg_image': {
++        'name': 'Virtual Background (Image)',
++        'tooltip': 'Choose the desired background image from the ~/.config/npu-effects/backgrounds/ folder',
++    },
++    'npu_blur_strength': {
++        'name': 'Blur Intensity',
++        'tooltip': 'Background blur intensity (0 = subtle, 100 = strong).',
++    },
++    'npu_feather': {
++        'name': 'Edge Transition (Feather)',
++        'tooltip': 'Width in pixels of the smooth transition band between you and the background (default: 40px).',
++    },
++    'npu_parallax': {
++        'name': '3D Parallax Effect (Virtual Background)',
++        'tooltip': 'Subtly shifts the background based on head position, creating 3D depth.',
++    },
++    'npu_parallax_strength': {
++        'name': '3D Parallax Sensitivity',
++        'tooltip': "Sensitivity of the background's 3D perspective movement.",
++    },
++    'npu_chair_retention': {
++        'name': 'Preserve Chair (AI Neural Model)',
++        'tooltip': 'Identifies the office or gaming chair using an OpenVINO neural model on the NPU and keeps the backrest in the foreground.',
++    },
++    'npu_chair_strength': {
++        'name': 'Chair Sensitivity (AI)',
++        'tooltip': "Sensitivity and range of the chair's neural segmentation (10 to 100%).",
++    },
++    'npu_artistic_filter': {
++        'name': 'Creative / Artistic Filter (AI)',
++        'tooltip': 'Applies real-time artistic stylization inspired by Windows Studio Effects and the community.',
++        'menu': {
++            'off': 'Off',
++            'illustrated': 'Illustrated (HQ / Cel-Shading)',
++            'animated': 'Animated (Cartoon / Anime)',
++            'watercolor': 'Watercolor',
++        },
++    },
++    'npu_artistic_strength': {
++        'name': 'Artistic Filter Intensity',
++        'tooltip': 'Intensity and stylization level of the creative filter.',
++    },
++    'npu_color_filter': {
++        'name': 'Cinematic Color Grading',
++        'tooltip': 'Applies professional cinematic color tables (3D LUTs).',
++        'menu': {
++            'none': 'None (Natural Colors)',
++            'teal_orange': 'Teal & Orange (Cinema)',
++            'warm_vintage': 'Warm Vintage (Film)',
++            'noir': 'Noir (Black & White)',
++            'vibrant': 'Vibrant / Modern Pop',
++        },
++    },
++    'npu_color_strength': {
++        'name': 'Cinematic Color Intensity',
++        'tooltip': 'Blend intensity of the cinematic color filter.',
++    },
++    'npu_rim_light': {
++        'name': 'Rim Light (Hair Light)',
++        'tooltip': 'Simulates professional cinema and studio contour lighting on hair and shoulder edges.',
++    },
++    'npu_rim_color': {
++        'name': 'Rim Light Color',
++        'tooltip': 'Select the temperature and tone of the contour light.',
++        'menu': {'warm': 'Amber / Warm Light', 'white': 'Neutral Studio White', 'cool': 'Studio Blue / Cyber'},
++    },
++    'npu_rim_intensity': {
++        'name': 'Rim Light Intensity',
++        'tooltip': 'Brightness intensity of the contour light (0 to 100).',
++    },
++    'npu_low_light': {
++        'name': 'Low Light Mode (Adaptive Booster)',
++        'tooltip': 'Adaptive lighting enhancement for low-light environments.',
++    },
++    'npu_low_light_gain': {
++        'name': 'Low Light Gain',
++        'tooltip': 'Intensity of the lighting gain for dark environments.',
++    },
++    'npu_screen_glare': {
++        'name': 'Suppress Screen Glare (Monitor Glare)',
++        'tooltip': 'Reduces bluish tones and unwanted monitor screen reflections projected on the face/glasses.',
++    },
++    'npu_screen_glare_strength': {
++        'name': 'Glare Suppression Strength',
++        'tooltip': 'Neutralization intensity of the monitor glare.',
++    },
++    'npu_studio_light': {
++        'name': 'Studio Light (Virtual Ring Light)',
++        'tooltip': 'Simulates soft, diffused studio lighting directed at the face.',
++    },
++    'npu_studio_light_gain': {
++        'name': 'Studio Light Intensity',
++        'tooltip': 'Intensity of the virtual studio light (0 to 100).',
++    },
++    'npu_sharpen': {
++        'name': 'Super-Resolution / Sharpness Enhancement',
++        'tooltip': 'Intelligent detail enhancement for eyes, hair, and clothing.',
++    },
++    'npu_sharpen_strength': {
++        'name': 'Sharpness Intensity',
++        'tooltip': 'Level of sharpness and micro-texture enhancement.',
++    },
++    'npu_framing_mode': {
++        'name': 'Framing Mode',
++        'tooltip': 'Select whether Auto-Framing focuses on a single person or frames the whole group.',
++        'menu': {'single': 'Individual (Main Person)', 'group': 'Group (All People)'},
++    },
++    'npu_auto_framing': {
++        'name': 'Automatic Framing',
++        'tooltip': 'Smart Auto-Framing with facial tracking and smooth transitions.',
++    },
++    'npu_framing_smoothness': {
++        'name': 'Auto-Framing Smoothness',
++        'tooltip': 'Speed and smoothness of the camera transition (1 = ultra smooth, 10 = fast).',
++    },
++    'npu_eye_contact_mode': {
++        'name': 'Eye Contact (Look at Camera)',
++        'tooltip': 'Redirects gaze toward the camera, with a dedicated mode for reading notes.',
++        'menu': {'off': 'Off', 'natural': 'Natural (Subtle)', 'teleprompter': 'Teleprompter (Reading / Elevated)'},
++    },
++    'npu_smooth': {
++        'name': 'Facial Smoothing / Noise Reduction',
++        'tooltip': 'Bilateral filter to smooth skin and remove low-light noise.',
++    },
++    'npu_smooth_strength': {
++        'name': 'Smoothing Intensity',
++        'tooltip': 'Intensity level of the skin smoothing and noise reduction filter.',
++    },
++    'npu_object_retention': {
++        'name': 'Preserve Handheld Objects (AI)',
++        'tooltip': 'Prevents held phones, mugs, pens, or documents from disappearing or getting blurred.',
++    },
++    'npu_object_strength': {
++        'name': 'Object Sensitivity',
++        'tooltip': 'Sensitivity of expansion and retention of objects connected to the hand.',
++    },
++    'npu_gesture_detect': {
++        'name': 'Gesture Recognition (AI)',
++        'tooltip': 'Identifies hand gestures (Thumbs Up, Victory, Open Palm) for reactions and shortcuts.',
++    },
++    'npu_gesture_action': {
++        'name': 'Action on Gesture Detection',
++        'tooltip': 'Select the automatic response when hand gestures are recognized on camera.',
++        'menu': {
++            'reaction': 'On-Screen Visual Reactions (Thumbs Up, Victory, Wave)',
++            'mute_toggle': 'Mute Toggle with Open Palm (Wave)',
++            'all': 'Visual Reactions + Mute Toggle',
++        },
++    },
++    'npu_privacy': {
++        'name': 'Absence Privacy Mode',
++        'tooltip': 'Pauses the video with a privacy screen when you step away from the laptop.',
++    },
++    'npu_privacy_fade': {
++        'name': 'Smooth Transition (Fade In/Out)',
++        'tooltip': 'Applies a smooth gradual transition entering and leaving the absence screen instead of a hard cut.',
++    },
++    'npu_privacy_mute': {
++        'name': 'Mute Microphone on Absence',
++        'tooltip': 'Automatically mutes the microphone when privacy mode activates.',
++    },
++    'npu_standby': {
++        'name': 'Automatic Standby (On-Demand)',
++        'tooltip': 'Turns off the physical camera sensor and LED when no app is using the video.',
++    },
++    'npu_ptz_park': {
++        'name': 'Retract PTZ Camera on Standby',
++        'tooltip': 'Tilts the PTZ camera downward (tilt -324000) when entering standby and reopens on wakeup.',
++    },
++    'npu_ptz_park_delay': {
++        'name': 'PTZ Parking Delay (s)',
++        'tooltip': 'Wait time (in seconds) after disabling the camera sensor before triggering the retraction motors.',
++    },
++    'npu_audio_denoise': {
++        'name': 'Microphone Noise Cancellation (AI)',
++        'tooltip': 'Real-time ambient noise and echo reduction via the NPU (PipeWire ClearVoice).',
++    },
++    'npu_audio_studio': {
++        'name': 'Studio / Broadcast Audio Package',
++        'tooltip': 'Complete vocal studio treatment: 80Hz Low-Cut, Equalization, Compressor, and De-Esser.',
++    },
++    'npu_audio_gate': {
++        'name': 'Smart Noise Gate (VAD)',
++        'tooltip': 'Absolute silence during speech pauses (eliminates breathing and residual room noise).',
++    },
++    'npu_audio_dereverb': {
++        'name': 'Room De-Reverberation (De-Reverb)',
++        'tooltip': 'Reduces the metallic echo of empty rooms and cold floors, bringing the voice closer to an acoustic studio.',
++    },
++    'npu_audio_standby': {
++        'name': 'Automatic Audio Standby (On-Demand)',
++        'tooltip': "Releases the physical microphone when no application is consuming the NPU's virtual microphone.",
++    },
++    'npu_audio_standby_timeout': {
++        'name': 'Audio Standby Timeout (s)',
++        'tooltip': 'Time with no app using the virtual microphone before releasing the physical microphone.',
++    },
++}
++
++def npu_translate(lang, text_id, field, pt_text, menu_id=None):
++    if lang != 'en':
++        return pt_text
++    entry = NPU_TR.get(text_id)
++    if not entry:
++        return pt_text
++    if field == 'menu':
++        return entry.get('menu', {}).get(menu_id, pt_text)
++    return entry.get(field, pt_text)
++
+ class IntelNPUCtrl(BaseCtrl):
+-    def __init__(self, text_id, name, type, tooltip, value=None, default=None, min=None, max=None, step=None, menu=None, inactive=False, readonly=False):
+-        super().__init__(text_id, name, type, value=value, default=default, min=min, max=max, step=step, tooltip=tooltip, menu=menu, inactive=inactive, readonly=readonly)
++    def __init__(self, text_id, name, type, tooltip, value=None, default=None, min=None, max=None, step=None, menu=None, inactive=False, readonly=False, reopener=False):
++        super().__init__(text_id, name, type, value=value, default=default, min=min, max=max, step=step, tooltip=tooltip, menu=menu, inactive=inactive, readonly=readonly, reopener=reopener)
+ 
+ class IntelNPUCtrls:
+     def __init__(self, device, fd):
+@@ -2173,6 +2415,13 @@ class IntelNPUCtrls:
+         v_cfg = cfg.get("video", {})
+         a_cfg = cfg.get("audio", {})
+ 
++        lang = cfg.get("language")
++        if lang not in ("pt", "en"):
++            lang = npu_detect_system_language()
++
++        def T(text_id, field, pt_text, menu_id=None):
++            return npu_translate(lang, text_id, field, pt_text, menu_id=menu_id)
++
+         blur_enabled = v_cfg.get("blur_enabled", True)
+         bg_image = v_cfg.get("background_image", "")
+         if bg_image:
+@@ -2225,30 +2474,45 @@ class IntelNPUCtrls:
+                     bg_name = os.path.splitext(f)[0].replace('_', ' ').title()
+                     bg_menu.append(BaseCtrlMenu(f, bg_name, f))
+ 
++        lang_val = lang
++
+         self.ctrls = [
++            IntelNPUCtrl(
++                'npu_language',
++                T('npu_language', 'name', 'Idioma do Painel'),
++                'menu',
++                T('npu_language', 'tooltip', 'Selecione o idioma de exibição do painel de controle Intel NPU Effects (Português ou English).'),
++                value=lang_val,
++                default='pt',
++                reopener=True,
++                menu=[
++                    BaseCtrlMenu('pt', T('npu_language', 'menu', 'Português', menu_id='pt'), 0),
++                    BaseCtrlMenu('en', T('npu_language', 'menu', 'English', menu_id='en'), 1),
++                ]
++            ),
+             IntelNPUCtrl(
+                 'npu_bg_mode',
+-                'Efeito de Fundo (AI)',
++                T('npu_bg_mode', 'name', 'Efeito de Fundo (AI)'),
+                 'menu',
+-                'Selecione o modo de fundo gerado pela IA da NPU: Desativado, Desfoque (Blur) ou Fundo Virtual (Imagem).',
++                T('npu_bg_mode', 'tooltip', 'Selecione o modo de fundo gerado pela IA da NPU: Desativado, Desfoque (Blur) ou Fundo Virtual (Imagem).'),
+                 value=mode_val,
+                 default='blur',
+                 menu=[
+-                    BaseCtrlMenu('off', 'Desativado', 0),
+-                    BaseCtrlMenu('blur', 'Desfoque (Blur)', 1),
+-                    BaseCtrlMenu('image', 'Fundo Virtual', 2),
++                    BaseCtrlMenu('off', T('npu_bg_mode', 'menu', 'Desativado', menu_id='off'), 0),
++                    BaseCtrlMenu('blur', T('npu_bg_mode', 'menu', 'Desfoque (Blur)', menu_id='blur'), 1),
++                    BaseCtrlMenu('image', T('npu_bg_mode', 'menu', 'Fundo Virtual', menu_id='image'), 2),
+                 ]
+             ),
+             IntelNPUCtrl(
+                 'npu_blur_mode',
+-                'Tipo de Desfoque',
++                T('npu_blur_mode', 'name', 'Tipo de Desfoque'),
+                 'menu',
+-                'Escolha entre desfoque uniforme clássico ou desfoque de profundidade óptico (bokeh gradativo).',
++                T('npu_blur_mode', 'tooltip', 'Escolha entre desfoque uniforme clássico ou desfoque de profundidade óptico (bokeh gradativo).'),
+                 value=blur_mode_val,
+                 default='standard',
+                 menu=[
+-                    BaseCtrlMenu('standard', 'Padrão (Uniforme)', 0),
+-                    BaseCtrlMenu('portrait_depth', 'Retrato Óptico (Profundidade / Bokeh)', 1),
++                    BaseCtrlMenu('standard', T('npu_blur_mode', 'menu', 'Padrão (Uniforme)', menu_id='standard'), 0),
++                    BaseCtrlMenu('portrait_depth', T('npu_blur_mode', 'menu', 'Retrato Óptico (Profundidade / Bokeh)', menu_id='portrait_depth'), 1),
+                 ]
+             ),
+         ]
+@@ -2259,9 +2523,9 @@ class IntelNPUCtrls:
+             self.ctrls.append(
+                 IntelNPUCtrl(
+                     'npu_bg_image',
+-                    'Fundo Virtual (Imagem)',
++                    T('npu_bg_image', 'name', 'Fundo Virtual (Imagem)'),
+                     'menu',
+-                    'Escolha a imagem de fundo desejada da pasta ~/.config/npu-effects/backgrounds/',
++                    T('npu_bg_image', 'tooltip', 'Escolha a imagem de fundo desejada da pasta ~/.config/npu-effects/backgrounds/'),
+                     value=current_bg_file,
+                     default=bg_menu[0].text_id,
+                     menu=bg_menu
+@@ -2271,9 +2535,9 @@ class IntelNPUCtrls:
+         self.ctrls.extend([
+             IntelNPUCtrl(
+                 'npu_blur_strength',
+-                'Intensidade do Blur',
++                T('npu_blur_strength', 'name', 'Intensidade do Blur'),
+                 'integer',
+-                'Intensidade do desfoque de fundo (0 = sutil, 100 = forte).',
++                T('npu_blur_strength', 'tooltip', 'Intensidade do desfoque de fundo (0 = sutil, 100 = forte).'),
+                 value=int(v_cfg.get("blur_strength", 35)),
+                 default=35,
+                 min=0,
+@@ -2281,9 +2545,9 @@ class IntelNPUCtrls:
+             ),
+             IntelNPUCtrl(
+                 'npu_feather',
+-                'Transição de Borda (Feather)',
++                T('npu_feather', 'name', 'Transição de Borda (Feather)'),
+                 'integer',
+-                'Largura em pixels da faixa de transição suave entre você e o fundo (padrão: 40px).',
++                T('npu_feather', 'tooltip', 'Largura em pixels da faixa de transição suave entre você e o fundo (padrão: 40px).'),
+                 value=int(v_cfg.get("mask_feather", 40)),
+                 default=40,
+                 min=10,
+@@ -2291,17 +2555,17 @@ class IntelNPUCtrls:
+             ),
+             IntelNPUCtrl(
+                 'npu_parallax',
+-                'Efeito Parallax 3D (Fundo Virtual)',
++                T('npu_parallax', 'name', 'Efeito Parallax 3D (Fundo Virtual)'),
+                 'boolean',
+-                'Desloca o plano de fundo sutilmente de acordo com a posição da cabeça, criando profundidade 3D.',
++                T('npu_parallax', 'tooltip', 'Desloca o plano de fundo sutilmente de acordo com a posição da cabeça, criando profundidade 3D.'),
+                 value=bool(v_cfg.get("parallax_enabled", False)),
+                 default=False
+             ),
+             IntelNPUCtrl(
+                 'npu_parallax_strength',
+-                'Sensibilidade do Parallax 3D',
++                T('npu_parallax_strength', 'name', 'Sensibilidade do Parallax 3D'),
+                 'integer',
+-                'Sensibilidade do movimento de perspectiva 3D do plano de fundo.',
++                T('npu_parallax_strength', 'tooltip', 'Sensibilidade do movimento de perspectiva 3D do plano de fundo.'),
+                 value=int(v_cfg.get("parallax_strength", 40)),
+                 default=40,
+                 min=10,
+@@ -2309,17 +2573,17 @@ class IntelNPUCtrls:
+             ),
+             IntelNPUCtrl(
+                 'npu_chair_retention',
+-                'Preservar Cadeira (Modelo Neural IA)',
++                T('npu_chair_retention', 'name', 'Preservar Cadeira (Modelo Neural IA)'),
+                 'boolean',
+-                'Identifica a cadeira de escritório ou gamer usando modelo neural OpenVINO na NPU e retém o encosto no primeiro plano.',
++                T('npu_chair_retention', 'tooltip', 'Identifica a cadeira de escritório ou gamer usando modelo neural OpenVINO na NPU e retém o encosto no primeiro plano.'),
+                 value=bool(v_cfg.get("chair_retention_enabled", True)),
+                 default=True
+             ),
+             IntelNPUCtrl(
+                 'npu_chair_strength',
+-                'Sensibilidade da Cadeira (IA)',
++                T('npu_chair_strength', 'name', 'Sensibilidade da Cadeira (IA)'),
+                 'integer',
+-                'Sensibilidade e alcance da segmentação neural da cadeira (10 a 100%).',
++                T('npu_chair_strength', 'tooltip', 'Sensibilidade e alcance da segmentação neural da cadeira (10 a 100%).'),
+                 value=int(v_cfg.get("chair_retention_strength", 50)),
+                 default=50,
+                 min=10,
+@@ -2327,23 +2591,23 @@ class IntelNPUCtrls:
+             ),
+             IntelNPUCtrl(
+                 'npu_artistic_filter',
+-                'Filtro Criativo / Artístico (AI)',
++                T('npu_artistic_filter', 'name', 'Filtro Criativo / Artístico (AI)'),
+                 'menu',
+-                'Aplica estilização artística em tempo real inspirada no Windows Studio Effects e comunidade.',
++                T('npu_artistic_filter', 'tooltip', 'Aplica estilização artística em tempo real inspirada no Windows Studio Effects e comunidade.'),
+                 value=art_val,
+                 default='off',
+                 menu=[
+-                    BaseCtrlMenu('off', 'Desativado', 0),
+-                    BaseCtrlMenu('illustrated', 'Ilustrado (HQ / Cel-Shading)', 1),
+-                    BaseCtrlMenu('animated', 'Animado (Cartoon / Anime)', 2),
+-                    BaseCtrlMenu('watercolor', 'Aquarela (Watercolor)', 3),
++                    BaseCtrlMenu('off', T('npu_artistic_filter', 'menu', 'Desativado', menu_id='off'), 0),
++                    BaseCtrlMenu('illustrated', T('npu_artistic_filter', 'menu', 'Ilustrado (HQ / Cel-Shading)', menu_id='illustrated'), 1),
++                    BaseCtrlMenu('animated', T('npu_artistic_filter', 'menu', 'Animado (Cartoon / Anime)', menu_id='animated'), 2),
++                    BaseCtrlMenu('watercolor', T('npu_artistic_filter', 'menu', 'Aquarela (Watercolor)', menu_id='watercolor'), 3),
+                 ]
+             ),
+             IntelNPUCtrl(
+                 'npu_artistic_strength',
+-                'Intensidade do Filtro Artístico',
++                T('npu_artistic_strength', 'name', 'Intensidade do Filtro Artístico'),
+                 'integer',
+-                'Nível de intensidade e estilização do filtro criativo.',
++                T('npu_artistic_strength', 'tooltip', 'Nível de intensidade e estilização do filtro criativo.'),
+                 value=int(v_cfg.get("artistic_strength", 70)),
+                 default=70,
+                 min=10,
+@@ -2351,24 +2615,24 @@ class IntelNPUCtrls:
+             ),
+             IntelNPUCtrl(
+                 'npu_color_filter',
+-                'Grading de Cor Cinematográfico',
++                T('npu_color_filter', 'name', 'Grading de Cor Cinematográfico'),
+                 'menu',
+-                'Aplica tabelas de cor cinematográficas profissionais (3D LUTs).',
++                T('npu_color_filter', 'tooltip', 'Aplica tabelas de cor cinematográficas profissionais (3D LUTs).'),
+                 value=color_val,
+                 default='none',
+                 menu=[
+-                    BaseCtrlMenu('none', 'Nenhum (Cores Naturais)', 0),
+-                    BaseCtrlMenu('teal_orange', 'Teal & Orange (Cinema)', 1),
+-                    BaseCtrlMenu('warm_vintage', 'Vintage Aquecido (Filme)', 2),
+-                    BaseCtrlMenu('noir', 'Noir (Preto & Branco)', 3),
+-                    BaseCtrlMenu('vibrant', 'Vibrante / Pop Moderno', 4),
++                    BaseCtrlMenu('none', T('npu_color_filter', 'menu', 'Nenhum (Cores Naturais)', menu_id='none'), 0),
++                    BaseCtrlMenu('teal_orange', T('npu_color_filter', 'menu', 'Teal & Orange (Cinema)', menu_id='teal_orange'), 1),
++                    BaseCtrlMenu('warm_vintage', T('npu_color_filter', 'menu', 'Vintage Aquecido (Filme)', menu_id='warm_vintage'), 2),
++                    BaseCtrlMenu('noir', T('npu_color_filter', 'menu', 'Noir (Preto & Branco)', menu_id='noir'), 3),
++                    BaseCtrlMenu('vibrant', T('npu_color_filter', 'menu', 'Vibrante / Pop Moderno', menu_id='vibrant'), 4),
+                 ]
+             ),
+             IntelNPUCtrl(
+                 'npu_color_strength',
+-                'Intensidade da Cor Cinematográfica',
++                T('npu_color_strength', 'name', 'Intensidade da Cor Cinematográfica'),
+                 'integer',
+-                'Intensidade de mistura do filtro de cor cinematográfico.',
++                T('npu_color_strength', 'tooltip', 'Intensidade de mistura do filtro de cor cinematográfico.'),
+                 value=int(v_cfg.get("color_strength", 70)),
+                 default=70,
+                 min=10,
+@@ -2376,30 +2640,30 @@ class IntelNPUCtrls:
+             ),
+             IntelNPUCtrl(
+                 'npu_rim_light',
+-                'Luz de Recorte (Rim / Hair Light)',
++                T('npu_rim_light', 'name', 'Luz de Recorte (Rim / Hair Light)'),
+                 'boolean',
+-                'Simula iluminação de contorno profissional de cinema e estúdio nas bordas do cabelo e ombros.',
++                T('npu_rim_light', 'tooltip', 'Simula iluminação de contorno profissional de cinema e estúdio nas bordas do cabelo e ombros.'),
+                 value=bool(v_cfg.get("rim_light_enabled", False)),
+                 default=False
+             ),
+             IntelNPUCtrl(
+                 'npu_rim_color',
+-                'Cor da Luz de Recorte',
++                T('npu_rim_color', 'name', 'Cor da Luz de Recorte'),
+                 'menu',
+-                'Selecione a temperatura e tonalidade da luz de contorno.',
++                T('npu_rim_color', 'tooltip', 'Selecione a temperatura e tonalidade da luz de contorno.'),
+                 value=rim_color_val,
+                 default='warm',
+                 menu=[
+-                    BaseCtrlMenu('warm', 'Âmbar / Luz Quente', 0),
+-                    BaseCtrlMenu('white', 'Branco Neutro de Estúdio', 1),
+-                    BaseCtrlMenu('cool', 'Azul Estúdio / Cyber', 2),
++                    BaseCtrlMenu('warm', T('npu_rim_color', 'menu', 'Âmbar / Luz Quente', menu_id='warm'), 0),
++                    BaseCtrlMenu('white', T('npu_rim_color', 'menu', 'Branco Neutro de Estúdio', menu_id='white'), 1),
++                    BaseCtrlMenu('cool', T('npu_rim_color', 'menu', 'Azul Estúdio / Cyber', menu_id='cool'), 2),
+                 ]
+             ),
+             IntelNPUCtrl(
+                 'npu_rim_intensity',
+-                'Intensidade da Luz de Recorte',
++                T('npu_rim_intensity', 'name', 'Intensidade da Luz de Recorte'),
+                 'integer',
+-                'Intensidade do brilho da luz de contorno (0 a 100).',
++                T('npu_rim_intensity', 'tooltip', 'Intensidade do brilho da luz de contorno (0 a 100).'),
+                 value=int(v_cfg.get("rim_light_intensity", 50)),
+                 default=50,
+                 min=10,
+@@ -2407,17 +2671,17 @@ class IntelNPUCtrls:
+             ),
+             IntelNPUCtrl(
+                 'npu_low_light',
+-                'Modo Pouca Luz (Adaptive Booster)',
++                T('npu_low_light', 'name', 'Modo Pouca Luz (Adaptive Booster)'),
+                 'boolean',
+-                'Realce adaptativo de iluminação para ambientes com pouca luz.',
++                T('npu_low_light', 'tooltip', 'Realce adaptativo de iluminação para ambientes com pouca luz.'),
+                 value=bool(v_cfg.get("low_light_enabled", False)),
+                 default=False
+             ),
+             IntelNPUCtrl(
+                 'npu_low_light_gain',
+-                'Ganho Pouca Luz',
++                T('npu_low_light_gain', 'name', 'Ganho Pouca Luz'),
+                 'integer',
+-                'Intensidade do ganho de iluminação para ambientes escuros.',
++                T('npu_low_light_gain', 'tooltip', 'Intensidade do ganho de iluminação para ambientes escuros.'),
+                 value=int(v_cfg.get("low_light_gain", 45)),
+                 default=45,
+                 min=10,
+@@ -2425,17 +2689,17 @@ class IntelNPUCtrls:
+             ),
+             IntelNPUCtrl(
+                 'npu_screen_glare',
+-                'Suprimir Reflexo de Tela (Monitor Glare)',
++                T('npu_screen_glare', 'name', 'Suprimir Reflexo de Tela (Monitor Glare)'),
+                 'boolean',
+-                'Atenua tons azulados e reflexos indesejados da tela do monitor projetados no rosto/óculos.',
++                T('npu_screen_glare', 'tooltip', 'Atenua tons azulados e reflexos indesejados da tela do monitor projetados no rosto/óculos.'),
+                 value=bool(v_cfg.get("screen_glare_enabled", False)),
+                 default=False
+             ),
+             IntelNPUCtrl(
+                 'npu_screen_glare_strength',
+-                'Força da Supressão de Reflexo',
++                T('npu_screen_glare_strength', 'name', 'Força da Supressão de Reflexo'),
+                 'integer',
+-                'Intensidade de neutralização do reflexo de monitor.',
++                T('npu_screen_glare_strength', 'tooltip', 'Intensidade de neutralização do reflexo de monitor.'),
+                 value=int(v_cfg.get("screen_glare_strength", 50)),
+                 default=50,
+                 min=10,
+@@ -2443,17 +2707,17 @@ class IntelNPUCtrls:
+             ),
+             IntelNPUCtrl(
+                 'npu_studio_light',
+-                'Luz de Estúdio (Ring Light Virtual)',
++                T('npu_studio_light', 'name', 'Luz de Estúdio (Ring Light Virtual)'),
+                 'boolean',
+-                'Simula uma iluminação suave e difusa de estúdio direcionada ao rosto.',
++                T('npu_studio_light', 'tooltip', 'Simula uma iluminação suave e difusa de estúdio direcionada ao rosto.'),
+                 value=bool(v_cfg.get("studio_light_enabled", False)),
+                 default=False
+             ),
+             IntelNPUCtrl(
+                 'npu_studio_light_gain',
+-                'Intensidade da Luz de Estúdio',
++                T('npu_studio_light_gain', 'name', 'Intensidade da Luz de Estúdio'),
+                 'integer',
+-                'Intensidade da luz virtual de estúdio (0 a 100).',
++                T('npu_studio_light_gain', 'tooltip', 'Intensidade da luz virtual de estúdio (0 a 100).'),
+                 value=int(v_cfg.get("studio_light_gain", 40)),
+                 default=40,
+                 min=10,
+@@ -2461,17 +2725,17 @@ class IntelNPUCtrls:
+             ),
+             IntelNPUCtrl(
+                 'npu_sharpen',
+-                'Super-Resolução / Realce de Nitidez',
++                T('npu_sharpen', 'name', 'Super-Resolução / Realce de Nitidez'),
+                 'boolean',
+-                'Realce inteligente de detalhes em olhos, cabelos e roupas.',
++                T('npu_sharpen', 'tooltip', 'Realce inteligente de detalhes em olhos, cabelos e roupas.'),
+                 value=bool(v_cfg.get("sharpen_enabled", False)),
+                 default=False
+             ),
+             IntelNPUCtrl(
+                 'npu_sharpen_strength',
+-                'Intensidade da Nitidez',
++                T('npu_sharpen_strength', 'name', 'Intensidade da Nitidez'),
+                 'integer',
+-                'Nível de realce de nitidez e micro-texturas.',
++                T('npu_sharpen_strength', 'tooltip', 'Nível de realce de nitidez e micro-texturas.'),
+                 value=int(v_cfg.get("sharpen_strength", 35)),
+                 default=35,
+                 min=10,
+@@ -2479,29 +2743,29 @@ class IntelNPUCtrls:
+             ),
+             IntelNPUCtrl(
+                 'npu_framing_mode',
+-                'Modo de Enquadramento',
++                T('npu_framing_mode', 'name', 'Modo de Enquadramento'),
+                 'menu',
+-                'Selecione se o Auto-Framing foca em uma só pessoa ou enquadra todo o grupo.',
++                T('npu_framing_mode', 'tooltip', 'Selecione se o Auto-Framing foca em uma só pessoa ou enquadra todo o grupo.'),
+                 value=framing_mode_val,
+                 default='single',
+                 menu=[
+-                    BaseCtrlMenu('single', 'Individual (Pessoa Principal)', 0),
+-                    BaseCtrlMenu('group', 'Grupo (Todas as Pessoas)', 1),
++                    BaseCtrlMenu('single', T('npu_framing_mode', 'menu', 'Individual (Pessoa Principal)', menu_id='single'), 0),
++                    BaseCtrlMenu('group', T('npu_framing_mode', 'menu', 'Grupo (Todas as Pessoas)', menu_id='group'), 1),
+                 ]
+             ),
+             IntelNPUCtrl(
+                 'npu_auto_framing',
+-                'Enquadramento Automático',
++                T('npu_auto_framing', 'name', 'Enquadramento Automático'),
+                 'boolean',
+-                'Auto-Framing inteligente com rastreamento facial e transições suaves.',
++                T('npu_auto_framing', 'tooltip', 'Auto-Framing inteligente com rastreamento facial e transições suaves.'),
+                 value=bool(v_cfg.get("auto_framing", False)),
+                 default=False
+             ),
+             IntelNPUCtrl(
+                 'npu_framing_smoothness',
+-                'Fluidez do Auto-Framing',
++                T('npu_framing_smoothness', 'name', 'Fluidez do Auto-Framing'),
+                 'integer',
+-                'Velocidade e suavidade de transição da câmera (1 = ultra suave, 10 = rápido).',
++                T('npu_framing_smoothness', 'tooltip', 'Velocidade e suavidade de transição da câmera (1 = ultra suave, 10 = rápido).'),
+                 value=int(v_cfg.get("framing_smoothness_int", 4)),
+                 default=4,
+                 min=1,
+@@ -2509,30 +2773,30 @@ class IntelNPUCtrls:
+             ),
+             IntelNPUCtrl(
+                 'npu_eye_contact_mode',
+-                'Contato Visual (Olhar na Câmera)',
++                T('npu_eye_contact_mode', 'name', 'Contato Visual (Olhar na Câmera)'),
+                 'menu',
+-                'Redireciona o olhar em direção à câmera, com modo dedicado para leitura de anotações.',
++                T('npu_eye_contact_mode', 'tooltip', 'Redireciona o olhar em direção à câmera, com modo dedicado para leitura de anotações.'),
+                 value=eye_mode_val,
+                 default='off',
+                 menu=[
+-                    BaseCtrlMenu('off', 'Desativado', 0),
+-                    BaseCtrlMenu('natural', 'Natural (Sutil)', 1),
+-                    BaseCtrlMenu('teleprompter', 'Teleprompter (Leitura / Elevado)', 2),
++                    BaseCtrlMenu('off', T('npu_eye_contact_mode', 'menu', 'Desativado', menu_id='off'), 0),
++                    BaseCtrlMenu('natural', T('npu_eye_contact_mode', 'menu', 'Natural (Sutil)', menu_id='natural'), 1),
++                    BaseCtrlMenu('teleprompter', T('npu_eye_contact_mode', 'menu', 'Teleprompter (Leitura / Elevado)', menu_id='teleprompter'), 2),
+                 ]
+             ),
+             IntelNPUCtrl(
+                 'npu_smooth',
+-                'Suavização Facial / Redução de Ruído',
++                T('npu_smooth', 'name', 'Suavização Facial / Redução de Ruído'),
+                 'boolean',
+-                'Filtro bilateral para suavizar a pele e remover ruído de baixa luminosidade.',
++                T('npu_smooth', 'tooltip', 'Filtro bilateral para suavizar a pele e remover ruído de baixa luminosidade.'),
+                 value=bool(v_cfg.get("smooth_enabled", True)),
+                 default=True
+             ),
+             IntelNPUCtrl(
+                 'npu_smooth_strength',
+-                'Intensidade da Suavização',
++                T('npu_smooth_strength', 'name', 'Intensidade da Suavização'),
+                 'integer',
+-                'Nível de intensidade do filtro de suavização da pele e redução de ruído.',
++                T('npu_smooth_strength', 'tooltip', 'Nível de intensidade do filtro de suavização da pele e redução de ruído.'),
+                 value=int(v_cfg.get("smooth_strength", 50)),
+                 default=50,
+                 min=0,
+@@ -2540,17 +2804,17 @@ class IntelNPUCtrls:
+             ),
+             IntelNPUCtrl(
+                 'npu_object_retention',
+-                'Preservar Objetos na Mão (AI)',
++                T('npu_object_retention', 'name', 'Preservar Objetos na Mão (AI)'),
+                 'boolean',
+-                'Impede que celulares, canecas, canetas ou documentos segurados sumam ou fiquem borrados.',
++                T('npu_object_retention', 'tooltip', 'Impede que celulares, canecas, canetas ou documentos segurados sumam ou fiquem borrados.'),
+                 value=obj_ret_val,
+                 default=True
+             ),
+             IntelNPUCtrl(
+                 'npu_object_strength',
+-                'Sensibilidade de Objetos',
++                T('npu_object_strength', 'name', 'Sensibilidade de Objetos'),
+                 'integer',
+-                'Sensibilidade de expansão e retenção de objetos conectados à mão.',
++                T('npu_object_strength', 'tooltip', 'Sensibilidade de expansão e retenção de objetos conectados à mão.'),
+                 value=obj_str_val,
+                 default=60,
+                 min=10,
+@@ -2558,70 +2822,70 @@ class IntelNPUCtrls:
+             ),
+             IntelNPUCtrl(
+                 'npu_gesture_detect',
+-                'Reconhecimento de Gestos (AI)',
++                T('npu_gesture_detect', 'name', 'Reconhecimento de Gestos (AI)'),
+                 'boolean',
+-                'Identifica gestos manuais (Joinha, Vitória, Mão Aberta) para reações e atalhos.',
++                T('npu_gesture_detect', 'tooltip', 'Identifica gestos manuais (Joinha, Vitória, Mão Aberta) para reações e atalhos.'),
+                 value=gesture_det_val,
+                 default=True
+             ),
+             IntelNPUCtrl(
+                 'npu_gesture_action',
+-                'Ação ao Detectar Gestos',
++                T('npu_gesture_action', 'name', 'Ação ao Detectar Gestos'),
+                 'menu',
+-                'Selecione a resposta automática ao reconhecer gestos manuais na câmera.',
++                T('npu_gesture_action', 'tooltip', 'Selecione a resposta automática ao reconhecer gestos manuais na câmera.'),
+                 value=gesture_act_val,
+                 default='all',
+                 menu=[
+-                    BaseCtrlMenu('reaction', 'Reações Visuais na Tela (Joinha, Vitoria, Aceno)', 0),
+-                    BaseCtrlMenu('mute_toggle', 'Gatilho de Mudo com Mão Aberta (Aceno)', 1),
+-                    BaseCtrlMenu('all', 'Reações Visuais + Gatilho de Mudo', 2),
++                    BaseCtrlMenu('reaction', T('npu_gesture_action', 'menu', 'Reações Visuais na Tela (Joinha, Vitoria, Aceno)', menu_id='reaction'), 0),
++                    BaseCtrlMenu('mute_toggle', T('npu_gesture_action', 'menu', 'Gatilho de Mudo com Mão Aberta (Aceno)', menu_id='mute_toggle'), 1),
++                    BaseCtrlMenu('all', T('npu_gesture_action', 'menu', 'Reações Visuais + Gatilho de Mudo', menu_id='all'), 2),
+                 ]
+             ),
+             IntelNPUCtrl(
+                 'npu_privacy',
+-                'Modo Privacidade por Ausência',
++                T('npu_privacy', 'name', 'Modo Privacidade por Ausência'),
+                 'boolean',
+-                'Pausa o vídeo com tela de privacidade ao sair da frente do notebook.',
++                T('npu_privacy', 'tooltip', 'Pausa o vídeo com tela de privacidade ao sair da frente do notebook.'),
+                 value=bool(v_cfg.get("privacy_enabled", False)),
+                 default=False
+             ),
+             IntelNPUCtrl(
+                 'npu_privacy_fade',
+-                'Transição Suave (Fade In/Out)',
++                T('npu_privacy_fade', 'name', 'Transição Suave (Fade In/Out)'),
+                 'boolean',
+-                'Aplica transição gradual suave ao entrar e sair da tela de ausência em vez de corte seco.',
++                T('npu_privacy_fade', 'tooltip', 'Aplica transição gradual suave ao entrar e sair da tela de ausência em vez de corte seco.'),
+                 value=priv_fade_val,
+                 default=True
+             ),
+             IntelNPUCtrl(
+                 'npu_privacy_mute',
+-                'Mutar Microfone na Ausência',
++                T('npu_privacy_mute', 'name', 'Mutar Microfone na Ausência'),
+                 'boolean',
+-                'Muta o microfone automaticamente quando o modo privacidade ativa.',
++                T('npu_privacy_mute', 'tooltip', 'Muta o microfone automaticamente quando o modo privacidade ativa.'),
+                 value=bool(v_cfg.get("privacy_mute_mic", True)),
+                 default=True
+             ),
+             IntelNPUCtrl(
+                 'npu_standby',
+-                'Standby Automático (On-Demand)',
++                T('npu_standby', 'name', 'Standby Automático (On-Demand)'),
+                 'boolean',
+-                'Desliga o sensor e LED da câmera física quando nenhum app estiver usando o vídeo.',
++                T('npu_standby', 'tooltip', 'Desliga o sensor e LED da câmera física quando nenhum app estiver usando o vídeo.'),
+                 value=bool(v_cfg.get("auto_standby", True)),
+                 default=True
+             ),
+             IntelNPUCtrl(
+                 'npu_ptz_park',
+-                'Recolher Câmera PTZ em Standby',
++                T('npu_ptz_park', 'name', 'Recolher Câmera PTZ em Standby'),
+                 'boolean',
+-                'Inclina a câmera PTZ para baixo (tilt -324000) ao entrar em repouso e reabre ao acordar.',
++                T('npu_ptz_park', 'tooltip', 'Inclina a câmera PTZ para baixo (tilt -324000) ao entrar em repouso e reabre ao acordar.'),
+                 value=bool(v_cfg.get("ptz_park_on_standby", True)),
+                 default=True
+             ),
+             IntelNPUCtrl(
+                 'npu_ptz_park_delay',
+-                'Atraso do Parking PTZ (s)',
++                T('npu_ptz_park_delay', 'name', 'Atraso do Parking PTZ (s)'),
+                 'integer',
+-                'Tempo de espera (em segundos) após desativar o sensor da câmera antes de acionar os motores de recolhimento.',
++                T('npu_ptz_park_delay', 'tooltip', 'Tempo de espera (em segundos) após desativar o sensor da câmera antes de acionar os motores de recolhimento.'),
+                 value=int(round(float(v_cfg.get("standby_park_delay", 1.0)))),
+                 default=1,
+                 min=0,
+@@ -2630,36 +2894,55 @@ class IntelNPUCtrls:
+             ),
+             IntelNPUCtrl(
+                 'npu_audio_denoise',
+-                'Cancelamento de Ruído do Microfone (IA)',
++                T('npu_audio_denoise', 'name', 'Cancelamento de Ruído do Microfone (IA)'),
+                 'boolean',
+-                'Redução de ruído ambiente e eco em tempo real pela NPU (PipeWire ClearVoice).',
++                T('npu_audio_denoise', 'tooltip', 'Redução de ruído ambiente e eco em tempo real pela NPU (PipeWire ClearVoice).'),
+                 value=bool(a_cfg.get("noise_suppression", True)),
+                 default=True
+             ),
+             IntelNPUCtrl(
+                 'npu_audio_studio',
+-                'Pacote de Áudio Estúdio / Broadcast',
++                T('npu_audio_studio', 'name', 'Pacote de Áudio Estúdio / Broadcast'),
+                 'boolean',
+-                'Tratamento completo de estúdio vocal: Low-Cut 80Hz, Equalização, Compressor e De-Esser.',
++                T('npu_audio_studio', 'tooltip', 'Tratamento completo de estúdio vocal: Low-Cut 80Hz, Equalização, Compressor e De-Esser.'),
+                 value=bool(a_cfg.get("studio_mic_enabled", True)),
+                 default=True
+             ),
+             IntelNPUCtrl(
+                 'npu_audio_gate',
+-                'Portão de Ruído Inteligente (VAD)',
++                T('npu_audio_gate', 'name', 'Portão de Ruído Inteligente (VAD)'),
+                 'boolean',
+-                'Silêncio absoluto durante pausas na fala (elimina respiração e ruídos de sala residuais).',
++                T('npu_audio_gate', 'tooltip', 'Silêncio absoluto durante pausas na fala (elimina respiração e ruídos de sala residuais).'),
+                 value=bool(a_cfg.get("gate_enabled", True)),
+                 default=True
+             ),
+             IntelNPUCtrl(
+                 'npu_audio_dereverb',
+-                'Desreverberação de Sala (De-Reverb)',
++                T('npu_audio_dereverb', 'name', 'Desreverberação de Sala (De-Reverb)'),
+                 'boolean',
+-                'Atenua o eco metálico de salas vazias e piso frio, aproximando a voz de estúdio acústico.',
++                T('npu_audio_dereverb', 'tooltip', 'Atenua o eco metálico de salas vazias e piso frio, aproximando a voz de estúdio acústico.'),
+                 value=bool(a_cfg.get("dereverb_enabled", True)),
+                 default=True
+             ),
++            IntelNPUCtrl(
++                'npu_audio_standby',
++                T('npu_audio_standby', 'name', 'Standby Automático de Áudio (On-Demand)'),
++                'boolean',
++                T('npu_audio_standby', 'tooltip', 'Libera o microfone físico quando nenhum aplicativo estiver consumindo o microfone virtual da NPU.'),
++                value=bool(a_cfg.get("auto_standby", True)),
++                default=True
++            ),
++            IntelNPUCtrl(
++                'npu_audio_standby_timeout',
++                T('npu_audio_standby_timeout', 'name', 'Tempo de Espera do Standby de Áudio (s)'),
++                'integer',
++                T('npu_audio_standby_timeout', 'tooltip', 'Tempo sem nenhum app usando o microfone virtual antes de liberar o microfone físico.'),
++                value=int(round(float(a_cfg.get("standby_timeout", 3.0)))),
++                default=3,
++                min=1,
++                max=30,
++                step=1
++            ),
+         ])
+ 
+     def get_ctrls(self):
+@@ -2683,7 +2966,12 @@ class IntelNPUCtrls:
+             if not ctrl:
+                 continue
+ 
+-            if k == 'npu_bg_mode':
++            if k == 'npu_language':
++                ctrl.value = v
++                cfg["language"] = v
++                changed = True
++
++            elif k == 'npu_bg_mode':
+                 ctrl.value = v
+                 if v == 'off':
+                     cfg["video"]["blur_enabled"] = False
+@@ -2925,6 +3213,16 @@ class IntelNPUCtrls:
+                 cfg["audio"]["dereverb_enabled"] = bool(v)
+                 changed = True
+ 
++            elif k == 'npu_audio_standby':
++                ctrl.value = bool(v)
++                cfg["audio"]["auto_standby"] = bool(v)
++                changed = True
++
++            elif k == 'npu_audio_standby_timeout':
++                ctrl.value = int(v)
++                cfg["audio"]["standby_timeout"] = float(v)
++                changed = True
++
+         if changed:
+             self.save_config(cfg)
+ 
+diff --git a/src/config/config.json b/src/config/config.json
+index faa4bf5..72cdf10 100644
+--- a/src/config/config.json
++++ b/src/config/config.json
+@@ -76,6 +76,8 @@
+     "compressor_enabled": true,
+     "comp_target_db": -18.0,
+     "dereverb_enabled": true,
+-    "dereverb_strength": 40
++    "dereverb_strength": 40,
++    "auto_standby": true,
++    "standby_timeout": 3.0
+   }
+ }
+\ No newline at end of file

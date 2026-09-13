@@ -76,6 +76,8 @@
     "compressor_enabled": true,
     "comp_target_db": -18.0,
     "dereverb_enabled": true,
-    "dereverb_strength": 40
+    "dereverb_strength": 40,
+    "auto_standby": true,
+    "standby_timeout": 3.0
   }
 }

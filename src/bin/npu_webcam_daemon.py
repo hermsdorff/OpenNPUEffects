@@ -47,6 +47,20 @@ for p in [
 if SEG_CHAIR_PATH is None:
     SEG_CHAIR_PATH = MODEL_DIR / "chair_instance_segmenter.xml"
 
+USER_ASSETS_DIR = Path.home() / ".local/share/npu-effects/assets"
+OPT_ASSETS_DIR = Path("/opt/npu-effects/assets")
+REPO_ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "assets"
+
+DEFAULT_PRIVACY_IMAGE = None
+for p in [
+    OPT_ASSETS_DIR / "default_privacy.png",
+    USER_ASSETS_DIR / "default_privacy.png",
+    REPO_ASSETS_DIR / "default_privacy.png",
+]:
+    if p.exists():
+        DEFAULT_PRIVACY_IMAGE = p
+        break
+
 running = True
 
 def handle_signal(sig, frame):
@@ -203,6 +217,14 @@ class AutoFramer:
             small = cv2.resize(frame, (self.det_w, self.det_h))
             self.detector.setInputSize((self.det_w, self.det_h))
             retval, faces = self.detector.detect(small)
+
+        # Sempre atualiza o instante do ultimo rosto visto quando ha deteccao,
+        # mesmo com o Auto-Framing desativado (enabled=False). Sem isso,
+        # desligar o enquadramento congelava last_face_time no valor anterior
+        # e o detector de ausencia (Smart Auto-Privacy) passava a marcar o
+        # usuario como ausente poucos segundos depois, mesmo com ele presente.
+        if faces is not None and len(faces) > 0:
+            self.last_face_time = now
 
         full_frame_box = np.array([0.0, 0.0, float(self.in_w), float(self.in_h)], dtype=np.float32)
 
@@ -593,6 +615,16 @@ def draw_privacy_screen(w, h, custom_path=None):
                     return cv2.resize(img, (w, h))
             except Exception:
                 pass
+
+    # Imagem padrao empacotada com o projeto (assets/default_privacy.png),
+    # usada quando o usuario nao configurou nenhuma imagem propria.
+    if DEFAULT_PRIVACY_IMAGE is not None:
+        try:
+            img = cv2.imread(str(DEFAULT_PRIVACY_IMAGE))
+            if img is not None:
+                return cv2.resize(img, (w, h))
+        except Exception as e:
+            logging.warning(f"Erro ao carregar imagem padrao de privacidade {DEFAULT_PRIVACY_IMAGE}: {e}")
 
     screen = np.full((h, w, 3), 26, dtype=np.uint8)
     cx, cy = w // 2, h // 2

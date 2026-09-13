@@ -72,7 +72,7 @@ fi
 
 # 4. Configurar parâmetros do v4l2loopback (/etc/modprobe.d/v4l2loopback.conf)
 echo -e "${YELLOW}--> Configurando /etc/modprobe.d/v4l2loopback.conf (preservando câmeras virtuais existentes)...${NC}"
-sudo python3 -c '
+sudo python3 - << 'PYEOF'
 import re
 from pathlib import Path
 
@@ -94,7 +94,7 @@ for idx, line in enumerate(lines):
         break
 
 if opt_idx == -1:
-    lines.append(f"options v4l2loopback devices=1 video_nr={target_nr} card_label=\"{target_label}\" exclusive_caps=1 max_buffers=6")
+    lines.append(f'options v4l2loopback devices=1 video_nr={target_nr} card_label="{target_label}" exclusive_caps=1 max_buffers=6')
 else:
     opt_line = lines[opt_idx]
     m_card = re.search(r"card_label=(.*?)(?=\s+[a-z_]+|\s*$)", opt_line)
@@ -126,16 +126,16 @@ else:
 
     dev_count = len(existing_labels)
     lines[opt_idx] = (
-        f"options v4l2loopback devices={dev_count} "
-        f"video_nr={\",\".join(map(str, existing_nrs))} "
-        f"card_label=\"{\",\".join(existing_labels)}\" "
-        f"exclusive_caps={\",\".join(existing_caps)} "
-        f"max_buffers={max_buf}"
+        f'options v4l2loopback devices={dev_count} '
+        f'video_nr={",".join(map(str, existing_nrs))} '
+        f'card_label="{",".join(existing_labels)}" '
+        f'exclusive_caps={",".join(existing_caps)} '
+        f'max_buffers={max_buf}'
     )
 
 conf_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 print("    ✓ /etc/modprobe.d/v4l2loopback.conf configurado preservando dispositivos existentes.")
-'
+PYEOF
 
 # 5. Configurar inicialização automática no boot (/etc/modules-load.d/v4l2loopback.conf)
 echo -e "${YELLOW}--> Garantindo carregamento automático do módulo no boot...${NC}"
