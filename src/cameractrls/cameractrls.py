@@ -2157,6 +2157,10 @@ NPU_TR = {
         'name': '3D Parallax Sensitivity',
         'tooltip': "Sensitivity of the background's 3D perspective movement.",
     },
+    'npu_preserve_glasses': {
+        'name': 'Preserve Glasses Frame',
+        'tooltip': 'Preserves eyeglasses frames and temples cleanly in the foreground, preventing cut-off or blurring around thin edges.',
+    },
     'npu_chair_retention': {
         'name': 'Preserve Chair (AI Neural Model)',
         'tooltip': 'Identifies the office or gaming chair using an OpenVINO neural model on the NPU and keeps the backrest in the foreground.',
@@ -2570,6 +2574,14 @@ class IntelNPUCtrls:
                 default=40,
                 min=10,
                 max=100
+            ),
+            IntelNPUCtrl(
+                'npu_preserve_glasses',
+                T('npu_preserve_glasses', 'name', 'Preservar Armação de Óculos'),
+                'boolean',
+                T('npu_preserve_glasses', 'tooltip', 'Preserva a armação e as hastes dos óculos nítidas no primeiro plano, evitando corte ou borrão na borda do fundo.'),
+                value=bool(v_cfg.get("preserve_glasses", v_cfg.get("glasses_protection", True))),
+                default=True
             ),
             IntelNPUCtrl(
                 'npu_chair_retention',
@@ -3024,6 +3036,12 @@ class IntelNPUCtrls:
             elif k == 'npu_parallax_strength':
                 ctrl.value = int(v)
                 cfg["video"]["parallax_strength"] = int(v)
+                changed = True
+
+            elif k == 'npu_preserve_glasses':
+                ctrl.value = bool(v)
+                cfg["video"]["preserve_glasses"] = bool(v)
+                cfg["video"]["glasses_protection"] = bool(v)
                 changed = True
 
             elif k == 'npu_chair_retention':
@@ -4329,6 +4347,7 @@ class CameraCtrls:
                         'npu_bg_image',
                         'npu_blur_strength',
                         'npu_feather',
+                        'npu_preserve_glasses',
                         'npu_chair_retention',
                         'npu_chair_strength',
                         'npu_parallax',

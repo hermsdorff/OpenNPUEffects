@@ -3,7 +3,13 @@
 # npu-ctl: CLI control utility for Intel NPU Webcam and Audio effects
 #
 CONFIG_FILE="$HOME/.config/npu-effects/config.json"
-VENV_PYTHON="$HOME/.local/share/npu-effects/venv/bin/python3"
+if [ -x "/opt/npu-effects/venv/bin/python3" ]; then
+    VENV_PYTHON="/opt/npu-effects/venv/bin/python3"
+elif [ -x "$HOME/.local/share/npu-effects/venv/bin/python3" ]; then
+    VENV_PYTHON="$HOME/.local/share/npu-effects/venv/bin/python3"
+else
+    VENV_PYTHON="$(which python3)"
+fi
 
 # Colors
 GREEN='\033[0;32m'
@@ -87,6 +93,7 @@ print(f'  Webcam Parallax 3D:    {\"ATIVO (\" + str(v.get(\"parallax_strength\",
 print(f'  Webcam Gestos Manuais: {\"ATIVO (\" + str(v.get(\"gesture_action\", \"all\")).upper() + \")\" if v.get(\"gesture_detection_enabled\", True) else \"DESATIVADO\"}')
 print(f'  Webcam Reter Objetos:  {\"ATIVO (\" + str(v.get(\"object_retention_strength\", 60)) + \"%)\" if v.get(\"object_retention_enabled\", True) else \"DESATIVADO\"}')
 print(f'  Webcam Reter Cadeira:  {\"ATIVO (Modelo Neural NPU - \" + str(v.get(\"chair_retention_strength\", 50)) + \"%)\" if v.get(\"chair_retention_enabled\", True) else \"DESATIVADO\"}')
+print(f'  Webcam Reter Armação Óculos: {\"ATIVO (BiSeNet Face Parsing NPU)\" if v.get(\"preserve_glasses\", True) else \"DESATIVADO\"}')
 print(f'  Webcam Fade Ausência:  {\"ATIVO (Fade Suave)\" if v.get(\"privacy_fade_enabled\", True) else \"DESATIVADO (Corte Seco)\"}')
 print(f'  Webcam Suavização/Denoise: {\"ATIVO\" if v.get(\"smooth_enabled\") else \"DESATIVADO\"} (Nível: {v.get(\"smooth_strength\", 50)})')
 print(f'  Webcam Luz de Estúdio: {\"ATIVO\" if v.get(\"studio_light_enabled\") else \"DESATIVADO\"} (Ganho: {v.get(\"studio_light_gain\", 40)})')
@@ -706,6 +713,32 @@ elif arg.isdigit():
     print(f'Sensibilidade do modelo neural de cadeira ajustada para {val}%!')
 else:
     print('Uso: npu-ctl chair [on | off | <sensibilidade 10-100>]')
+    exit(1)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+}
+
+cmd_glasses() {
+    ensure_config
+    arg="$1"
+    $VENV_PYTHON -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    cfg = json.load(f)
+
+arg = '$arg'.lower()
+if arg in ['on', 'true', '1', 'ativar', 'sim', '']:
+    cfg['video']['preserve_glasses'] = True
+    cfg['video']['glasses_protection'] = True
+    print('Preservação de armação de óculos (BiSeNet NPU) ATIVADA!')
+elif arg in ['off', 'false', '0', 'desativar', 'nao']:
+    cfg['video']['preserve_glasses'] = False
+    cfg['video']['glasses_protection'] = False
+    print('Preservação de armação de óculos (BiSeNet NPU) DESATIVADA!')
+else:
+    print('Uso: npu-ctl glasses [on | off]')
     exit(1)
 
 with open('$CONFIG_FILE', 'w') as f:
@@ -1625,6 +1658,9 @@ case "$1" in
     chair|cadeira)
         cmd_chair "$2"
         ;;
+    glasses|oculos|eyeglass)
+        cmd_glasses "$2"
+        ;;
     privacy-fade|fade)
         cmd_privacy_fade "$2"
         ;;
@@ -1666,6 +1702,7 @@ case "$1" in
         echo "  npu-ctl mic-source [<1,2..|auto>] Seleciona qual microfone físico (PIXY, USB, Notebook) alimenta a NPU"
         echo "  npu-ctl blur [on|off|<5-99>]     Ativa, desativa ou ajusta nível do desfoque"
         echo "  npu-ctl feather <10-80>          Ajusta a largura da borda de transição suave (padrão: 40px)"
+        echo "  npu-ctl glasses [on|off]         Ativa/desativa preservação de armação de óculos (BiSeNet NPU)"
         echo "  npu-ctl chair [on|off|<10-100>]  Ativa/desativa retenção de cadeira com modelo neural IA na NPU"
         echo "  npu-ctl smooth [on|off|<10-100>] Ativa, desativa ou ajusta nível de suavização/denoise"
         echo "  npu-ctl studio [on|off|<10-100>] Ativa, desativa ou ajusta luz de estúdio (ring light)"

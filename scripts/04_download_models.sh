@@ -87,6 +87,31 @@ if [ -f "$LOCAL_MODELS/video/chair_instance_segmenter.xml" ] && [ -f "$LOCAL_MOD
     sudo cp -u "$LOCAL_MODELS/video/chair_instance_segmenter".* "$TARGET_VIDEO/"
 fi
 
+echo -e "${YELLOW}--> Verificando modelo de Segmentação de Rosto e Óculos (BiSeNet Face Parsing)...${NC}"
+if [ -f "$LOCAL_MODELS/video/face_parsing_bisenet.xml" ] && [ -f "$LOCAL_MODELS/video/face_parsing_bisenet.bin" ]; then
+    echo -e "${GREEN}Copiando modelo de face parsing (BiSeNet) para $TARGET_VIDEO...${NC}"
+    sudo cp -u "$LOCAL_MODELS/video/face_parsing_bisenet".* "$TARGET_VIDEO/"
+else
+    echo -e "${CYAN}Baixando modelo BiSeNet Face Parsing e convertendo para OpenVINO IR FP16...${NC}"
+    BISENET_URL="https://huggingface.co/litert-community/BiSeNet-Face-Parsing-LiteRT/resolve/main/faceparsing.tflite"
+    sudo curl -L --retry 3 -o "$TARGET_VIDEO/faceparsing.tflite" "$BISENET_URL"
+
+    sudo "$VENV_PYTHON" - << 'PYBISENET'
+import openvino as ov
+from pathlib import Path
+
+video_dir = Path("/opt/npu-effects/models/video") if Path("/opt/npu-effects/models/video").exists() else Path.home() / ".local/share/npu-effects/models/video"
+tflite_path = video_dir / "faceparsing.tflite"
+out_path = video_dir / "face_parsing_bisenet.xml"
+
+core = ov.Core()
+model = core.read_model(str(tflite_path))
+ov.save_model(model, str(out_path), compress_to_fp16=True)
+print("Modelo BiSeNet Face Parsing convertido para IR FP16 com sucesso!")
+PYBISENET
+    sudo rm -f "$TARGET_VIDEO/faceparsing.tflite"
+fi
+
 # 3. Testar compilação dos modelos na NPU
 echo -e "${YELLOW}--> Testando compilação dos modelos baixados na NPU...${NC}"
 "$VENV_PYTHON" - << 'PYTEST'
@@ -116,6 +141,12 @@ if chair_m.exists():
     m = core.read_model(str(chair_m))
     compiled = core.compile_model(m, device)
     print(f"\033[0;32m✓ Modelo de Segmentação de Cadeira YOLACT compilado com sucesso no dispositivo '{device}'!\033[0m")
+
+glasses_m = base / "video/face_parsing_bisenet.xml"
+if glasses_m.exists():
+    m = core.read_model(str(glasses_m))
+    compiled = core.compile_model(m, device)
+    print(f"\033[0;32m✓ Modelo Face Parsing (BiSeNet Óculos) compilado com sucesso no dispositivo '{device}'!\033[0m")
 PYTEST
 
 # Garantir permissão de leitura para todos os usuários

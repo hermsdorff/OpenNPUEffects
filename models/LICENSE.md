@@ -16,6 +16,7 @@ The source code of the Open NPU Effects project is distributed under the **MIT L
 | **MediaPipe Selfie Multiclass** | `video/selfie_multiclass.*` | Multiclass segmentation (skin, hair, clothes, body) | [Google LLC / MediaPipe](https://github.com/google/mediapipe) | [Apache 2.0](#4-mediapipe-selfie-multiclass-google-llc) |
 | **MobileNetV3 LRASPP** | `video/chair_segmenter.*` | 21-class semantic segmentation (chair fallback) | [PyTorch / TorchVision Contributors](https://github.com/pytorch/vision) | [BSD 3-Clause](#5-mobilenetv3-lraspp-segmenter-pytorch--torchvision) |
 | **YOLACT ResNet-50 FPN** | `video/chair_instance_segmenter.*` | Instance segmentation for precise chair retention | [Daniel Bolya et al. (UC Davis)](https://github.com/dbolya/yolact) | [MIT](#6-yolact-resnet-50-fpn-instance-segmenter-uc-davis--intel-omz) |
+| **BiSeNet ResNet-18 Face Parser** | `video/face_parsing_bisenet.*` | Semantic face parsing & eyeglass preservation | [zllrunning](https://github.com/zllrunning/face-parsing.PyTorch) / [LiteRT Community](https://huggingface.co/litert-community/BiSeNet-Face-Parsing-LiteRT) | [MIT](#7-bisenet-resnet-18-face-parser-celebamask-hq) |
 
 ---
 
@@ -154,6 +155,39 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 MIT License
 
 Copyright (c) 2019 Daniel Bolya
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+## 7. BiSeNet ResNet-18 Face Parser (CelebAMask-HQ)
+- **Files:** `video/face_parsing_bisenet.xml`, `video/face_parsing_bisenet.bin`
+- **Source:** [zllrunning/face-parsing.PyTorch](https://github.com/zllrunning/face-parsing.PyTorch) / [LiteRT Community BiSeNet-Face-Parsing-LiteRT](https://huggingface.co/litert-community/BiSeNet-Face-Parsing-LiteRT)
+- **Authors:** zllrunning (PyTorch implementation & CelebAMask-HQ training) / LiteRT Community (on-device conversion)
+- **Copyright:** Copyright (c) 2019 zll
+- **License:** **MIT License**
+
+```text
+MIT License
+
+Copyright (c) 2019 zll
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

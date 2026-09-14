@@ -16,6 +16,7 @@ For full copyright details and individual model licenses, see [`LICENSE.md`](LIC
 | `video/selfie_multiclass.*` | MediaPipe Selfie Multiclass | `[1, 256, 256, 3]` (6 classes) | FP16 | [Google MediaPipe](https://github.com/google/mediapipe) / PINTO Zoo | Apache 2.0 |
 | `video/chair_instance_segmenter.*` | YOLACT ResNet-50 FPN Instance Segmenter | `[1, 3, 550, 550]` | FP16 | [Daniel Bolya et al. (UC Davis)](https://github.com/dbolya/yolact) / Intel OMZ | MIT |
 | `video/chair_segmenter.*` | MobileNetV3 LRASPP Segmenter | `[1, 3, 256, 256]` (21 classes VOC) | FP16 | [TorchVision](https://github.com/pytorch/vision) | BSD-3-Clause |
+| `video/face_parsing_bisenet.*` | BiSeNet ResNet-18 Face Parser | `[1, 3, 512, 512]` (19 classes CelebAMask-HQ) | FP16 | [LiteRT Community](https://huggingface.co/litert-community/BiSeNet-Face-Parsing-LiteRT) / [zllrunning](https://github.com/zllrunning/face-parsing.PyTorch) | MIT |
 
 ---
 

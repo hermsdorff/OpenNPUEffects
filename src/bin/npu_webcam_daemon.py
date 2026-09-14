@@ -47,6 +47,19 @@ for p in [
 if SEG_CHAIR_PATH is None:
     SEG_CHAIR_PATH = MODEL_DIR / "chair_instance_segmenter.xml"
 
+SEG_GLASSES_PATH = None
+for p in [
+    USER_MODEL_DIR / "face_parsing_bisenet.xml",
+    REPO_MODEL_DIR / "face_parsing_bisenet.xml",
+    OPT_MODEL_DIR / "face_parsing_bisenet.xml",
+    MODEL_DIR / "face_parsing_bisenet.xml",
+]:
+    if p.exists():
+        SEG_GLASSES_PATH = p
+        break
+if SEG_GLASSES_PATH is None:
+    SEG_GLASSES_PATH = MODEL_DIR / "face_parsing_bisenet.xml"
+
 USER_ASSETS_DIR = Path.home() / ".local/share/npu-effects/assets"
 OPT_ASSETS_DIR = Path("/opt/npu-effects/assets")
 REPO_ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "assets"
@@ -121,7 +134,9 @@ def load_config():
             "privacy_enabled": False,
             "privacy_timeout": 3.0,
             "privacy_mute_mic": True,
-            "privacy_image": ""
+            "privacy_image": "",
+            "preserve_glasses": True,
+            "glasses_protection": True
         }
     }
     try:
@@ -218,13 +233,57 @@ class AutoFramer:
             self.detector.setInputSize((self.det_w, self.det_h))
             retval, faces = self.detector.detect(small)
 
-        # Sempre atualiza o instante do ultimo rosto visto quando ha deteccao,
-        # mesmo com o Auto-Framing desativado (enabled=False). Sem isso,
-        # desligar o enquadramento congelava last_face_time no valor anterior
-        # e o detector de ausencia (Smart Auto-Privacy) passava a marcar o
-        # usuario como ausente poucos segundos depois, mesmo com ele presente.
+        # Sempre atualiza o rastreamento facial e o instante do ultimo rosto visto quando ha deteccao,
+        # mesmo com o Auto-Framing desativado (enabled=False). Dessa forma, o detector de ausencia
+        # e recursos dependentes da face (Preservacao de Oculos, Studio Light, Eye Contact) continuam
+        # funcionando com total precisao.
         if faces is not None and len(faces) > 0:
             self.last_face_time = now
+            scale_x = self.in_w / self.det_w
+            scale_y = self.in_h / self.det_h
+
+            if self.smooth_face is not None:
+                prev_cx = self.smooth_face[0] + self.smooth_face[2] / 2.0
+                prev_cy = self.smooth_face[1] + self.smooth_face[3] / 2.0
+                def face_score(f):
+                    area = (f[2] * scale_x) * (f[3] * scale_y)
+                    fcx = (f[0] + f[2] / 2.0) * scale_x
+                    fcy = (f[1] + f[3] * 0.5) * scale_y
+                    dist = np.hypot(fcx - prev_cx, fcy - prev_cy)
+                    return area / (1.0 + (dist / 120.0))
+                best_face = max(faces, key=face_score)
+            else:
+                best_face = max(faces, key=lambda f: f[2] * f[3])
+
+            fx = float(best_face[0] * scale_x)
+            fy = float(best_face[1] * scale_y)
+            fw = float(best_face[2] * scale_x)
+            fh = float(best_face[3] * scale_y)
+            rx = float(best_face[4] * scale_x)
+            ry = float(best_face[5] * scale_y)
+            lx = float(best_face[6] * scale_x)
+            ly = float(best_face[7] * scale_y)
+
+            raw_face = np.array([fx, fy, fw, fh, rx, ry, lx, ly], dtype=np.float32)
+
+            # Exponential Moving Average filter on face position & dimensions (eliminates frame jitter)
+            if self.smooth_face is None or len(self.smooth_face) != 8:
+                self.smooth_face = raw_face
+            else:
+                self.smooth_face = self.smooth_face * 0.82 + raw_face * 0.18
+
+            s_fx, s_fy, s_fw, s_fh, s_rx, s_ry, s_lx, s_ly = self.smooth_face
+
+            self.last_face_info = {
+                "has_face": True,
+                "box_phys": (s_fx, s_fy, s_fw, s_fh),
+                "r_eye_phys": (s_rx, s_ry),
+                "l_eye_phys": (s_lx, s_ly),
+                "time": now
+            }
+        else:
+            if (now - self.last_face_time) > 1.0:
+                self.last_face_info = {"has_face": False}
 
         full_frame_box = np.array([0.0, 0.0, float(self.in_w), float(self.in_h)], dtype=np.float32)
 
@@ -237,7 +296,6 @@ class AutoFramer:
             return self.crop_and_resize(frame, self.curr_box)
 
         if faces is not None and len(faces) > 0:
-            self.last_face_time = now
             scale_x = self.in_w / self.det_w
             scale_y = self.in_h / self.det_h
 
@@ -267,78 +325,26 @@ class AutoFramer:
                 group_w = max(10.0, max_x - min_x)
                 group_h = max(10.0, max_y - min_y)
 
-                raw_face = np.array([min_x, min_y, group_w, group_h, min_x + group_w * 0.3, min_y + group_h * 0.3, min_x + group_w * 0.7, min_y + group_h * 0.3], dtype=np.float32)
-                if self.smooth_face is None or len(self.smooth_face) != 8:
-                    self.smooth_face = raw_face
-                else:
-                    self.smooth_face = self.smooth_face * 0.82 + raw_face * 0.18
+                g_fx, g_fy, g_fw, g_fh = min_x, min_y, group_w, group_h
 
-                s_fx, s_fy, s_fw, s_fh, s_rx, s_ry, s_lx, s_ly = self.smooth_face
-                self.last_face_info = {
-                    "has_face": True,
-                    "box_phys": (s_fx, s_fy, s_fw, s_fh),
-                    "r_eye_phys": (s_rx, s_ry),
-                    "l_eye_phys": (s_lx, s_ly),
-                    "time": now
-                }
-
-                target_h = max(s_fh * 2.2, self.in_h * 0.58)
+                target_h = max(g_fh * 2.2, self.in_h * 0.58)
                 target_h = min(target_h, float(self.in_h))
                 target_w = target_h * self.aspect_ratio
-                if target_w < (s_fw * 1.35):
-                    target_w = min(float(self.in_w), s_fw * 1.35)
+                if target_w < (g_fw * 1.35):
+                    target_w = min(float(self.in_w), g_fw * 1.35)
                     target_h = target_w / self.aspect_ratio
                     if target_h > self.in_h:
                         target_h = float(self.in_h)
                         target_w = target_h * self.aspect_ratio
 
-                center_x = s_fx + s_fw / 2.0
-                center_y = s_fy + s_fh * 0.48
+                center_x = g_fx + g_fw / 2.0
+                center_y = g_fy + g_fh * 0.48
                 x1 = center_x - target_w / 2.0
                 y1 = center_y - target_h * 0.42
                 x2 = x1 + target_w
                 y2 = y1 + target_h
             else:
-                # Single face selection: pick candidate closest to tracked face
-                if self.smooth_face is not None:
-                    prev_cx = self.smooth_face[0] + self.smooth_face[2] / 2.0
-                    prev_cy = self.smooth_face[1] + self.smooth_face[3] / 2.0
-                    def face_score(f):
-                        area = (f[2] * scale_x) * (f[3] * scale_y)
-                        fcx = (f[0] + f[2] / 2.0) * scale_x
-                        fcy = (f[1] + f[3] * 0.5) * scale_y
-                        dist = np.hypot(fcx - prev_cx, fcy - prev_cy)
-                        return area / (1.0 + (dist / 120.0))
-                    best_face = max(faces, key=face_score)
-                else:
-                    best_face = max(faces, key=lambda f: f[2] * f[3])
-
-                fx = float(best_face[0] * scale_x)
-                fy = float(best_face[1] * scale_y)
-                fw = float(best_face[2] * scale_x)
-                fh = float(best_face[3] * scale_y)
-                rx = float(best_face[4] * scale_x)
-                ry = float(best_face[5] * scale_y)
-                lx = float(best_face[6] * scale_x)
-                ly = float(best_face[7] * scale_y)
-
-                raw_face = np.array([fx, fy, fw, fh, rx, ry, lx, ly], dtype=np.float32)
-
-                # Exponential Moving Average filter on face position & dimensions (eliminates frame jitter)
-                if self.smooth_face is None:
-                    self.smooth_face = raw_face
-                else:
-                    self.smooth_face = self.smooth_face * 0.82 + raw_face * 0.18
-
                 s_fx, s_fy, s_fw, s_fh, s_rx, s_ry, s_lx, s_ly = self.smooth_face
-
-                self.last_face_info = {
-                    "has_face": True,
-                    "box_phys": (s_fx, s_fy, s_fw, s_fh),
-                    "r_eye_phys": (s_rx, s_ry),
-                    "l_eye_phys": (s_lx, s_ly),
-                    "time": now
-                }
 
                 # Comfortable framing: ~3.2x face height, min crop 55% of sensor height
                 target_h = max(s_fh * 3.2, self.in_h * 0.55)
@@ -419,6 +425,8 @@ class AutoFramer:
 
     def get_framed_face_info(self):
         if not self.last_face_info or not self.last_face_info.get("has_face"):
+            return {"has_face": False}
+        if (time.time() - self.last_face_info.get("time", 0)) > 1.0:
             return {"has_face": False}
         x1, y1, x2, y2 = self.curr_box
         cw = max(1.0, x2 - x1)
@@ -846,6 +854,103 @@ def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_i
     except Exception as e:
         return p_person, cached_chair_mask
 
+def apply_neural_glasses_retention(
+    framed,
+    face_info,
+    glasses_infer_req=None,
+    glasses_inp_name=None,
+    glasses_out_name=None,
+    cached_glasses_mask=None,
+    run_inference=True,
+    inp_w=512,
+    inp_h=512
+):
+    """
+    Retencao Neural de Armacao e Hastes de Oculos (BiSeNet Face Parsing - MIT License) na NPU:
+    Detecta e preserva com precisao sub-pixel a armacao dos oculos e as hastes laterais ate as orelhas,
+    impedindo que bordas finas sejam cortadas ou borradas pelo algoritmo de segmentacao de pessoa.
+    1. Recorte focado (crop) a partir da bounding box do rosto rastreada pelo YuNet com expansao lateral (~35%) e superior (~30%).
+    2. Inferencia na NPU do modelo BiSeNet Face Parsing (CelebAMask-HQ, 19 classes, classe 6 = eyeglass).
+    3. Extracao da mascara binaria dos oculos, redimensionamento para coordenadas originais e dilatacao suave + feathering.
+    4. Suavizacao temporal e cache entre quadros para manter 30+ FPS solidos.
+    """
+    try:
+        if glasses_infer_req is None or glasses_inp_name is None:
+            return cached_glasses_mask
+
+        if not face_info or not face_info.get("has_face"):
+            return None
+
+        # Reutiliza mascara estavel no frame intermediario para economizar ciclos na NPU
+        if not run_inference and cached_glasses_mask is not None:
+            return cached_glasses_mask
+
+        h_orig, w_orig = framed.shape[:2]
+        fx, fy, fw, fh = face_info["box"]
+
+        if fw < 16 or fh < 16:
+            return cached_glasses_mask
+
+        # Margens expandidas para cobrir as hastes dos oculos ate a regiao das orelhas (~38% nas laterais, ~30% superior, ~15% inferior)
+        margin_x = int(fw * 0.38)
+        margin_top = int(fh * 0.30)
+        margin_bottom = int(fh * 0.15)
+
+        x1 = max(0, fx - margin_x)
+        y1 = max(0, fy - margin_top)
+        x2 = min(w_orig, fx + fw + margin_x)
+        y2 = min(h_orig, fy + fh + margin_bottom)
+
+        cw = x2 - x1
+        ch = y2 - y1
+        if cw < 16 or ch < 16:
+            return cached_glasses_mask
+
+        crop = framed[y1:y2, x1:x2]
+        resized = cv2.resize(crop, (inp_w, inp_h))
+
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        # Normalizacao ImageNet padrao do BiSeNet Face Parsing
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        blob = ((rgb - mean) / std).transpose(2, 0, 1)[np.newaxis, ...]
+
+        glasses_infer_req.infer({glasses_inp_name: blob})
+        out_tensor = glasses_infer_req.get_tensor(glasses_out_name).data[0]
+        classes = np.argmax(out_tensor, axis=0)
+
+        # Classe 6: eyeglass no CelebAMask-HQ
+        glasses_bin = (classes == 6).astype(np.uint8)
+
+        # Se nenhum pixel de oculos foi detectado
+        if np.count_nonzero(glasses_bin) < 25:
+            # Se havia mascara anterior, decai suavemente antes de zerar
+            if cached_glasses_mask is not None:
+                decayed = cached_glasses_mask * 0.4
+                return decayed if np.max(decayed) > 0.08 else None
+            return None
+
+        # Redimensiona mascara de volta para as dimensoes do crop no frame
+        glasses_crop_unpad = cv2.resize(glasses_bin, (cw, ch), interpolation=cv2.INTER_NEAREST)
+
+        # Dilate suave (3x3) para garantir continuidade das hastes finas e cobertura total da armacao
+        k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        dilated = cv2.dilate(glasses_crop_unpad, k_dilate, iterations=1)
+
+        # Feathering com GaussianBlur para bordas anti-aliased e fusao natural com o primeiro plano
+        feathered = cv2.GaussianBlur(dilated.astype(np.float32), (5, 5), sigmaX=1.0)
+        core_mask = glasses_crop_unpad.astype(np.float32)
+        feathered = np.maximum(core_mask, feathered)
+        feathered = np.clip(feathered, 0.0, 1.0)
+
+        # Posiciona na mascara full frame
+        glasses_full = np.zeros((h_orig, w_orig), dtype=np.float32)
+        glasses_full[y1:y2, x1:x2] = feathered
+
+        return glasses_full
+    except Exception as e:
+        return cached_glasses_mask
+
 def detect_hand_gesture(hand_skin, out_w=1920, out_h=1080):
     hand_bin = (hand_skin > 0.28).astype(np.uint8) * 255
     hand_bin = cv2.morphologyEx(hand_bin, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
@@ -1208,6 +1313,39 @@ def main():
             except Exception as e2:
                 logging.error(f"Failed to load neural chair model: {e2}")
 
+    glasses_infer_req = None
+    glasses_inp_name = None
+    glasses_out_name = None
+    glasses_inp_w = 512
+    glasses_inp_h = 512
+    if SEG_GLASSES_PATH.exists():
+        logging.info(f"Loading BiSeNet Face Parsing model from: {SEG_GLASSES_PATH}")
+        try:
+            glasses_model = core.read_model(str(SEG_GLASSES_PATH))
+            try:
+                glasses_compiled = core.compile_model(glasses_model, npu_device)
+                glasses_infer_req = glasses_compiled.create_infer_request()
+                glasses_inp_name = glasses_model.inputs[0].get_any_name()
+                glasses_out_name = glasses_model.outputs[0].get_any_name()
+                g_shape = glasses_model.inputs[0].shape
+                if len(g_shape) >= 4:
+                    glasses_inp_h = int(g_shape[2])
+                    glasses_inp_w = int(g_shape[3])
+                logging.info(f"BiSeNet Face Parsing model (CelebAMask-HQ) compiled successfully on {npu_device} ({glasses_inp_w}x{glasses_inp_h})!")
+            except Exception as e:
+                logging.warning(f"Could not compile BiSeNet Face Parsing model on {npu_device}: {e}. Retrying on CPU...")
+                glasses_compiled = core.compile_model(glasses_model, "CPU")
+                glasses_infer_req = glasses_compiled.create_infer_request()
+                glasses_inp_name = glasses_model.inputs[0].get_any_name()
+                glasses_out_name = glasses_model.outputs[0].get_any_name()
+                g_shape = glasses_model.inputs[0].shape
+                if len(g_shape) >= 4:
+                    glasses_inp_h = int(g_shape[2])
+                    glasses_inp_w = int(g_shape[3])
+                logging.info(f"BiSeNet Face Parsing model compiled successfully on CPU ({glasses_inp_w}x{glasses_inp_h})!")
+        except Exception as e2:
+            logging.error(f"Failed to load BiSeNet Face Parsing model: {e2}")
+
     last_bg_path = ""
     cached_bg = None
     oversized_bg = None
@@ -1237,6 +1375,8 @@ def main():
         prev_mask = None
         chair_frame_counter = 0
         cached_chair_mask = None
+        glasses_frame_counter = 0
+        cached_glasses_mask = None
         morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
         last_consumer_check = 0.0
@@ -1531,6 +1671,27 @@ def main():
                     infer_request.infer({seg_inp_name: blob})
                     p_person = infer_request.get_tensor(seg_out_name).data[0, 0]
 
+                # 2.2 Neural Eyeglasses & Frame Retention (Modelo BiSeNet Face Parsing na NPU - MIT License)
+                preserve_glasses = cfg.get("preserve_glasses", cfg.get("glasses_protection", True))
+                if preserve_glasses and face_info.get("has_face") and glasses_infer_req is not None:
+                    should_infer_glasses = (glasses_frame_counter % 2 == 1) or (cached_glasses_mask is None)
+                    cached_glasses_mask = apply_neural_glasses_retention(
+                        framed, face_info,
+                        glasses_infer_req=glasses_infer_req,
+                        glasses_inp_name=glasses_inp_name,
+                        glasses_out_name=glasses_out_name,
+                        cached_glasses_mask=cached_glasses_mask,
+                        run_inference=should_infer_glasses,
+                        inp_w=glasses_inp_w,
+                        inp_h=glasses_inp_h
+                    )
+                    glasses_frame_counter += 1
+                    if cached_glasses_mask is not None:
+                        g_low = cv2.resize(cached_glasses_mask, (p_person.shape[1], p_person.shape[0]), interpolation=cv2.INTER_LINEAR)
+                        p_person = np.maximum(p_person, g_low)
+                else:
+                    cached_glasses_mask = None
+
                 # Motion-Adaptive Temporal Filtering:
                 # Kills pixel jitter on static areas, but responds instantly (alpha=0.96) to arm/hand motion
                 if prev_mask is None:
@@ -1560,6 +1721,8 @@ def main():
                 # Uses 640x360 camera luminance to snap the mask to exact real-world 1080p hair & finger edges!
                 guide_small = cv2.resize(cv2.cvtColor(framed, cv2.COLOR_BGR2GRAY), (640, 360))
                 mask_full = fast_guided_filter(guide_small, p_curved, r=5, eps=1e-3, out_shape=(out_w, out_h))
+                if cached_glasses_mask is not None:
+                    mask_full = np.maximum(mask_full, cached_glasses_mask)
                 mask_3c = cv2.merge([mask_full, mask_full, mask_full])
 
                 # Rim Light (Contour / Hair Light)
@@ -1656,6 +1819,8 @@ def main():
                     output_frame = apply_artistic_filter(output_frame, mode=art_f, strength=int(cfg.get("artistic_strength", 70)))
             else:
                 prev_mask = None
+                cached_glasses_mask = None
+                cached_chair_mask = None
                 output_frame = processed_fg
 
                 # Post-Processing: Cinematic Color Grading & Artistic Filters even without blur
