@@ -2351,8 +2351,8 @@ def npu_translate(lang, text_id, field, pt_text, menu_id=None):
     return entry.get(field, pt_text)
 
 class IntelNPUCtrl(BaseCtrl):
-    def __init__(self, text_id, name, type, tooltip, value=None, default=None, min=None, max=None, step=None, menu=None, inactive=False, readonly=False, reopener=False):
-        super().__init__(text_id, name, type, value=value, default=default, min=min, max=max, step=step, tooltip=tooltip, menu=menu, inactive=inactive, readonly=readonly, reopener=reopener)
+    def __init__(self, text_id, name, type, tooltip, value=None, default=None, min=None, max=None, step=None, menu=None, menu_dd=False, inactive=False, readonly=False, reopener=False):
+        super().__init__(text_id, name, type, value=value, default=default, min=min, max=max, step=step, tooltip=tooltip, menu=menu, menu_dd=menu_dd, inactive=inactive, readonly=readonly, reopener=reopener)
 
 class IntelNPUCtrls:
     def __init__(self, device, fd):
@@ -2847,6 +2847,7 @@ class IntelNPUCtrls:
                 T('npu_gesture_action', 'tooltip', 'Selecione a resposta automática ao reconhecer gestos manuais na câmera.'),
                 value=gesture_act_val,
                 default='all',
+                menu_dd=True,
                 menu=[
                     BaseCtrlMenu('reaction', T('npu_gesture_action', 'menu', 'Reações Visuais na Tela (Joinha, Vitoria, Aceno)', menu_id='reaction'), 0),
                     BaseCtrlMenu('mute_toggle', T('npu_gesture_action', 'menu', 'Gatilho de Mudo com Mão Aberta (Aceno)', menu_id='mute_toggle'), 1),

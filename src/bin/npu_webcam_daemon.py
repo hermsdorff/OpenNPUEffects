@@ -952,8 +952,9 @@ def apply_neural_glasses_retention(
         return cached_glasses_mask
 
 def detect_hand_gesture(hand_skin, out_w=1920, out_h=1080):
-    hand_bin = (hand_skin > 0.28).astype(np.uint8) * 255
-    hand_bin = cv2.morphologyEx(hand_bin, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    hand_bin = (hand_skin > 0.30).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    hand_bin = cv2.morphologyEx(hand_bin, cv2.MORPH_OPEN, kernel)
     contours, _ = cv2.findContours(hand_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     best_gesture = None
@@ -961,11 +962,21 @@ def detect_hand_gesture(hand_skin, out_w=1920, out_h=1080):
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 85:
+        if area < 200 or area > 6000:
             continue
 
         x, y, w, h = cv2.boundingRect(cnt)
+        if w < 16 or h < 20:
+            continue
+
+        # Ignore arms resting on desk at bottom edge of screen
+        if (y + h >= 253) and (y > 185):
+            continue
+
         aspect = float(h) / max(1.0, float(w))
+        if aspect < 0.60 or aspect > 2.30:
+            continue
+
         cx = int((x + w / 2.0) * out_w / 256.0)
         cy = int((y + h / 2.0) * out_h / 256.0)
 
@@ -973,13 +984,21 @@ def detect_hand_gesture(hand_skin, out_w=1920, out_h=1080):
         if hull is None or len(hull) < 4:
             continue
 
+        hull_pts = cv2.convexHull(cnt, returnPoints=True)
+        hull_area = cv2.contourArea(hull_pts)
+        solidity = float(area) / max(1.0, hull_area)
+
         defects = cv2.convexityDefects(cnt, hull)
-        finger_count = 0
+        valid_defects = []
 
         if defects is not None:
             for i in range(defects.shape[0]):
                 row = defects[i, 0] if len(defects.shape) == 3 else defects[i]
                 s, e, f, d = int(row[0]), int(row[1]), int(row[2]), float(row[3])
+                d_px = d / 256.0
+                if d_px < 3.2:
+                    continue
+
                 start = cnt[s][0]
                 end = cnt[e][0]
                 far = cnt[f][0]
@@ -988,24 +1007,39 @@ def detect_hand_gesture(hand_skin, out_w=1920, out_h=1080):
                 b = np.hypot(far[0] - start[0], far[1] - start[1])
                 c = np.hypot(end[0] - far[0], end[1] - far[1])
 
+                if b < 6.0 or c < 6.0:
+                    continue
+
                 cos_val = (b**2 + c**2 - a**2) / (2.0 * b * c + 1e-6)
                 angle = np.arccos(np.clip(cos_val, -1.0, 1.0)) * 180.0 / np.pi
 
-                if angle <= 88.0 and d > 320:
-                    finger_count += 1
+                if 12.0 <= angle <= 92.0:
+                    valid_defects.append((d_px, angle, far))
 
-        if finger_count >= 3:
+        finger_count = len(valid_defects)
+        gesture = None
+
+        # 1. Open Palm / Wave: >= 3 finger valleys, balanced aspect
+        if finger_count >= 3 and 0.40 <= solidity <= 0.85 and 0.65 <= aspect <= 1.70:
             gesture = "open_palm"
-        elif finger_count == 1:
-            gesture = "peace"
-        elif finger_count == 0:
-            top_pt = min(cnt, key=lambda p: p[0][1])[0]
-            if aspect >= 1.15 and (y + h * 0.40) > top_pt[1]:
-                gesture = "thumbs_up"
-            else:
-                gesture = None
-        else:
-            gesture = None
+
+        # 2. Peace / Victory: 1 or 2 prominent deep valleys, taller aspect (index & middle fingers up)
+        elif (finger_count in [1, 2]) and 1.10 <= aspect <= 2.25 and 0.45 <= solidity <= 0.88:
+            deepest = max(valid_defects, key=lambda d: d[0])
+            if deepest[0] >= 5.0 and deepest[1] <= 65.0 and deepest[2][1] < (y + h * 0.70):
+                gesture = "peace"
+
+        # 3. Thumbs Up: Fist with thumb pointing up
+        # Curled fingers have no deep valleys (finger_count == 0), aspect >= 1.12
+        # Crucial: the top 25% of height (thumb) must be significantly narrower than the fist in the middle
+        elif finger_count == 0 and aspect >= 1.12 and solidity >= 0.70:
+            top_slice = hand_bin[y : y + max(3, int(h * 0.25)), x : x + w]
+            mid_slice = hand_bin[y + int(h * 0.40) : y + int(h * 0.85), x : x + w]
+            if top_slice.size > 0 and mid_slice.size > 0 and np.any(top_slice > 0) and np.any(mid_slice > 0):
+                top_w = np.max(np.sum(top_slice > 0, axis=1))
+                mid_w = np.max(np.sum(mid_slice > 0, axis=1))
+                if top_w < 0.65 * mid_w and mid_w >= 16:
+                    gesture = "thumbs_up"
 
         if gesture:
             best_gesture = gesture
@@ -1372,6 +1406,8 @@ def main():
         candidate_gesture_time = 0.0
         gesture_animation = None
         last_gesture_mute_time = 0.0
+        gesture_latched = False
+        gesture_cooldown_until = 0.0
         prev_mask = None
         chair_frame_counter = 0
         cached_chair_mask = None
@@ -1591,7 +1627,7 @@ def main():
                     body_skin = probs[:, :, 2]
                     p_person = np.maximum(p_person, np.clip(body_skin * 1.25, 0.0, 1.0))
 
-                    # 1. Hand isolation (excluding face & neck)
+                    # 1. Hand isolation (excluding face, neck, and central chest)
                     hand_skin = body_skin.copy()
                     if face_info.get("has_face"):
                         fx, fy, fw, fh = face_info["box"]
@@ -1599,13 +1635,21 @@ def main():
                         fy_s = int(fy * 256 / out_h)
                         fw_s = int(fw * 256 / out_w)
                         fh_s = int(fh * 256 / out_h)
-                        y1_ex = max(0, fy_s - int(fh_s * 0.2))
-                        y2_ex = min(256, fy_s + int(fh_s * 1.45))
-                        x1_ex = max(0, fx_s - int(fw_s * 0.25))
-                        x2_ex = min(256, fx_s + int(fw_s * 1.25))
+                        # Head / Face exclusion box
+                        y1_ex = max(0, fy_s - int(fh_s * 0.25))
+                        y2_ex = min(256, fy_s + int(fh_s * 1.25))
+                        x1_ex = max(0, fx_s - int(fw_s * 0.30))
+                        x2_ex = min(256, fx_s + int(fw_s * 1.30))
                         hand_skin[y1_ex:y2_ex, x1_ex:x2_ex] = 0.0
 
-                    has_hands = bool(np.max(hand_skin) > 0.22)
+                        # Neck & central chest corridor exclusion
+                        y1_neck = max(0, fy_s + int(fh_s * 0.85))
+                        y2_neck = min(256, fy_s + int(fh_s * 2.80))
+                        x1_neck = max(0, fx_s - int(fw_s * 0.40))
+                        x2_neck = min(256, fx_s + int(fw_s * 1.40))
+                        hand_skin[y1_neck:y2_neck, x1_neck:x2_neck] = 0.0
+
+                    has_hands = bool(np.max(hand_skin) > 0.25)
 
                     # 2. Handheld Object Retention (Preservação de Objetos Segurados na Mão)
                     if cfg.get("object_retention_enabled", True) and has_hands:
@@ -1640,30 +1684,44 @@ def main():
                         cached_chair_mask = None
 
                     # 3. Real-time Hand Gesture Recognition & Triggers
-                    if cfg.get("gesture_detection_enabled", True) and has_hands:
+                    if cfg.get("gesture_detection_enabled", True):
                         g_act = cfg.get("gesture_action", "all")
-                        g_type, g_pos = detect_hand_gesture(hand_skin, out_w, out_h)
+                        g_type, g_pos = (None, None)
+                        if has_hands:
+                            g_type, g_pos = detect_hand_gesture(hand_skin, out_w, out_h)
+
                         if g_type is not None:
                             if candidate_gesture == g_type:
-                                if (now - candidate_gesture_time) >= 0.25:
-                                    if gesture_animation is None or (now - gesture_animation["start_time"]) > 1.8:
+                                # Stable gesture held for at least 0.28 seconds
+                                if (now - candidate_gesture_time) >= 0.28:
+                                    # Trigger once per gesture presentation (one-shot latch)
+                                    if not gesture_latched and (now >= gesture_cooldown_until):
                                         if g_act in ["reaction", "all"]:
                                             gesture_animation = {
                                                 "type": g_type,
                                                 "pos": g_pos,
                                                 "start_time": now,
-                                                "duration": 2.2
+                                                "duration": 1.6
                                             }
                                         if g_type == "open_palm" and g_act in ["mute_toggle", "all"]:
-                                            if (now - last_gesture_mute_time) > 2.5:
+                                            if (now - last_gesture_mute_time) > 1.8:
                                                 is_currently_muted = check_audio_muted()
                                                 set_audio_mute(not is_currently_muted)
                                                 last_gesture_mute_time = now
+
+                                        gesture_latched = True
+                                        gesture_cooldown_until = now + 1.2
                             else:
                                 candidate_gesture = g_type
                                 candidate_gesture_time = now
+                                gesture_latched = False
                         else:
+                            # Hand is hidden, lowered, or returned to neutral
                             candidate_gesture = None
+                            gesture_latched = False
+                    else:
+                        candidate_gesture = None
+                        gesture_latched = False
                 else:
                     # Legacy 144x256 model fallback
                     small = cv2.resize(framed, (256, 144))
