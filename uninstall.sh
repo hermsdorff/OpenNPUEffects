@@ -14,6 +14,8 @@ YELLOW='\033[1;33m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 AUTO_YES=false
 PURGE_ALL=false
 
@@ -53,8 +55,8 @@ if [ "$AUTO_YES" = false ]; then
     echo -e "${YELLOW}Este script irá remover:${NC}"
     echo -e "  - Serviços systemd em segundo plano (npu-webcam e npu-audio)"
     echo -e "  - Diretório de instalação global (/opt/npu-effects/)"
-    echo -e "  - Comandos e atalhos (/usr/local/bin/npu-ctl, /usr/local/bin/cameractrls)"
-    echo -e "  - Atalho do menu de aplicativos (hu.irl.cameractrls.desktop)"
+    echo -e "  - Comando de controle (/usr/local/bin/npu-ctl)"
+    echo -e "  - Configurações e controles customizados do Cameractrls (o Cameractrls é mantido)"
     echo ""
     read -p "Deseja continuar com a desinstalação? [s/N]: " -r CONFIRM
     if [[ ! "$CONFIRM" =~ ^[sSyY]$ ]]; then
@@ -77,7 +79,7 @@ SUDO_PID=$!
 trap 'kill $SUDO_PID 2>/dev/null || true' EXIT
 
 # ------------------------------------------------------------------------------
-# 1. Parar e desabilitar serviços systemd do usuário
+# 1. Parar e desabilitar serviços systemd para todos os usuários
 # ------------------------------------------------------------------------------
 echo -e "\n${YELLOW}--> [1/5] Parando e desabilitando serviços em segundo plano...${NC}"
 
@@ -92,27 +94,26 @@ stop_user_services() {
         systemctl --user stop npu-webcam.service npu-audio.service 2>/dev/null || true
         systemctl --user disable npu-webcam.service npu-audio.service 2>/dev/null || true
     else
-        # Executar dentro do contexto da sessão do usuário alvo
-        sudo -u "$target_user" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user stop npu-webcam.service npu-audio.service 2>/dev/null || true
-        sudo -u "$target_user" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user disable npu-webcam.service npu-audio.service 2>/dev/null || true
+        sudo -u "$target_user" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user stop npu-webcam.service npu-audio.service 2>/dev/null || true
+        sudo -u "$target_user" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user disable npu-webcam.service npu-audio.service 2>/dev/null || true
     fi
 }
 
-stop_user_services "$REAL_USER"
-
-# Se purge ativo, parar para todos os usuários com home
-if [ "$PURGE_ALL" = true ]; then
-    while IFS=: read -r username _ uid _ _ homedir _; do
-        if [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ] && [[ "$homedir" == /home/* ]] && [ "$username" != "$REAL_USER" ]; then
-            stop_user_services "$username"
+while IFS=: read -r username _ uid _ _ homedir _; do
+    if [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ] && [[ "$homedir" == /home/* ]]; then
+        stop_user_services "$username"
+        sudo rm -f "$homedir/.config/systemd/user/default.target.wants/npu-webcam.service" 2>/dev/null || true
+        sudo rm -f "$homedir/.config/systemd/user/default.target.wants/npu-audio.service" 2>/dev/null || true
+        if [ -d "/run/user/$uid" ]; then
+            sudo -u "$username" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user daemon-reload 2>/dev/null || true
         fi
-    done < /etc/passwd
-fi
+    fi
+done < /etc/passwd
 
 # ------------------------------------------------------------------------------
 # 2. Remover arquivos de serviço systemd globais
 # ------------------------------------------------------------------------------
-echo -e "\n${YELLOW}--> [2/5] Removendo arquivos de serviço systemd...${NC}"
+echo -e "\n${YELLOW}--> [2/5] Removendo arquivos de serviço systemd globais...${NC}"
 if [ -f "/etc/systemd/user/npu-webcam.service" ]; then
     sudo rm -f "/etc/systemd/user/npu-webcam.service"
     echo -e "    Removido /etc/systemd/user/npu-webcam.service"
@@ -122,28 +123,122 @@ if [ -f "/etc/systemd/user/npu-audio.service" ]; then
     echo -e "    Removido /etc/systemd/user/npu-audio.service"
 fi
 
-# Recarregar systemd para aplicar a remoção
-if [ -n "$XDG_RUNTIME_DIR" ]; then
-    systemctl --user daemon-reload 2>/dev/null || true
-fi
-sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" systemctl --user daemon-reload 2>/dev/null || true
+# ------------------------------------------------------------------------------
+# 3. Remover utilitários e restaurar Cameractrls limpo
+# ------------------------------------------------------------------------------
+echo -e "\n${YELLOW}--> [3/5] Removendo customizações do Cameractrls e utilitários NPU...${NC}"
 
-# ------------------------------------------------------------------------------
-# 3. Remover comandos do PATH e atalhos (.desktop)
-# ------------------------------------------------------------------------------
-echo -e "\n${YELLOW}--> [3/5] Removendo utilitários e atalhos do sistema...${NC}"
+# 3a. Remover npu-ctl
 sudo rm -f "/usr/local/bin/npu-ctl"
-sudo rm -f "/usr/local/bin/cameractrls"
-rm -f "$USER_HOME/.local/bin/npu-ctl" 2>/dev/null || true
-rm -f "$USER_HOME/.local/bin/cameractrls" 2>/dev/null || true
+while IFS=: read -r username _ uid _ _ homedir _; do
+    if [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ] && [[ "$homedir" == /home/* ]]; then
+        sudo rm -f "$homedir/.local/bin/npu-ctl" 2>/dev/null || true
+    fi
+done < /etc/passwd
+echo -e "    Removido utilitário npu-ctl"
 
-if [ -f "/usr/share/applications/hu.irl.cameractrls.desktop" ]; then
-    sudo rm -f "/usr/share/applications/hu.irl.cameractrls.desktop"
-    echo -e "    Removido /usr/share/applications/hu.irl.cameractrls.desktop"
-    if command -v update-desktop-database > /dev/null 2>&1; then
-        sudo update-desktop-database "/usr/share/applications" || true
+# 3b. Remover arquivos de desktop customizados com branding NPU
+sudo rm -f "/usr/share/applications/hu.irl.cameractrls.desktop"
+sudo rm -f "/usr/local/share/applications/hu.irl.cameractrls.desktop"
+
+while IFS=: read -r username _ uid _ _ homedir _; do
+    if [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ] && [[ "$homedir" == /home/* ]]; then
+        # Remover desktop file customizado da pasta do usuário
+        if [ -f "$homedir/.local/share/applications/hu.irl.cameractrls.desktop" ]; then
+            sudo rm -f "$homedir/.local/share/applications/hu.irl.cameractrls.desktop"
+        fi
+
+        # Restaurar autostart do Flatpak se tiver sido alterado para /usr/local/bin/cameractrls
+        if [ -f "$homedir/.config/autostart/hu.irl.cameractrls.desktop" ]; then
+            if command -v flatpak >/dev/null 2>&1 && flatpak list 2>/dev/null | grep -q "hu.irl.cameractrls"; then
+                sudo sed -i 's|Exec=/usr/local/bin/cameractrls.*|Exec=flatpak run hu.irl.cameractrls|g' "$homedir/.config/autostart/hu.irl.cameractrls.desktop" 2>/dev/null || true
+            fi
+        fi
+
+        # Remover presets e configurações customizadas da câmera virtual NPU criados no Cameractrls
+        for cdir in "$homedir/.config/hu.irl.cameractrls" "$homedir/.var/app/hu.irl.cameractrls/config/hu.irl.cameractrls"; do
+            if [ -d "$cdir" ]; then
+                sudo find "$cdir" -type f \( -name "*video72*.ini" -o -name "*Intel*NPU*.ini" \) -delete 2>/dev/null || true
+            fi
+        done
+
+        # Limpar symlink antigo se quebrado
+        if [ -L "$homedir/.local/bin/cameractrls" ]; then
+            if [ ! -e "$homedir/.local/bin/cameractrls" ]; then
+                sudo rm -f "$homedir/.local/bin/cameractrls"
+            fi
+        fi
+    fi
+done < /etc/passwd
+
+# 3c. Garantir que o Cameractrls original seja preservado e permaneça funcional
+if command -v flatpak >/dev/null 2>&1 && flatpak list 2>/dev/null | grep -q "hu.irl.cameractrls"; then
+    echo -e "    ${GREEN}✓ Instalação Flatpak do Cameractrls detectada.${NC}"
+    echo -e "    Configurando executável /usr/local/bin/cameractrls limpo para o Flatpak..."
+    sudo tee "/usr/local/bin/cameractrls" > /dev/null << 'EOF_CAM'
+#!/bin/sh
+exec flatpak run hu.irl.cameractrls "$@"
+EOF_CAM
+    sudo chmod 755 "/usr/local/bin/cameractrls"
+elif [ -x "/usr/bin/cameractrls" ] || [ -x "/usr/bin/cameractrlsgtk.py" ]; then
+    echo -e "    ${GREEN}✓ Instalação de sistema (apt) do Cameractrls detectada.${NC}"
+    sudo rm -f "/usr/local/bin/cameractrls"
+else
+    # Standalone Cameractrls em /opt/npu-effects/cameractrls:
+    # Mover para /opt/cameractrls e restaurar código limpo para que Cameractrls NÃO seja removido
+    if [ -d "/opt/npu-effects/cameractrls" ]; then
+        echo -e "    ${YELLOW}Cameractrls autônomo detectado em /opt/npu-effects/cameractrls.${NC}"
+        echo -e "    Preservando Cameractrls em /opt/cameractrls sem as customizações de NPU..."
+        sudo mkdir -p "/opt/cameractrls"
+        sudo cp -r "/opt/npu-effects/cameractrls"/* "/opt/cameractrls/" 2>/dev/null || true
+
+        # Restaurar arquivos originais upstream limpos
+        if [ -f "/opt/cameractrls/cameractrls.py.upstream_clean" ]; then
+            sudo cp -f "/opt/cameractrls/cameractrls.py.upstream_clean" "/opt/cameractrls/cameractrls.py"
+        elif [ -f "$SCRIPT_DIR/src/cameractrls/upstream/cameractrls.py" ]; then
+            sudo cp -f "$SCRIPT_DIR/src/cameractrls/upstream/cameractrls.py" "/opt/cameractrls/cameractrls.py"
+        fi
+
+        if [ -f "/opt/cameractrls/cameractrlsgtk.py.upstream_clean" ]; then
+            sudo cp -f "/opt/cameractrls/cameractrlsgtk.py.upstream_clean" "/opt/cameractrls/cameractrlsgtk.py"
+        elif [ -f "$SCRIPT_DIR/src/cameractrls/upstream/cameractrlsgtk.py" ]; then
+            sudo cp -f "$SCRIPT_DIR/src/cameractrls/upstream/cameractrlsgtk.py" "/opt/cameractrls/cameractrlsgtk.py"
+        fi
+
+        sudo rm -f "/opt/cameractrls"/*.npu_backup
+
+        # Instalar desktop file original limpo
+        if [ -f "/opt/cameractrls/pkg/hu.irl.cameractrls.desktop" ]; then
+            sudo cp -f "/opt/cameractrls/pkg/hu.irl.cameractrls.desktop" "/usr/share/applications/hu.irl.cameractrls.desktop"
+            sudo sed -i 's|Exec=cameractrlsgtk.py|Exec=/usr/local/bin/cameractrls|g' "/usr/share/applications/hu.irl.cameractrls.desktop"
+        elif [ -f "$SCRIPT_DIR/src/cameractrls/upstream/hu.irl.cameractrls.desktop" ]; then
+            sudo cp -f "$SCRIPT_DIR/src/cameractrls/upstream/hu.irl.cameractrls.desktop" "/usr/share/applications/hu.irl.cameractrls.desktop"
+            sudo sed -i 's|Exec=cameractrlsgtk.py|Exec=/usr/local/bin/cameractrls|g' "/usr/share/applications/hu.irl.cameractrls.desktop"
+        fi
+
+        # Criar executável limpo apontando para /opt/cameractrls
+        sudo tee "/usr/local/bin/cameractrls" > /dev/null << 'EOF_STANDALONE'
+#!/bin/sh
+exec /usr/bin/python3 /opt/cameractrls/cameractrlsgtk.py "$@"
+EOF_STANDALONE
+        sudo chmod 755 "/usr/local/bin/cameractrls"
     fi
 fi
+
+# 3d. Atualizar bancos de dados de aplicativos (.desktop)
+if command -v update-desktop-database > /dev/null 2>&1; then
+    sudo update-desktop-database "/usr/share/applications" 2>/dev/null || true
+    sudo update-desktop-database "/usr/local/share/applications" 2>/dev/null || true
+fi
+while IFS=: read -r username _ uid _ _ homedir _; do
+    if [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ] && [[ "$homedir" == /home/* ]]; then
+        if [ -d "$homedir/.local/share/applications" ] && command -v update-desktop-database > /dev/null 2>&1; then
+            sudo -u "$username" update-desktop-database "$homedir/.local/share/applications" 2>/dev/null || true
+        fi
+    fi
+done < /etc/passwd
+
+echo -e "    ${GREEN}✓ Customizações do Cameractrls removidas com sucesso (o aplicativo continua instalado e funcional).${NC}"
 
 # ------------------------------------------------------------------------------
 # 4. Remover diretório global de instalação (/opt/npu-effects)
@@ -157,12 +252,22 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# 5. Limpeza de dados de usuário e configurações de sistema
+# 5. Limpeza de dados de áudio, configurações de usuário e sistema
 # ------------------------------------------------------------------------------
 echo -e "\n${YELLOW}--> [5/5] Verificando configurações e parâmetros do sistema...${NC}"
 
+# Limpar fonte de áudio npu_clearvoice do WirePlumber
+while IFS=: read -r username _ uid _ _ homedir _; do
+    if [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ] && [[ "$homedir" == /home/* ]]; then
+        wp_nodes="$homedir/.local/state/wireplumber/default-nodes"
+        if [ -f "$wp_nodes" ]; then
+            sudo sed -i '/default\.configured\.audio\.source=npu_clearvoice/d' "$wp_nodes" 2>/dev/null || true
+        fi
+    fi
+done < /etc/passwd
+
 if [ "$PURGE_ALL" = true ]; then
-    echo -e "    ${RED}Modo Purge ativado: removendo arquivos de configuração...${NC}"
+    echo -e "    ${RED}Modo Purge ativado: removendo arquivos de configuração de todos os usuários...${NC}"
     
     # Remover ~/.config/npu-effects de todos os usuários
     while IFS=: read -r username _ uid _ _ homedir _; do

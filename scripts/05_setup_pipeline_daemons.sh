@@ -55,7 +55,31 @@ fi
 if [ ! -f "$USER_CONFIG/config.json" ]; then
     sudo cp -a "$SRC_DIR/config/config.json" "$USER_CONFIG/config.json"
     sudo chown "$TARGET_USER:$TARGET_USER" "$USER_CONFIG/config.json"
+else
+    sudo python3 -c "
+import json
+def merge(d, u):
+    for k, v in d.items():
+        if k not in u:
+            u[k] = v
+        elif isinstance(v, dict) and isinstance(u[k], dict):
+            merge(v, u[k])
+    return u
+
+try:
+    with open('$SRC_DIR/config/config.json', 'r', encoding='utf-8') as f:
+        default_data = json.load(f)
+    with open('$USER_CONFIG/config.json', 'r', encoding='utf-8') as f:
+        user_data = json.load(f)
+    merged = merge(default_data, user_data)
+    with open('$USER_CONFIG/config.json', 'w', encoding='utf-8') as f:
+        json.dump(merged, f, indent=2)
+except Exception:
+    pass
+" 2>/dev/null || true
+    sudo chown "$TARGET_USER:$TARGET_USER" "$USER_CONFIG/config.json"
 fi
+
 
 # 4. Instalar units do systemd user em /etc/systemd/user (disponíveis para TODOS os usuários)
 echo -e "${YELLOW}--> Instalando units de serviço em $SYSTEMD_GLOBAL...${NC}"

@@ -20,11 +20,49 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 ensure_config() {
+    local def_cfg="/opt/npu-effects/config/config.json"
+    if [ ! -f "$def_cfg" ]; then
+        local self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        if [ -f "$self_dir/../config/config.json" ]; then
+            def_cfg="$self_dir/../config/config.json"
+        fi
+    fi
+
     if [ ! -f "$CONFIG_FILE" ]; then
         mkdir -p "$(dirname "$CONFIG_FILE")"
-        echo '{"video":{"enabled":true,"blur_enabled":true,"blur_strength":35,"auto_framing":true,"framing_smoothness":0.04,"framing_smoothness_int":4,"framing_deadzone":0.10,"smooth_enabled":true,"smooth_strength":50,"background_image":""},"audio":{"enabled":true,"noise_suppression":true}}' > "$CONFIG_FILE"
+        if [ -f "$def_cfg" ]; then
+            cp "$def_cfg" "$CONFIG_FILE"
+        else
+            echo '{"video":{"enabled":true,"blur_enabled":true,"blur_strength":35,"auto_framing":true,"framing_smoothness":0.04,"framing_smoothness_int":4,"framing_deadzone":0.10,"smooth_enabled":true,"smooth_strength":50,"background_image":""},"audio":{"enabled":true,"noise_suppression":true}}' > "$CONFIG_FILE"
+        fi
+    elif [ -f "$def_cfg" ] && [ -x "$VENV_PYTHON" ]; then
+        $VENV_PYTHON -c "
+import json
+def merge(d, u):
+    changed = False
+    for k, v in d.items():
+        if k not in u:
+            u[k] = v
+            changed = True
+        elif isinstance(v, dict) and isinstance(u[k], dict):
+            if merge(v, u[k]):
+                changed = True
+    return changed
+
+try:
+    with open('$def_cfg', 'r', encoding='utf-8') as f:
+        default_data = json.load(f)
+    with open('$CONFIG_FILE', 'r', encoding='utf-8') as f:
+        user_data = json.load(f)
+    if merge(default_data, user_data):
+        with open('$CONFIG_FILE', 'w', encoding='utf-8') as f:
+            json.dump(user_data, f, indent=2)
+except Exception:
+    pass
+" 2>/dev/null || true
     fi
 }
+
 
 cmd_status() {
     echo -e "${CYAN}====================================================${NC}"
@@ -1451,17 +1489,29 @@ else:
 
 cmd_restore_cameractrls() {
     echo -e "${CYAN}Restaurando integração Intel NPU no Cameractrls...${NC}"
-    c_dir="$HOME/.local/share/cameractrls"
-    if [ -f "$c_dir/cameractrls.py.npu_backup" ]; then
-        cp "$c_dir/cameractrls.py.npu_backup" "$c_dir/cameractrls.py"
-        echo -e "${GREEN}✓ cameractrls.py restaurado!${NC}"
+    local c_dirs=("/opt/npu-effects/cameractrls" "/opt/cameractrls" "$HOME/.local/share/cameractrls")
+    local restored=false
+    for c_dir in "${c_dirs[@]}"; do
+        if [ -d "$c_dir" ]; then
+            if [ -f "$c_dir/cameractrls.py.npu_backup" ]; then
+                cp "$c_dir/cameractrls.py.npu_backup" "$c_dir/cameractrls.py" 2>/dev/null || sudo cp "$c_dir/cameractrls.py.npu_backup" "$c_dir/cameractrls.py"
+                restored=true
+                echo -e "  - $c_dir/cameractrls.py: ${GREEN}Restaurado [OK]${NC}"
+            fi
+            if [ -f "$c_dir/cameractrlsgtk.py.npu_backup" ]; then
+                cp "$c_dir/cameractrlsgtk.py.npu_backup" "$c_dir/cameractrlsgtk.py" 2>/dev/null || sudo cp "$c_dir/cameractrlsgtk.py.npu_backup" "$c_dir/cameractrlsgtk.py"
+                restored=true
+                echo -e "  - $c_dir/cameractrlsgtk.py: ${GREEN}Restaurado [OK]${NC}"
+            fi
+        fi
+    done
+    if [ "$restored" = true ]; then
+        echo -e "${GREEN}✓ Cameractrls atualizado com a aba Intel NPU e barra de rolagem permanente.${NC}"
+    else
+        echo -e "${YELLOW}Nenhum arquivo de backup .npu_backup encontrado para restauração.${NC}"
     fi
-    if [ -f "$c_dir/cameractrlsgtk.py.npu_backup" ]; then
-        cp "$c_dir/cameractrlsgtk.py.npu_backup" "$c_dir/cameractrlsgtk.py"
-        echo -e "${GREEN}✓ cameractrlsgtk.py restaurado!${NC}"
-    fi
-    echo -e "${GREEN}✓ Cameractrls atualizado com a aba Intel NPU e barra de rolagem permanente.${NC}"
 }
+
 
 cmd_make_default() {
     echo -e "${CYAN}======================================================${NC}"
@@ -1530,6 +1580,230 @@ else:
 
     echo -e "${GREEN}✓ Câmera e microfone virtuais da Intel NPU definidos como padrão com sucesso!${NC}\n"
 }
+
+setup_single_user() {
+    local target_user="$1"
+    if [ -z "$target_user" ]; then return 1; fi
+    if ! id "$target_user" >/dev/null 2>&1; then
+        echo -e "${RED}Aviso: Usuário '$target_user' não existe no sistema.${NC}"
+        return 1
+    fi
+
+    echo -e "${YELLOW}--> Configurando usuário: ${BOLD}$target_user${NC}..."
+
+    # 1. Permissões de hardware (render, video)
+    usermod -aG render,video "$target_user"
+    echo -e "    Grupos 'render' e 'video': ${GREEN}OK${NC}"
+
+    # 2. Diretório de configurações do usuário
+    local user_home=$(getent passwd "$target_user" | cut -d: -f6)
+    if [ -z "$user_home" ] || [ ! -d "$user_home" ]; then
+        user_home=$(eval echo "~$target_user")
+    fi
+    if [ ! -d "$user_home" ]; then
+        echo -e "${RED}    Diretório home '$user_home' não encontrado.${NC}"
+        return 1
+    fi
+
+    local user_cfg="$user_home/.config/npu-effects"
+    local user_bg="$user_cfg/backgrounds"
+    local user_absence="$user_cfg/absence"
+    mkdir -p "$user_bg" "$user_absence"
+
+    local def_cfg="/opt/npu-effects/config/config.json"
+    if [ ! -f "$def_cfg" ]; then
+        local self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        if [ -f "$self_dir/../config/config.json" ]; then
+            def_cfg="$self_dir/../config/config.json"
+        fi
+    fi
+
+    # Sincronizar/fundir config.json preservando personalizações do usuário
+    if [ ! -f "$user_cfg/config.json" ]; then
+        if [ -f "$def_cfg" ]; then
+            cp -a "$def_cfg" "$user_cfg/config.json"
+        fi
+    else
+        if [ -f "$def_cfg" ]; then
+            python3 -c "
+import json
+def merge(d, u):
+    for k, v in d.items():
+        if k not in u:
+            u[k] = v
+        elif isinstance(v, dict) and isinstance(u[k], dict):
+            merge(v, u[k])
+    return u
+
+try:
+    with open('$def_cfg', 'r', encoding='utf-8') as f:
+        default_data = json.load(f)
+    with open('$user_cfg/config.json', 'r', encoding='utf-8') as f:
+        user_data = json.load(f)
+    merged = merge(default_data, user_data)
+    with open('$user_cfg/config.json', 'w', encoding='utf-8') as f:
+        json.dump(merged, f, indent=2)
+except Exception:
+    pass
+" 2>/dev/null || true
+        fi
+    fi
+
+    # Assets de ausência/privacidade e fundos
+    local assets_src="/opt/npu-effects/assets"
+    if [ ! -d "$assets_src" ]; then
+        local self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        assets_src="$(dirname "$(dirname "$self_dir")")/assets"
+    fi
+    if [ -d "$assets_src/absence" ]; then
+        cp -an "$assets_src/absence/"* "$user_absence/" 2>/dev/null || true
+    fi
+    if [ -d "$assets_src/backgrounds" ]; then
+        cp -an "$assets_src/backgrounds/"* "$user_bg/" 2>/dev/null || true
+    fi
+
+    chown -R "$target_user:$target_user" "$user_cfg"
+    echo -e "    Configurações em $user_cfg: ${GREEN}OK${NC}"
+
+    # 3. Atalhos locais (.local/bin e .local/share/applications)
+    mkdir -p "$user_home/.local/bin" "$user_home/.local/share/applications" "$user_home/.local/share/icons/hicolor/scalable/apps"
+    ln -sf "/usr/local/bin/npu-ctl" "$user_home/.local/bin/npu-ctl"
+    ln -sf "/usr/local/bin/cameractrls" "$user_home/.local/bin/cameractrls"
+
+    if [ -f "/usr/share/applications/hu.irl.cameractrls.desktop" ]; then
+        cp -a "/usr/share/applications/hu.irl.cameractrls.desktop" "$user_home/.local/share/applications/hu.irl.cameractrls.desktop"
+    fi
+    if [ -f "/usr/share/icons/hicolor/scalable/apps/hu.irl.cameractrls.svg" ]; then
+        cp -a "/usr/share/icons/hicolor/scalable/apps/hu.irl.cameractrls.svg" "$user_home/.local/share/icons/hicolor/scalable/apps/hu.irl.cameractrls.svg"
+    fi
+
+    if [ -f "$user_home/.config/autostart/hu.irl.cameractrls.desktop" ]; then
+        sed -i 's|Exec=flatpak run.*|Exec=/usr/local/bin/cameractrls|g' "$user_home/.config/autostart/hu.irl.cameractrls.desktop" 2>/dev/null || true
+    fi
+
+    chown -R "$target_user:$target_user" "$user_home/.local/bin" "$user_home/.local/share/applications" "$user_home/.local/share/icons" 2>/dev/null || true
+
+    # 4. Configurar inicialização dos serviços systemd para o usuário
+    mkdir -p "$user_home/.config/systemd/user/default.target.wants"
+    if [ -f "/etc/systemd/user/npu-webcam.service" ]; then
+        ln -sf "/etc/systemd/user/npu-webcam.service" "$user_home/.config/systemd/user/default.target.wants/npu-webcam.service"
+    fi
+    if [ -f "/etc/systemd/user/npu-audio.service" ]; then
+        ln -sf "/etc/systemd/user/npu-audio.service" "$user_home/.config/systemd/user/default.target.wants/npu-audio.service"
+    fi
+    chown -R "$target_user:$target_user" "$user_home/.config/systemd"
+
+    local target_uid=$(id -u "$target_user" 2>/dev/null || echo "1000")
+    if [ -d "/run/user/$target_uid" ]; then
+        sudo -u "$target_user" XDG_RUNTIME_DIR="/run/user/$target_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$target_uid/bus" systemctl --user daemon-reload 2>/dev/null || true
+        sudo -u "$target_user" XDG_RUNTIME_DIR="/run/user/$target_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$target_uid/bus" systemctl --user enable npu-webcam.service npu-audio.service 2>/dev/null || true
+        sudo -u "$target_user" XDG_RUNTIME_DIR="/run/user/$target_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$target_uid/bus" systemctl --user restart npu-webcam.service npu-audio.service 2>/dev/null || true
+        echo -e "    Serviços systemd da sessão ($target_user): ${GREEN}Ativados e Reiniciados${NC}"
+    else
+        echo -e "    Serviços systemd ($target_user): ${GREEN}Habilitados (iniciarão no login)${NC}"
+    fi
+
+    # 5. Configurar navegadores e WirePlumber
+    python3 - "$user_home" << 'PYEOF' 2>/dev/null || true
+import sys
+import json
+from pathlib import Path
+
+user_home = Path(sys.argv[1])
+browser_roots = [
+    user_home / '.config/google-chrome',
+    user_home / '.config/chromium',
+    user_home / '.config/BraveSoftware/Brave-Browser',
+    user_home / '.config/microsoft-edge',
+    user_home / '.config/microsoft-edge-dev',
+]
+cam_name = 'Intel NPU Enhanced Webcam'
+for b_dir in browser_roots:
+    if not b_dir.exists():
+        continue
+    for pref_file in b_dir.glob('**/Preferences'):
+        try:
+            with open(pref_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            media = data.setdefault('media', {})
+            v_in = media.setdefault('video_input', {})
+            v_rank = v_in.setdefault('user_preference_ranking', [])
+            if cam_name in v_rank:
+                v_rank.remove(cam_name)
+            v_rank.insert(0, cam_name)
+            a_in = media.setdefault('audio_input', {})
+            a_rank = a_in.setdefault('user_preference_ranking', [])
+            if 'default' in a_rank:
+                a_rank.remove('default')
+            a_rank.insert(0, 'default')
+            with open(pref_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+wp_nodes = user_home / '.local/state/wireplumber/default-nodes'
+if wp_nodes.exists():
+    try:
+        content = wp_nodes.read_text(encoding='utf-8')
+        lines = []
+        has_src = False
+        for line in content.splitlines():
+            if line.startswith('default.configured.audio.source='):
+                lines.append('default.configured.audio.source=npu_clearvoice')
+                has_src = True
+            else:
+                lines.append(line)
+        if not has_src:
+            lines.append('default.configured.audio.source=npu_clearvoice')
+        wp_nodes.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    except Exception:
+        pass
+PYEOF
+
+    if [ -d "/run/user/$target_uid" ]; then
+        sudo -u "$target_user" XDG_RUNTIME_DIR="/run/user/$target_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$target_uid/bus" pactl set-default-source npu_clearvoice 2>/dev/null || true
+    fi
+
+    if command -v update-desktop-database > /dev/null 2>&1; then
+        sudo -u "$target_user" update-desktop-database "$user_home/.local/share/applications" 2>/dev/null || true
+    fi
+
+    echo -e "${GREEN}✓ Usuário '$target_user' configurado com sucesso para a Intel NPU!${NC}\n"
+}
+
+cmd_setup_user() {
+    local target_user="$1"
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}Erro: 'npu-ctl setup-user' requer privilégios de superusuário (sudo).${NC}"
+        echo -e "Execute: ${BOLD}sudo npu-ctl setup-user ${target_user:-<usuario>}${NC}"
+        exit 1
+    fi
+    if [ -z "$target_user" ]; then
+        echo -e "${RED}Uso: sudo npu-ctl setup-user <nome_do_usuario>${NC}"
+        exit 1
+    fi
+    setup_single_user "$target_user"
+}
+
+cmd_setup_all_users() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}Erro: 'npu-ctl setup-all-users' requer privilégios de superusuário (sudo).${NC}"
+        echo -e "Execute: ${BOLD}sudo npu-ctl setup-all-users${NC}"
+        exit 1
+    fi
+    echo -e "${CYAN}======================================================${NC}"
+    echo -e "${CYAN} Configurando Todos os Usuários do Sistema para a NPU ${NC}"
+    echo -e "${CYAN}======================================================${NC}"
+    local count=0
+    while IFS=: read -r username _ uid _ _ homedir _; do
+        if [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ] && [[ "$homedir" == /home/* ]]; then
+            setup_single_user "$username"
+            count=$((count + 1))
+        fi
+    done < /etc/passwd
+    echo -e "${GREEN}✓ Total de $count usuário(s) configurado(s) com sucesso!${NC}"
+}
+
 
 case "$1" in
     status|"")
@@ -1681,6 +1955,12 @@ case "$1" in
     make-default|padrao|set-default)
         cmd_make_default
         ;;
+    setup-user|setup_user)
+        cmd_setup_user "$2"
+        ;;
+    setup-all-users|setup_all_users)
+        cmd_setup_all_users
+        ;;
     logs)
         case "$2" in
             audio)
@@ -1698,6 +1978,8 @@ case "$1" in
         echo "Uso do npu-ctl:"
         echo "  npu-ctl status                   Exibe status da NPU, dispositivos e serviços"
         echo "  npu-ctl make-default             Define câmera e microfone virtuais NPU como padrão (sistema e navegadores)"
+        echo "  sudo npu-ctl setup-user <user>   Configura permissões, atalhos e padrões NPU para o usuário especificado"
+        echo "  sudo npu-ctl setup-all-users     Configura todos os usuários do sistema com pasta em /home"
         echo "  npu-ctl cam-source [<1,2..|auto>] Seleciona qual webcam física (PIXY ou Notebook) alimenta a NPU"
         echo "  npu-ctl mic-source [<1,2..|auto>] Seleciona qual microfone físico (PIXY, USB, Notebook) alimenta a NPU"
         echo "  npu-ctl blur [on|off|<5-99>]     Ativa, desativa ou ajusta nível do desfoque"

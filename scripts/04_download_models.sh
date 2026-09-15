@@ -27,39 +27,40 @@ fi
 
 sudo mkdir -p "$TARGET_AUDIO" "$TARGET_VIDEO"
 
+# Sincronização forçada dos modelos locais do repositório para o diretório global
+# Garante que novas versões/modelos atualizem os arquivos existentes
+if [ -d "$LOCAL_MODELS/audio" ]; then
+    echo -e "${GREEN}Sincronizando modelos de áudio locais para $TARGET_AUDIO...${NC}"
+    sudo cp -af "$LOCAL_MODELS/audio/"* "$TARGET_AUDIO/" 2>/dev/null || true
+fi
+if [ -d "$LOCAL_MODELS/video" ]; then
+    echo -e "${GREEN}Sincronizando modelos de vídeo locais para $TARGET_VIDEO...${NC}"
+    sudo cp -af "$LOCAL_MODELS/video/"* "$TARGET_VIDEO/" 2>/dev/null || true
+fi
+
 # 1. Modelos de Áudio (Intel PoCoNet Noise Suppression)
 echo -e "${YELLOW}--> Verificando modelo de Áudio (PoCoNet FP16)...${NC}"
-if [ -f "$LOCAL_MODELS/audio/noise-suppression-poconetlike-0001.xml" ] && [ -f "$LOCAL_MODELS/audio/noise-suppression-poconetlike-0001.bin" ]; then
-    echo -e "${GREEN}Copiando modelo de áudio local para $TARGET_AUDIO...${NC}"
-    sudo cp -u "$LOCAL_MODELS/audio/noise-suppression-poconetlike-0001".* "$TARGET_AUDIO/"
-else
+if [ ! -f "$TARGET_AUDIO/noise-suppression-poconetlike-0001.xml" ] || [ ! -f "$TARGET_AUDIO/noise-suppression-poconetlike-0001.bin" ]; then
     echo -e "${CYAN}Baixando modelo PoCoNet do repositório oficial da Intel (Open Model Zoo)...${NC}"
     OMZ_URL="https://storage.openvinotoolkit.org/repositories/open_model_zoo/2023.0/models_bin/1/noise-suppression-poconetlike-0001/FP16"
     sudo curl -L --retry 3 -o "$TARGET_AUDIO/noise-suppression-poconetlike-0001.xml" "$OMZ_URL/noise-suppression-poconetlike-0001.xml"
     sudo curl -L --retry 3 -o "$TARGET_AUDIO/noise-suppression-poconetlike-0001.bin" "$OMZ_URL/noise-suppression-poconetlike-0001.bin"
+else
+    echo -e "${GREEN}✓ Modelo de Áudio PoCoNet presente em $TARGET_AUDIO${NC}"
 fi
 
 # 2. Modelos de Vídeo (YuNet Face Detection & Selfie Segmentation)
 echo -e "${YELLOW}--> Verificando modelo de Rastreamento Facial (YuNet)...${NC}"
-if [ -f "$LOCAL_MODELS/video/face_detection_yunet_2023mar.onnx" ]; then
-    echo -e "${GREEN}Copiando YuNet local para $TARGET_VIDEO...${NC}"
-    sudo cp -u "$LOCAL_MODELS/video/face_detection_yunet_2023mar.onnx" "$TARGET_VIDEO/"
-else
+if [ ! -f "$TARGET_VIDEO/face_detection_yunet_2023mar.onnx" ]; then
     echo -e "${CYAN}Baixando YuNet do repositório oficial OpenCV Zoo...${NC}"
     YUNET_URL="https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
     sudo curl -L --retry 3 -o "$TARGET_VIDEO/face_detection_yunet_2023mar.onnx" "$YUNET_URL"
+else
+    echo -e "${GREEN}✓ Modelo YuNet presente em $TARGET_VIDEO${NC}"
 fi
 
 echo -e "${YELLOW}--> Verificando modelo de Segmentação de Pessoas (Selfie Multiclass & Static NPU IR)...${NC}"
-if [ -f "$LOCAL_MODELS/video/selfie_multiclass.xml" ] && [ -f "$LOCAL_MODELS/video/selfie_multiclass.bin" ]; then
-    echo -e "${GREEN}Copiando modelo de segmentação Multiclass local para $TARGET_VIDEO...${NC}"
-    sudo cp -u "$LOCAL_MODELS/video/selfie_multiclass".* "$TARGET_VIDEO/"
-fi
-
-if [ -f "$LOCAL_MODELS/video/selfie_segmentation_static.xml" ] && [ -f "$LOCAL_MODELS/video/selfie_segmentation_static.bin" ]; then
-    echo -e "${GREEN}Copiando modelo de segmentação estático local para $TARGET_VIDEO...${NC}"
-    sudo cp -u "$LOCAL_MODELS/video/selfie_segmentation_static".* "$TARGET_VIDEO/"
-else
+if [ ! -f "$TARGET_VIDEO/selfie_segmentation_static.xml" ] || [ ! -f "$TARGET_VIDEO/selfie_segmentation_static.bin" ]; then
     echo -e "${CYAN}Baixando modelo de segmentação e convertendo para formato estático otimizado para NPU...${NC}"
     ONNX_URL="https://github.com/PINTO0309/PINTO_model_zoo/raw/main/082_MediaPipe_Selfie_Segmentation/selfie_landscape_fp16.onnx"
     sudo curl -L --retry 3 -o "$TARGET_VIDEO/selfie_landscape_fp16.onnx" "$ONNX_URL"
@@ -79,19 +80,18 @@ model.reshape({"pixel_values": [1, 3, 144, 256]})
 ov.save_model(model, str(out_path))
 print("Modelo de segmentação estático gerado com sucesso!")
 PYCONV
+    sudo rm -f "$TARGET_VIDEO/selfie_landscape_fp16.onnx"
+else
+    echo -e "${GREEN}✓ Modelo Selfie Segmentation Static presente em $TARGET_VIDEO${NC}"
 fi
 
 echo -e "${YELLOW}--> Verificando modelo de Segmentação de Instâncias (Cadeira/Objetos YOLACT)...${NC}"
-if [ -f "$LOCAL_MODELS/video/chair_instance_segmenter.xml" ] && [ -f "$LOCAL_MODELS/video/chair_instance_segmenter.bin" ]; then
-    echo -e "${GREEN}Copiando modelo de segmentação de cadeira (YOLACT) para $TARGET_VIDEO...${NC}"
-    sudo cp -u "$LOCAL_MODELS/video/chair_instance_segmenter".* "$TARGET_VIDEO/"
+if [ -f "$TARGET_VIDEO/chair_instance_segmenter.xml" ]; then
+    echo -e "${GREEN}✓ Modelo YOLACT (Cadeira) presente em $TARGET_VIDEO${NC}"
 fi
 
 echo -e "${YELLOW}--> Verificando modelo de Segmentação de Rosto e Óculos (BiSeNet Face Parsing)...${NC}"
-if [ -f "$LOCAL_MODELS/video/face_parsing_bisenet.xml" ] && [ -f "$LOCAL_MODELS/video/face_parsing_bisenet.bin" ]; then
-    echo -e "${GREEN}Copiando modelo de face parsing (BiSeNet) para $TARGET_VIDEO...${NC}"
-    sudo cp -u "$LOCAL_MODELS/video/face_parsing_bisenet".* "$TARGET_VIDEO/"
-else
+if [ ! -f "$TARGET_VIDEO/face_parsing_bisenet.xml" ] || [ ! -f "$TARGET_VIDEO/face_parsing_bisenet.bin" ]; then
     echo -e "${CYAN}Baixando modelo BiSeNet Face Parsing e convertendo para OpenVINO IR FP16...${NC}"
     BISENET_URL="https://huggingface.co/litert-community/BiSeNet-Face-Parsing-LiteRT/resolve/main/faceparsing.tflite"
     sudo curl -L --retry 3 -o "$TARGET_VIDEO/faceparsing.tflite" "$BISENET_URL"
@@ -110,6 +110,8 @@ ov.save_model(model, str(out_path), compress_to_fp16=True)
 print("Modelo BiSeNet Face Parsing convertido para IR FP16 com sucesso!")
 PYBISENET
     sudo rm -f "$TARGET_VIDEO/faceparsing.tflite"
+else
+    echo -e "${GREEN}✓ Modelo BiSeNet Face Parsing presente em $TARGET_VIDEO${NC}"
 fi
 
 # 3. Testar compilação dos modelos na NPU

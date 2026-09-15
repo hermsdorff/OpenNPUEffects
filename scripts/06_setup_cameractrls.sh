@@ -50,6 +50,17 @@ if [ ! -f "$CAMERACTRLS_DIR/cameraview.py" ]; then
     fi
 fi
 
+# Salvar arquivos originais limpos (upstream) para restauração na desinstalação
+if [ -d "$SRC_CAMERACTRLS/upstream" ]; then
+    sudo mkdir -p "$CAMERACTRLS_DIR/upstream"
+    sudo cp -a "$SRC_CAMERACTRLS/upstream/"* "$CAMERACTRLS_DIR/upstream/" 2>/dev/null || true
+    [ -f "$SRC_CAMERACTRLS/upstream/cameractrls.py" ] && sudo cp -a "$SRC_CAMERACTRLS/upstream/cameractrls.py" "$CAMERACTRLS_DIR/cameractrls.py.upstream_clean"
+    [ -f "$SRC_CAMERACTRLS/upstream/cameractrlsgtk.py" ] && sudo cp -a "$SRC_CAMERACTRLS/upstream/cameractrlsgtk.py" "$CAMERACTRLS_DIR/cameractrlsgtk.py.upstream_clean"
+elif [ -f "$CAMERACTRLS_DIR/cameractrls.py" ] && ! grep -q "IntelNPUCtrls" "$CAMERACTRLS_DIR/cameractrls.py"; then
+    sudo cp -a "$CAMERACTRLS_DIR/cameractrls.py" "$CAMERACTRLS_DIR/cameractrls.py.upstream_clean"
+    sudo cp -a "$CAMERACTRLS_DIR/cameractrlsgtk.py" "$CAMERACTRLS_DIR/cameractrlsgtk.py.upstream_clean"
+fi
+
 # 3. Aplicar arquivos integrados com suporte à NPU Intel em /opt/npu-effects/cameractrls
 echo -e "${YELLOW}--> Injetando controles de IA, barra de rolagem fixa e redimensionamento...${NC}"
 sudo cp -a "$SRC_CAMERACTRLS/cameractrls.py" "$CAMERACTRLS_DIR/cameractrls.py"
@@ -58,6 +69,7 @@ sudo cp -a "$SRC_CAMERACTRLS/cameractrlsgtk.py" "$CAMERACTRLS_DIR/cameractrlsgtk
 # Criar cópias de backup persistentes (.npu_backup) para restauração rápida
 sudo cp -a "$SRC_CAMERACTRLS/cameractrls.py" "$CAMERACTRLS_DIR/cameractrls.py.npu_backup"
 sudo cp -a "$SRC_CAMERACTRLS/cameractrlsgtk.py" "$CAMERACTRLS_DIR/cameractrlsgtk.py.npu_backup"
+
 
 # Garantir permissão de leitura/execução global
 sudo chmod -R a+rX "$CAMERACTRLS_DIR"
