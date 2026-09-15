@@ -17,6 +17,7 @@ The source code of the Open NPU Effects project is distributed under the **MIT L
 | **MobileNetV3 LRASPP** | `video/chair_segmenter.*` | 21-class semantic segmentation (chair fallback) | [PyTorch / TorchVision Contributors](https://github.com/pytorch/vision) | [BSD 3-Clause](#5-mobilenetv3-lraspp-segmenter-pytorch--torchvision) |
 | **YOLACT ResNet-50 FPN** | `video/chair_instance_segmenter.*` | Instance segmentation for precise chair retention | [Daniel Bolya et al. (UC Davis)](https://github.com/dbolya/yolact) | [MIT](#6-yolact-resnet-50-fpn-instance-segmenter-uc-davis--intel-omz) |
 | **BiSeNet ResNet-18 Face Parser** | `video/face_parsing_bisenet.*` | Semantic face parsing & eyeglass preservation | [zllrunning](https://github.com/zllrunning/face-parsing.PyTorch) / [LiteRT Community](https://huggingface.co/litert-community/BiSeNet-Face-Parsing-LiteRT) | [MIT](#7-bisenet-resnet-18-face-parser-celebamask-hq) |
+| **MODNet Portrait Matting** | `video/modnet_portrait_matting.*` | Optional high-fidelity person matting assist (fixes dark-clothing gaps in Selfie Multiclass) | [ZHKKKe (Zhanghan Ke) et al.](https://github.com/ZHKKKe/MODNet) / [Intel Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/modnet-photographic-portrait-matting) | [Apache 2.0](#8-modnet-portrait-matting-zhkkke--intel-omz) |
 
 ---
 
@@ -210,7 +211,7 @@ SOFTWARE.
 
 ---
 
-## 7. MODNet Portrait Matting (ZHKKKe / Intel OMZ)
+## 8. MODNet Portrait Matting (ZHKKKe / Intel OMZ)
 - **Files:** `video/modnet_portrait_matting.xml`, `video/modnet_portrait_matting.bin`
 - **Source:** [ZHKKKe/MODNet](https://github.com/ZHKKKe/MODNet) (paper: https://arxiv.org/abs/2011.11961), checkpoint mirrored by Intel at [Open Model Zoo - modnet-photographic-portrait-matting](https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/modnet-photographic-portrait-matting)
 - **Copyright:** Copyright (c) 2020 Zhanghan Ke

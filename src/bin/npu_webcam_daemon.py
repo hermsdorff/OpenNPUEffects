@@ -1522,15 +1522,10 @@ def main():
     npu_device = "NPU" if "NPU" in devices else "CPU"
     logging.info(f"Targeting inference device: {npu_device} (Available: {devices})")
 
-    wants_modnet = (cfg.get("video", {}).get("segmentation_model", "multiclass") == "modnet")
-    if wants_modnet and SEG_MODNET_PATH.exists():
-        active_seg_path = SEG_MODNET_PATH
-    elif SEG_MULTICLASS_PATH.exists():
+    if SEG_MULTICLASS_PATH.exists():
         active_seg_path = SEG_MULTICLASS_PATH
     else:
         active_seg_path = SEG_MODEL_PATH
-    if wants_modnet and not SEG_MODNET_PATH.exists():
-        logging.warning(f"segmentation_model=modnet requested but {SEG_MODNET_PATH} not found. Falling back to {active_seg_path}.")
     if not active_seg_path.exists():
         logging.error(f"Model not found at {active_seg_path}")
         sys.exit(1)
@@ -1542,10 +1537,20 @@ def main():
     seg_inp_name = model.inputs[0].get_any_name()
     seg_out_name = model.outputs[0].get_any_name()
     seg_inp_shape = list(model.inputs[0].get_shape())
-    is_modnet = (active_seg_path == SEG_MODNET_PATH)
-    is_multiclass = (not is_modnet) and ((active_seg_path == SEG_MULTICLASS_PATH) or (len(seg_inp_shape) == 4 and seg_inp_shape[-1] == 3))
-    seg_type_label = "MODNet Portrait Matting" if is_modnet else ("Multiclass (6-class + Hand/Skin)" if is_multiclass else "Legacy Landscape")
+    is_multiclass = (active_seg_path == SEG_MULTICLASS_PATH) or (len(seg_inp_shape) == 4 and seg_inp_shape[-1] == 3)
+    seg_type_label = "Multiclass (6-class + Hand/Skin)" if is_multiclass else "Legacy Landscape"
     logging.info(f"NPU segmentation model compiled successfully! Type: {seg_type_label}, In: {seg_inp_shape}")
+
+    # MODNet Portrait Matting (Apache 2.0) nunca é usado como modelo PRIMÁRIO - ele não tem os
+    # canais de mão/pele/roupa necessários para detecção de gestos, retenção de objetos na mão
+    # e retenção de cadeira. Em vez disso, é carregado abaixo como modelo SECUNDÁRIO opcional
+    # ("assist") e combinado com a máscara do Multiclass para corrigir um ponto fraco conhecido
+    # do Multiclass: roupas escuras/pretas lisas às vezes são classificadas como fundo mesmo no
+    # meio da silhueta, não só nas bordas (confirmado com foto real de teste).
+    modnet_assist_enabled = (
+        cfg.get("video", {}).get("segmentation_model", "multiclass") == "modnet"
+        or cfg.get("segmentation_model", "multiclass") == "modnet"
+    )
 
     # Load Neural Chair Segmentation Model (YOLACT Instance Segmenter - MIT License)
     chair_infer_req = None
@@ -1610,6 +1615,24 @@ def main():
                 logging.info(f"BiSeNet Face Parsing model compiled successfully on CPU ({glasses_inp_w}x{glasses_inp_h})!")
         except Exception as e2:
             logging.error(f"Failed to load BiSeNet Face Parsing model: {e2}")
+
+    # MODNet Portrait Matting - modelo secundário opcional "assist" (ver comentário acima).
+    modnet_infer_req = None
+    modnet_inp_name = None
+    modnet_out_name = None
+    if modnet_assist_enabled and SEG_MODNET_PATH.exists():
+        try:
+            logging.info(f"Loading MODNet assist model {SEG_MODNET_PATH}...")
+            modnet_model = core.read_model(str(SEG_MODNET_PATH))
+            modnet_compiled = core.compile_model(modnet_model, npu_device)
+            modnet_infer_req = modnet_compiled.create_infer_request()
+            modnet_inp_name = modnet_model.inputs[0].get_any_name()
+            modnet_out_name = modnet_model.outputs[0].get_any_name()
+            logging.info(f"MODNet assist model compiled successfully on {npu_device}!")
+        except Exception as e:
+            logging.warning(f"Could not compile MODNet assist model: {e}. Continuing without it.")
+    elif modnet_assist_enabled:
+        logging.warning(f"segmentation_model=modnet requested but {SEG_MODNET_PATH} not found. Continuing with multiclass only.")
 
     last_bg_path = ""
     cached_bg = None
@@ -2027,6 +2050,30 @@ def main():
                         gesture_match_count = 0
                         no_hand_count = 0
                         gesture_latched = False
+
+                    # Optional MODNet Assist Pass (modo híbrido, Apache 2.0):
+                    # Validado com foto real que o Multiclass sozinho frequentemente classifica
+                    # roupas escuras/pretas lisas como fundo mesmo no meio da silhueta (não só
+                    # nas bordas). Pegar o MÁXIMO pixel a pixel entre os dois modelos resolve
+                    # isso - quem estiver mais confiante de que é "pessoa" vence - sem nunca
+                    # remover regiões já corretamente detectadas pelo Multiclass, ou seja, é uma
+                    # combinação segura e estritamente aditiva.
+                    if modnet_infer_req is not None:
+                        fh, fw = framed.shape[:2]
+                        lb_scale = min(512.0 / fw, 512.0 / fh)
+                        lb_w, lb_h = max(1, int(round(fw * lb_scale))), max(1, int(round(fh * lb_scale)))
+                        lb_resized = cv2.resize(framed, (lb_w, lb_h), interpolation=cv2.INTER_AREA)
+                        lb_pad_x, lb_pad_y = (512 - lb_w) // 2, (512 - lb_h) // 2
+                        modnet_canvas = np.zeros((512, 512, 3), dtype=np.uint8)
+                        modnet_canvas[lb_pad_y:lb_pad_y + lb_h, lb_pad_x:lb_pad_x + lb_w] = lb_resized
+                        modnet_blob = np.expand_dims(modnet_canvas, axis=0)
+
+                        modnet_infer_req.infer({modnet_inp_name: modnet_blob})
+                        modnet_alpha = modnet_infer_req.get_tensor(modnet_out_name).data[0, 0]
+                        modnet_alpha_cropped = modnet_alpha[lb_pad_y:lb_pad_y + lb_h, lb_pad_x:lb_pad_x + lb_w]
+                        modnet_256 = cv2.resize(modnet_alpha_cropped, (256, 256), interpolation=cv2.INTER_LINEAR)
+
+                        p_person = np.maximum(p_person, modnet_256)
                 else:
                     # Legacy 144x256 model fallback
                     small = cv2.resize(framed, (256, 144))

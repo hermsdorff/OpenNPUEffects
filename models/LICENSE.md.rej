@@ -1,9 +1,0 @@
-diff a/models/LICENSE.md b/models/LICENSE.md	(rejected hunks)
-@@ -16,6 +16,7 @@ The source code of the Open NPU Effects project is distributed under the **MIT L
- | **MediaPipe Selfie Multiclass** | `video/selfie_multiclass.*` | Multiclass segmentation (skin, hair, clothes, body) | [Google LLC / MediaPipe](https://github.com/google/mediapipe) | [Apache 2.0](#4-mediapipe-selfie-multiclass-google-llc) |
- | **MobileNetV3 LRASPP** | `video/chair_segmenter.*` | 21-class semantic segmentation (chair fallback) | [PyTorch / TorchVision Contributors](https://github.com/pytorch/vision) | [BSD 3-Clause](#5-mobilenetv3-lraspp-segmenter-pytorch--torchvision) |
- | **YOLACT ResNet-50 FPN** | `video/chair_instance_segmenter.*` | Instance segmentation for precise chair retention | [Daniel Bolya et al. (UC Davis)](https://github.com/dbolya/yolact) | [MIT](#6-yolact-resnet-50-fpn-instance-segmenter-uc-davis--intel-omz) |
-+| **MODNet Portrait Matting** | `video/modnet_portrait_matting.*` | Optional high-fidelity person matting (alternative to Selfie Multiclass, better edge quality on hair/fingers) | [ZHKKKe (Zhanghan Ke) et al.](https://github.com/ZHKKKe/MODNet) / [Intel Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/modnet-photographic-portrait-matting) | [Apache 2.0](#7-modnet-portrait-matting-zhkkke--intel-omz) |
- 
- ---
- 
