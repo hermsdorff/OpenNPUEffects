@@ -60,7 +60,11 @@
     "object_retention_strength": 60,
     "chair_retention_enabled": true,
     "chair_retention_strength": 50,
-    "privacy_fade_enabled": true
+    "privacy_fade_enabled": true,
+    "guided_filter_guide_size": [640, 360],
+    "guided_filter_radius": 5,
+    "guided_filter_eps": 0.001,
+    "guided_filter_color_guide": true
   },
   "audio": {
     "enabled": true,

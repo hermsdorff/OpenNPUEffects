@@ -142,7 +142,11 @@ def load_config():
             "privacy_mute_mic": True,
             "privacy_image": "",
             "preserve_glasses": True,
-            "glasses_protection": True
+            "glasses_protection": True,
+            "guided_filter_guide_size": [640, 360],
+            "guided_filter_radius": 5,
+            "guided_filter_eps": 0.001,
+            "guided_filter_color_guide": True
         }
     }
     try:
@@ -1419,26 +1423,69 @@ def apply_smart_sharpen(img, strength=35):
                        [0, -amount, 0]], dtype=np.float32)
     return cv2.filter2D(img, -1, kernel)
 
-def fast_guided_filter(guide_small, mask_small, r=5, eps=1e-3, out_shape=(1920, 1080)):
+def fast_guided_filter(guide_small, mask_small, r=5, eps=1e-3, out_shape=(1920, 1080), color_guide=False):
     """
-    Fast Guided Filter (snaps coarse mask to high-res physical edges of hair and fingers).
-    guide_small: grayscale guide image at 640x360
+    Fast Guided Filter (snaps coarse mask to physical edges of hair and fingers).
+    guide_small: grayscale (2D) or color (3D BGR) guide image, uint8 or float32
     mask_small: segmentation mask at model resolution (e.g. 256x256), float32 [0, 1]
+    r: filter radius (ksize = 2*r + 1)
+    eps: regularization parameter
     out_shape: (width, height) to upscale the final refined edge mask (1920, 1080)
+    color_guide: boolean, whether to use multi-channel color edge guidance
     """
     gw, gh = guide_small.shape[1], guide_small.shape[0]
     p = cv2.resize(mask_small, (gw, gh), interpolation=cv2.INTER_LINEAR)
-    I = guide_small.astype(np.float32) / 255.0 if guide_small.dtype == np.uint8 else guide_small
+    r = max(1, int(r))
+    eps = max(1e-6, float(eps))
     ksize = (2 * r + 1, 2 * r + 1)
-    mean_I = cv2.boxFilter(I, -1, ksize)
-    mean_p = cv2.boxFilter(p, -1, ksize)
-    cov_Ip = cv2.boxFilter(I * p, -1, ksize) - mean_I * mean_p
-    var_I = cv2.boxFilter(I * I, -1, ksize) - mean_I * mean_I
-    a = cov_Ip / (var_I + eps)
-    b = mean_p - a * mean_I
-    mean_a = cv2.boxFilter(a, -1, ksize)
-    mean_b = cv2.boxFilter(b, -1, ksize)
-    q = mean_a * I + mean_b
+
+    if color_guide and guide_small.ndim == 3:
+        # Multi-channel color guided filter (joint linear regression across B, G, R channels)
+        # Model: q = a0*I0 + a1*I1 + a2*I2 + b
+        I = guide_small.astype(np.float32) * (1.0 / 255.0) if guide_small.dtype == np.uint8 else guide_small
+        mean_I = cv2.boxFilter(I, -1, ksize)
+        mean_p = cv2.boxFilter(p, -1, ksize)
+
+        I0, I1, I2 = I[:, :, 0], I[:, :, 1], I[:, :, 2]
+        mI0, mI1, mI2 = mean_I[:, :, 0], mean_I[:, :, 1], mean_I[:, :, 2]
+
+        v0 = cv2.boxFilter(I0 * I0, -1, ksize) - mI0 * mI0
+        v1 = cv2.boxFilter(I1 * I1, -1, ksize) - mI1 * mI1
+        v2 = cv2.boxFilter(I2 * I2, -1, ksize) - mI2 * mI2
+        inv_var = 1.0 / (v0 + v1 + v2 + eps)
+
+        cov0 = cv2.boxFilter(I0 * p, -1, ksize) - mI0 * mean_p
+        cov1 = cv2.boxFilter(I1 * p, -1, ksize) - mI1 * mean_p
+        cov2 = cv2.boxFilter(I2 * p, -1, ksize) - mI2 * mean_p
+
+        a0 = cov0 * inv_var
+        a1 = cov1 * inv_var
+        a2 = cov2 * inv_var
+        b = mean_p - (a0 * mI0 + a1 * mI1 + a2 * mI2)
+
+        ma0 = cv2.boxFilter(a0, -1, ksize)
+        ma1 = cv2.boxFilter(a1, -1, ksize)
+        ma2 = cv2.boxFilter(a2, -1, ksize)
+        mb = cv2.boxFilter(b, -1, ksize)
+
+        q = ma0 * I0 + ma1 * I1 + ma2 * I2 + mb
+    else:
+        # Grayscale guided filter (classic single-channel)
+        if guide_small.ndim == 3:
+            guide_gray = cv2.cvtColor(guide_small, cv2.COLOR_BGR2GRAY)
+        else:
+            guide_gray = guide_small
+        I = guide_gray.astype(np.float32) / 255.0 if guide_gray.dtype == np.uint8 else guide_gray
+        mean_I = cv2.boxFilter(I, -1, ksize)
+        mean_p = cv2.boxFilter(p, -1, ksize)
+        cov_Ip = cv2.boxFilter(I * p, -1, ksize) - mean_I * mean_p
+        var_I = cv2.boxFilter(I * I, -1, ksize) - mean_I * mean_I
+        a = cov_Ip / (var_I + eps)
+        b = mean_p - a * mean_I
+        mean_a = cv2.boxFilter(a, -1, ksize)
+        mean_b = cv2.boxFilter(b, -1, ksize)
+        q = mean_a * I + mean_b
+
     return cv2.resize(np.clip(q, 0.0, 1.0), out_shape, interpolation=cv2.INTER_LINEAR)
 
 def main():
@@ -2004,9 +2051,30 @@ def main():
                 p_curved = u * u * (3.0 - 2.0 * u)
 
                 # Fast Guided Filter:
-                # Uses 640x360 camera luminance to snap the mask to exact real-world 1080p hair & finger edges!
-                guide_small = cv2.resize(cv2.cvtColor(framed, cv2.COLOR_BGR2GRAY), (640, 360))
-                mask_full = fast_guided_filter(guide_small, p_curved, r=5, eps=1e-3, out_shape=(out_w, out_h))
+                # Uses camera color/luminance to snap the mask to exact real-world 1080p hair & finger edges!
+                gf_size = cfg.get("guided_filter_guide_size", [640, 360])
+                if isinstance(gf_size, (list, tuple)) and len(gf_size) == 2:
+                    gw, gh = int(gf_size[0]), int(gf_size[1])
+                else:
+                    gw, gh = 640, 360
+                gw = max(640, gw)
+                gh = max(360, gh)
+
+                gf_r = int(cfg.get("guided_filter_radius", 5))
+                gf_eps = float(cfg.get("guided_filter_eps", 0.001))
+                gf_color = bool(cfg.get("guided_filter_color_guide", True))
+
+                if gf_color:
+                    guide_small = cv2.resize(framed, (gw, gh))
+                else:
+                    guide_small = cv2.resize(cv2.cvtColor(framed, cv2.COLOR_BGR2GRAY), (gw, gh))
+
+                mask_full = fast_guided_filter(
+                    guide_small, p_curved,
+                    r=gf_r, eps=gf_eps,
+                    out_shape=(out_w, out_h),
+                    color_guide=gf_color
+                )
                 if cached_glasses_mask is not None:
                     mask_full = np.maximum(mask_full, cached_glasses_mask)
 
