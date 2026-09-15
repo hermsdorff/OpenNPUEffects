@@ -66,6 +66,12 @@ REPO_ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "assets"
 
 DEFAULT_PRIVACY_IMAGE = None
 for p in [
+    Path.home() / ".config/npu-effects/absence/Ausente.png",
+    Path.home() / ".local/share/npu-effects/absence/Ausente.png",
+    REPO_ASSETS_DIR / "absence" / "Ausente.png",
+    Path("/home/kleber/picture/ausente.png"),
+    Path("/home/kleber/Pictures/ausente.png"),
+    OPT_ASSETS_DIR / "absence" / "Ausente.png",
     OPT_ASSETS_DIR / "default_privacy.png",
     USER_ASSETS_DIR / "default_privacy.png",
     REPO_ASSETS_DIR / "default_privacy.png",
@@ -612,6 +618,24 @@ def draw_privacy_screen(w, h, custom_path=None):
             except Exception as e:
                 logging.warning(f"Erro ao carregar imagem de privacidade {cp}: {e}")
 
+    # Checar na pasta de presets de ausencia (~/.config/npu-effects/absence)
+    absence_dirs = [
+        Path.home() / ".config/npu-effects/absence",
+        Path.home() / ".local/share/npu-effects/absence",
+        REPO_ASSETS_DIR / "absence",
+        OPT_ASSETS_DIR / "absence",
+    ]
+    for d in absence_dirs:
+        for candidate in ["Ausente.png", "ausente.png", "default.png", "privacy.jpg", "privacy.png", "ausencia.jpg", "ausencia.png", "away.jpg", "away.png"]:
+            p = d / candidate
+            if p.exists():
+                try:
+                    img = cv2.imread(str(p))
+                    if img is not None:
+                        return cv2.resize(img, (w, h))
+                except Exception:
+                    pass
+
     # Checar imagem padrao na pasta de backgrounds caso o usuario tenha adicionado
     bg_dir = Path.home() / ".config/npu-effects/backgrounds"
     for candidate in ["privacy.jpg", "privacy.png", "ausencia.jpg", "ausencia.png", "away.jpg", "away.png"]:
@@ -624,8 +648,7 @@ def draw_privacy_screen(w, h, custom_path=None):
             except Exception:
                 pass
 
-    # Imagem padrao empacotada com o projeto (assets/default_privacy.png),
-    # usada quando o usuario nao configurou nenhuma imagem propria.
+    # Imagem padrao empacotada com o projeto (assets/absence/Ausente.png ou assets/default_privacy.png)
     if DEFAULT_PRIVACY_IMAGE is not None:
         try:
             img = cv2.imread(str(DEFAULT_PRIVACY_IMAGE))

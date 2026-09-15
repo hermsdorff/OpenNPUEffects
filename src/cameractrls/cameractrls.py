@@ -2298,6 +2298,14 @@ NPU_TR = {
         'name': 'Absence Privacy Mode',
         'tooltip': 'Pauses the video with a privacy screen when you step away from the laptop.',
     },
+    'npu_privacy_image': {
+        'name': 'Absence Screen (Presets)',
+        'tooltip': 'Select the preset screen shown when stepping away from the notebook.',
+    },
+    'npu_privacy_file': {
+        'name': 'Select Absence Image from Computer...',
+        'tooltip': 'Choose a custom image file (.jpg, .png, .webp) for the absence/privacy screen.',
+    },
     'npu_privacy_fade': {
         'name': 'Smooth Transition (Fade In/Out)',
         'tooltip': 'Applies a smooth gradual transition entering and leaving the absence screen instead of a hard cut.',
@@ -2497,6 +2505,41 @@ class IntelNPUCtrls:
                 if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
                     bg_name = os.path.splitext(f)[0].replace('_', ' ').title()
                     bg_menu.append(BaseCtrlMenu(f, bg_name, f))
+
+        priv_dir = os.path.expanduser('~/.config/npu-effects/absence')
+        os.makedirs(priv_dir, exist_ok=True)
+        # Pre-populate defaults if folder is empty
+        if not any(f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')) for f in os.listdir(priv_dir)):
+            for candidate in [
+                os.path.expanduser('~/.local/share/npu-effects/absence'),
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'assets', 'absence'),
+                '/opt/npu-effects/assets/absence',
+            ]:
+                if os.path.isdir(candidate):
+                    for f in os.listdir(candidate):
+                        if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                            try:
+                                shutil.copy2(os.path.join(candidate, f), os.path.join(priv_dir, f))
+                            except Exception:
+                                pass
+
+        priv_menu = []
+        priv_image = v_cfg.get("privacy_image", "")
+        default_priv_img = os.path.join(priv_dir, 'Ausente.png')
+        if not priv_image or not os.path.exists(priv_image):
+            if os.path.exists(default_priv_img):
+                priv_image = default_priv_img
+            elif os.path.exists('/home/kleber/Pictures/ausente.png'):
+                priv_image = '/home/kleber/Pictures/ausente.png'
+            elif os.path.exists('/home/kleber/picture/ausente.png'):
+                priv_image = '/home/kleber/picture/ausente.png'
+
+        current_priv_file = os.path.basename(priv_image) if priv_image else "Ausente.png"
+        if os.path.isdir(priv_dir):
+            for f in sorted(os.listdir(priv_dir)):
+                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                    priv_name = os.path.splitext(f)[0].replace('_', ' ').title()
+                    priv_menu.append(BaseCtrlMenu(f, priv_name, f))
 
         lang_val = lang
 
@@ -2896,6 +2939,24 @@ class IntelNPUCtrls:
                 default=False
             ),
             IntelNPUCtrl(
+                'npu_privacy_image',
+                T('npu_privacy_image', 'name', 'Imagem de Ausência (Presets)'),
+                'menu',
+                T('npu_privacy_image', 'tooltip', 'Selecione a imagem exibida quando o modo de ausência/privacidade for ativado.'),
+                value=current_priv_file,
+                default='Ausente.png',
+                menu=priv_menu,
+                menu_dd=True
+            ),
+            IntelNPUCtrl(
+                'npu_privacy_file',
+                T('npu_privacy_file', 'name', 'Selecionar Imagem do Computador...'),
+                'file',
+                T('npu_privacy_file', 'tooltip', 'Escolha uma imagem personalizada (.jpg, .png, .webp) para a tela de ausência/privacidade.'),
+                value=priv_image,
+                default=default_priv_img
+            ),
+            IntelNPUCtrl(
                 'npu_privacy_fade',
                 T('npu_privacy_fade', 'name', 'Transição Suave (Fade In/Out)'),
                 'boolean',
@@ -3253,6 +3314,32 @@ class IntelNPUCtrls:
                 ctrl.value = bool(v)
                 cfg["video"]["privacy_enabled"] = bool(v)
                 changed = True
+
+            elif k == 'npu_privacy_image':
+                ctrl.value = v
+                img_path = os.path.join(priv_dir, v)
+                if os.path.exists(img_path):
+                    cfg["video"]["privacy_image"] = img_path
+                    file_ctrl = find_by_text_id(self.ctrls, 'npu_privacy_file')
+                    if file_ctrl:
+                        file_ctrl.value = img_path
+                    changed = True
+
+            elif k == 'npu_privacy_file':
+                ctrl.value = v
+                if v and os.path.isfile(v):
+                    dest_file = os.path.join(priv_dir, os.path.basename(v))
+                    if not os.path.exists(dest_file):
+                        try:
+                            shutil.copy2(v, dest_file)
+                            v = dest_file
+                        except Exception:
+                            pass
+                    cfg["video"]["privacy_image"] = v
+                    img_ctrl = find_by_text_id(self.ctrls, 'npu_privacy_image')
+                    if img_ctrl:
+                        img_ctrl.value = os.path.basename(v)
+                    changed = True
 
             elif k == 'npu_privacy_fade':
                 ctrl.value = bool(v)
@@ -4469,6 +4556,8 @@ class CameraCtrls:
                 CtrlCategory('Privacidade & Energia',
                     pop_list_by_text_ids(ctrls, [
                         'npu_privacy',
+                        'npu_privacy_image',
+                        'npu_privacy_file',
                         'npu_privacy_fade',
                         'npu_privacy_mute',
                         'npu_standby',
