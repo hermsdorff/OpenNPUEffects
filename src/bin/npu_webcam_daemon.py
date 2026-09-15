@@ -951,46 +951,91 @@ def apply_neural_glasses_retention(
     except Exception as e:
         return cached_glasses_mask
 
+GESTURE_EMOJI_CACHE = {}
+
+def get_gesture_emoji(gesture_name):
+    global GESTURE_EMOJI_CACHE
+    if gesture_name in GESTURE_EMOJI_CACHE:
+        return GESTURE_EMOJI_CACHE[gesture_name]
+
+    candidate_dirs = [
+        "/home/kleber/Development/NPU/assets/emojis",
+        os.path.expanduser("~/.local/share/npu-effects/assets/emojis"),
+        "/opt/npu-effects/assets/emojis",
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "emojis"),
+    ]
+
+    for d in candidate_dirs:
+        p = os.path.join(d, f"{gesture_name}.png")
+        if os.path.isfile(p):
+            im = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+            if im is not None and len(im.shape) == 3 and im.shape[2] == 4:
+                GESTURE_EMOJI_CACHE[gesture_name] = im
+                return im
+    return None
+
 def detect_hand_gesture(hand_skin, out_w=1920, out_h=1080):
-    hand_bin = (hand_skin > 0.30).astype(np.uint8) * 255
+    hand_bin = (hand_skin > 0.22).astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     hand_bin = cv2.morphologyEx(hand_bin, cv2.MORPH_OPEN, kernel)
-    contours, _ = cv2.findContours(hand_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, hierarchy = cv2.findContours(hand_bin, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
 
-    best_gesture = None
-    best_hand_pos = None
+    if not contours:
+        return None, None
 
-    for cnt in contours:
+    valid_candidates = []
+    for idx, cnt in enumerate(contours):
+        # Ignore inner holes as candidate hands
+        if hierarchy is not None and hierarchy[0][idx][3] != -1:
+            continue
         area = cv2.contourArea(cnt)
-        if area < 200 or area > 6000:
+        if area < 120 or area > 7500:
             continue
 
         x, y, w, h = cv2.boundingRect(cnt)
-        if w < 16 or h < 20:
+        if w < 12 or h < 14:
             continue
 
-        # Ignore arms resting on desk at bottom edge of screen
-        if (y + h >= 253) and (y > 185):
+        # Ignore arms resting on desk at bottom edge of screen (bottom 45px when resting)
+        if (y + h >= 253) and (y > 195):
             continue
 
         aspect = float(h) / max(1.0, float(w))
-        if aspect < 0.60 or aspect > 2.30:
+        if aspect < 0.45 or aspect > 3.20:
             continue
 
-        cx = int((x + w / 2.0) * out_w / 256.0)
-        cy = int((y + h / 2.0) * out_h / 256.0)
+        valid_candidates.append((area, cnt, (x, y, w, h), idx, aspect))
 
-        hull = cv2.convexHull(cnt, returnPoints=False)
-        if hull is None or len(hull) < 4:
-            continue
+    if not valid_candidates:
+        return None, None
 
-        hull_pts = cv2.convexHull(cnt, returnPoints=True)
-        hull_area = cv2.contourArea(hull_pts)
-        solidity = float(area) / max(1.0, hull_area)
+    valid_candidates.sort(key=lambda c: c[0], reverse=True)
+    area, cnt, (x, y, w, h), cnt_idx, aspect = valid_candidates[0]
 
-        defects = cv2.convexityDefects(cnt, hull)
-        valid_defects = []
+    cx = int((x + w / 2.0) * out_w / 256.0)
+    cy = int((y + h / 2.0) * out_h / 256.0)
 
+    hull_idx = cv2.convexHull(cnt, returnPoints=False)
+    if hull_idx is None or len(hull_idx) < 3:
+        return None, None
+
+    hull_pts = cv2.convexHull(cnt, returnPoints=True)
+    hull_area = cv2.contourArea(hull_pts)
+    solidity = float(area) / max(1.0, hull_area)
+
+    # Check for inner hole (e.g. OK hand loop)
+    has_inner_hole = False
+    if hierarchy is not None:
+        for ch_idx in range(len(contours)):
+            if hierarchy[0][ch_idx][3] == cnt_idx:
+                hole_area = cv2.contourArea(contours[ch_idx])
+                if hole_area >= 20:
+                    has_inner_hole = True
+                    break
+
+    valid_defects = []
+    try:
+        defects = cv2.convexityDefects(cnt, hull_idx)
         if defects is not None:
             for i in range(defects.shape[0]):
                 row = defects[i, 0] if len(defects.shape) == 3 else defects[i]
@@ -1007,80 +1052,170 @@ def detect_hand_gesture(hand_skin, out_w=1920, out_h=1080):
                 b = np.hypot(far[0] - start[0], far[1] - start[1])
                 c = np.hypot(end[0] - far[0], end[1] - far[1])
 
-                if b < 6.0 or c < 6.0:
+                if b < 5.5 or c < 5.5:
                     continue
 
                 cos_val = (b**2 + c**2 - a**2) / (2.0 * b * c + 1e-6)
                 angle = np.arccos(np.clip(cos_val, -1.0, 1.0)) * 180.0 / np.pi
 
-                if 12.0 <= angle <= 92.0:
-                    valid_defects.append((d_px, angle, far))
+                if 12.0 <= angle <= 95.0:
+                    valid_defects.append((d_px, angle, far, start, end))
+    except Exception:
+        pass
 
-        finger_count = len(valid_defects)
-        gesture = None
+    fc = len(valid_defects)
 
-        # 1. Open Palm / Wave: >= 3 finger valleys, balanced aspect
-        if finger_count >= 3 and 0.40 <= solidity <= 0.85 and 0.65 <= aspect <= 1.70:
-            gesture = "open_palm"
+    h_top = max(3, int(h * 0.25))
+    h_bot = max(3, int(h * 0.25))
+    top_slice = hand_bin[y : y + h_top, x : x + w]
+    mid_slice = hand_bin[y + int(h * 0.35) : y + int(h * 0.75), x : x + w]
+    bot_slice = hand_bin[y + h - h_bot : y + h, x : x + w]
 
-        # 2. Peace / Victory: 1 or 2 prominent deep valleys, taller aspect (index & middle fingers up)
-        elif (finger_count in [1, 2]) and 1.10 <= aspect <= 2.25 and 0.45 <= solidity <= 0.88:
-            deepest = max(valid_defects, key=lambda d: d[0])
-            if deepest[0] >= 5.0 and deepest[1] <= 65.0 and deepest[2][1] < (y + h * 0.70):
-                gesture = "peace"
+    top_w = np.max(np.sum(top_slice > 0, axis=1)) if top_slice.size > 0 and np.any(top_slice > 0) else 0
+    mid_w = np.max(np.sum(mid_slice > 0, axis=1)) if mid_slice.size > 0 and np.any(mid_slice > 0) else 1
+    bot_w = np.max(np.sum(bot_slice > 0, axis=1)) if bot_slice.size > 0 and np.any(bot_slice > 0) else 0
 
-        # 3. Thumbs Up: Fist with thumb pointing up
-        # Curled fingers have no deep valleys (finger_count == 0), aspect >= 1.12
-        # Crucial: the top 25% of height (thumb) must be significantly narrower than the fist in the middle
-        elif finger_count == 0 and aspect >= 1.12 and solidity >= 0.70:
-            top_slice = hand_bin[y : y + max(3, int(h * 0.25)), x : x + w]
-            mid_slice = hand_bin[y + int(h * 0.40) : y + int(h * 0.85), x : x + w]
-            if top_slice.size > 0 and mid_slice.size > 0 and np.any(top_slice > 0) and np.any(mid_slice > 0):
-                top_w = np.max(np.sum(top_slice > 0, axis=1))
-                mid_w = np.max(np.sum(mid_slice > 0, axis=1))
-                if top_w < 0.65 * mid_w and mid_w >= 16:
-                    gesture = "thumbs_up"
+    top_ratio = top_w / max(1.0, float(mid_w))
+    bot_ratio = bot_w / max(1.0, float(mid_w))
 
-        if gesture:
-            best_gesture = gesture
-            best_hand_pos = (cx, cy)
-            break
+    gesture = None
 
-    return best_gesture, best_hand_pos
+    # 1. OK Hand: loop formed by thumb and index
+    if has_inner_hole and aspect >= 0.90:
+        gesture = "ok_hand"
+
+    # 2. Open Palm / Wave: 3 or more deep finger valleys
+    elif fc >= 3 and 0.40 <= solidity <= 0.85 and 0.65 <= aspect <= 1.70:
+        gesture = "open_palm"
+
+    # 3. Two-finger or Horn gestures (Peace vs Rock)
+    elif fc in [1, 2] and aspect >= 1.00 and 0.42 <= solidity <= 0.88:
+        deepest = max(valid_defects, key=lambda d: d[0])
+        tip_dist = np.hypot(deepest[3][0] - deepest[4][0], deepest[3][1] - deepest[4][1])
+        tip_dist_ratio = tip_dist / max(1.0, float(w))
+
+        # Rock / Horns: index and pinky extended wide apart
+        if tip_dist_ratio >= 0.42 and deepest[0] >= 4.5:
+            gesture = "rock"
+        # Peace: index and middle extended together in upper region
+        elif deepest[0] >= 3.8 and deepest[1] <= 75.0 and deepest[2][1] < (y + h * 0.75):
+            gesture = "peace"
+
+    # 4. Zero defects: Thumbs Up, Thumbs Down, Pointing Up, Call Me (Shaka), Fist
+    elif fc == 0:
+        # Call Me / Shaka: wide horizontal profile (w > h)
+        if aspect <= 0.95 and 0.40 <= solidity <= 0.88:
+            gesture = "call_me"
+        # Pointing Up: tall and slender single index finger
+        elif aspect >= 1.45 and top_ratio < 0.55 and solidity <= 0.85:
+            gesture = "pointing_up"
+        # Thumbs Up: vertical, top is narrow thumb, middle is wide fist
+        elif aspect >= 1.06 and solidity >= 0.64 and top_ratio < 0.72 and mid_w >= 12:
+            gesture = "thumbs_up"
+        # Thumbs Down: vertical, top is wide fist, bottom is narrow thumb
+        elif aspect >= 1.06 and solidity >= 0.64 and bot_ratio < 0.72 and top_ratio >= 0.65 and mid_w >= 12:
+            gesture = "thumbs_down"
+        # Fist Bump / Clenched Fist: compact ball, high solidity, no protrusions
+        elif 0.75 <= aspect <= 1.30 and solidity >= 0.78 and top_ratio >= 0.65 and bot_ratio >= 0.65:
+            gesture = "fist"
+
+    if gesture:
+        return gesture, (cx, cy)
+
+    return None, None
 
 def draw_gesture_reaction_fast(frame, gesture_type, hand_pos, progress):
-    h, w = frame.shape[:2]
-    badge_w, badge_h = 180, 52
+    emoji_img = get_gesture_emoji(gesture_type)
+    fh, fw = frame.shape[:2]
     hx, hy = hand_pos
-    cy = int(hy - 45 - progress * 55)
-    cx = int(hx)
-    x1 = max(10, min(w - badge_w - 10, cx - badge_w // 2))
-    y1 = max(10, min(h - badge_h - 10, cy - badge_h // 2))
-    x2, y2 = x1 + badge_w, y1 + badge_h
 
-    if progress < 0.18:
-        alpha = progress / 0.18
-    elif progress > 0.65:
-        alpha = (1.0 - progress) / 0.35
+    # Rising trajectory with subtle natural sway as it floats up
+    cy = int(hy - 45 - progress * 165)
+    cx = int(hx + np.sin(progress * np.pi * 2.5) * 12)
+
+    # Pop-in bounce scale, then subtle expansion as it floats up
+    if progress < 0.15:
+        scale = 0.45 + (progress / 0.15) * 0.70  # 0.45 -> 1.15
+    elif progress < 0.28:
+        scale = 1.15 - ((progress - 0.15) / 0.13) * 0.15  # 1.15 -> 1.0
+    else:
+        scale = 1.0 + (progress - 0.28) * 0.12  # 1.0 -> 1.08
+
+    # Alpha fade-in and smooth fade-out
+    if progress < 0.12:
+        alpha = progress / 0.12
+    elif progress > 0.68:
+        alpha = (1.0 - progress) / 0.32
     else:
         alpha = 1.0
-    alpha = float(np.clip(alpha * 0.92, 0.0, 1.0))
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    if alpha <= 0.01:
+        return frame
 
-    roi = frame[y1:y2, x1:x2]
-    pill = roi.copy()
-    cv2.rectangle(pill, (0, 0), (badge_w, badge_h), (22, 22, 30), -1)
-    border_color = (60, 220, 120) if gesture_type == "thumbs_up" else ((120, 180, 255) if gesture_type == "peace" else (255, 160, 80))
-    cv2.rectangle(pill, (0, 0), (badge_w, badge_h), border_color, 2)
+    if emoji_img is not None:
+        base_sz = 110
+        target_sz = max(24, int(base_sz * scale))
+        if target_sz % 2 != 0:
+            target_sz += 1
 
-    if gesture_type == "thumbs_up":
-        tag = "[+] JOINHA"
-    elif gesture_type == "peace":
-        tag = "[V] VITORIA"
+        scaled_emoji = cv2.resize(emoji_img, (target_sz, target_sz), interpolation=cv2.INTER_LINEAR)
+
+        # Circular frosted bubble backdrop (modern slate with translucent border)
+        bubble_radius = int(target_sz * 0.58)
+        x1 = cx - bubble_radius
+        y1 = cy - bubble_radius
+        x2 = cx + bubble_radius
+        y2 = cy + bubble_radius
+
+        if x2 <= 0 or y2 <= 0 or x1 >= fw or y1 >= fh:
+            return frame
+
+        fx1 = max(0, x1)
+        fy1 = max(0, y1)
+        fx2 = min(fw, x2)
+        fy2 = min(fh, y2)
+        box_w = fx2 - fx1
+        box_h = fy2 - fy1
+        if box_w <= 0 or box_h <= 0:
+            return frame
+
+        roi = frame[fy1:fy2, fx1:fx2]
+
+        bw = 2 * bubble_radius
+        bubble_mask = np.zeros((bw, bw), dtype=np.float32)
+        cv2.circle(bubble_mask, (bubble_radius, bubble_radius), bubble_radius - 2, 0.65 * alpha, -1, cv2.LINE_AA)
+        cv2.circle(bubble_mask, (bubble_radius, bubble_radius), bubble_radius - 2, 0.90 * alpha, 2, cv2.LINE_AA)
+
+        bx1 = fx1 - x1
+        by1 = fy1 - y1
+        b_crop = bubble_mask[by1:by1 + box_h, bx1:bx1 + box_w]
+        b_3c = np.repeat(b_crop[:, :, np.newaxis], 3, axis=2)
+        bubble_color = np.array([24, 24, 34], dtype=np.uint8)
+        roi[:] = (roi * (1.0 - b_3c) + bubble_color * b_3c).astype(np.uint8)
+
+        # Overlay high-res emoji with alpha channel
+        ex1 = cx - target_sz // 2
+        ey1 = cy - target_sz // 2
+        ex2 = ex1 + target_sz
+        ey2 = ey1 + target_sz
+
+        efx1 = max(0, ex1)
+        efy1 = max(0, ey1)
+        efx2 = min(fw, ex2)
+        efy2 = min(fh, ey2)
+
+        if efx2 > efx1 and efy2 > efy1:
+            e_crop = scaled_emoji[efy1 - ey1 : efy1 - ey1 + (efy2 - efy1), efx1 - ex1 : efx1 - ex1 + (efx2 - efx1)]
+            e_alpha = (e_crop[:, :, 3].astype(np.float32) / 255.0) * alpha
+            e_alpha_3c = np.repeat(e_alpha[:, :, np.newaxis], 3, axis=2)
+            e_bgr = e_crop[:, :, :3]
+            e_roi = frame[efy1:efy2, efx1:efx2]
+            e_roi[:] = (e_roi * (1.0 - e_alpha_3c) + e_bgr * e_alpha_3c).astype(np.uint8)
     else:
-        tag = "[*] ACENO"
+        # Fallback if image asset is unexpectedly missing
+        tag = gesture_type.upper()
+        cv2.putText(frame, tag, (cx - 40, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-    cv2.putText(pill, tag, (16, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2, cv2.LINE_AA)
-    frame[y1:y2, x1:x2] = cv2.addWeighted(pill, alpha, roi, 1.0 - alpha, 0)
     return frame
 
 def apply_low_light_booster(img, gain_percent=45):
@@ -1404,6 +1539,8 @@ def main():
         privacy_fade_alpha = 0.0
         candidate_gesture = None
         candidate_gesture_time = 0.0
+        gesture_match_count = 0
+        no_hand_count = 0
         gesture_animation = None
         last_gesture_mute_time = 0.0
         gesture_latched = False
@@ -1414,6 +1551,10 @@ def main():
         glasses_frame_counter = 0
         cached_glasses_mask = None
         morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+        # Pre-warm gesture emoji cache into memory
+        for g_name in ["thumbs_up", "thumbs_down", "peace", "rock", "call_me", "pointing_up", "fist", "ok_hand", "open_palm"]:
+            get_gesture_emoji(g_name)
 
         last_consumer_check = 0.0
         last_active_time = 0.0
@@ -1623,11 +1764,69 @@ def main():
                     # 1.0 - background gives full human silhouette (classes 1..5)
                     p_person = 1.0 - probs[:, :, 0]
 
-                    # Boost body-skin (hands, wrists, fingers) so open hands never disappear
-                    body_skin = probs[:, :, 2]
-                    p_person = np.maximum(p_person, np.clip(body_skin * 1.25, 0.0, 1.0))
+                    # Direct foreground vs background logit differential:
+                    # In multiclass, the sum of human classes (hair, skin, clothes, etc.) can be diluted
+                    # when individual classes are split. fg_max_logits compares the strongest human class
+                    # against the background logit directly!
+                    fg_max_logits = np.max(raw[:, :, 1:], axis=-1)
+                    bg_logits = raw[:, :, 0]
+                    logit_diff = fg_max_logits - bg_logits
+                    p_direct_fg = 1.0 / (1.0 + np.exp(-1.8 * logit_diff))
+                    p_person = np.maximum(p_person, p_direct_fg)
 
-                    # 1. Hand isolation (excluding face, neck, and central chest)
+                    # Boost human foreground components: body-skin and clothes (arms, sleeves, torso)
+                    body_skin = probs[:, :, 2]
+                    clothes = probs[:, :, 4]
+                    human_body = np.maximum(body_skin * 1.45, clothes * 1.40)
+                    p_person = np.maximum(p_person, np.clip(human_body, 0.0, 1.0))
+
+                    # Anatomical Torso Core Boost:
+                    # Directly below the chin/neck, the central column beneath the face
+                    # is the user's torso. Reinforce any signal here so shirts never become transparent.
+                    if face_info.get("has_face"):
+                        fx_b, fy_b, fw_b, fh_b = face_info["box"]
+                        fx_sb = int(fx_b * 256 / out_w)
+                        fy_sb = int(fy_b * 256 / out_h)
+                        fw_sb = int(fw_b * 256 / out_w)
+                        fh_sb = int(fh_b * 256 / out_h)
+                        cx_sb = max(0, min(255, fx_sb + fw_sb // 2))
+
+                        torso_y_start = min(250, fy_sb + int(fh_sb * 1.10))
+                        if torso_y_start < 255:
+                            y_idx_arr = np.arange(torso_y_start, 256)
+                            prog = (y_idx_arr - torso_y_start) / max(1.0, 255 - torso_y_start)
+                            # Expands from shoulders down to waist
+                            hws = (fw_sb * (0.85 + prog * 0.65)).astype(int)
+                            torso_mask = np.zeros((256, 256), dtype=bool)
+                            for y_idx, hw in zip(y_idx_arr, hws):
+                                x1_t = max(0, cx_sb - hw)
+                                x2_t = min(256, cx_sb + hw)
+                                torso_mask[y_idx, x1_t:x2_t] = True
+
+                            torso_signal = p_person[torso_mask]
+                            if len(torso_signal) > 0 and np.mean(torso_signal) > 0.15:
+                                p_person[torso_mask] = np.maximum(p_person[torso_mask], 0.92)
+
+                    # Morphological vertical closing to seal cloth folds, buttons, creases and arm-torso gaps
+                    torso_close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 21))
+                    p_closed = cv2.morphologyEx(p_person, cv2.MORPH_CLOSE, torso_close_k)
+                    p_person = np.maximum(p_person, p_closed)
+
+                    # Solidify interior holes inside the silhouette (flood-fill background from corners)
+                    p_bin = (p_person > 0.25).astype(np.uint8)
+                    if face_info.get("has_face"):
+                        b_x1 = max(0, cx_sb - int(fw_sb * 1.4))
+                        b_x2 = min(256, cx_sb + int(fw_sb * 1.4))
+                        p_bin[253:256, b_x1:b_x2] = 1
+
+                    flood_padded = cv2.copyMakeBorder(p_bin, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+                    f_h, f_w = flood_padded.shape
+                    flood_mask = np.zeros((f_h + 2, f_w + 2), np.uint8)
+                    cv2.floodFill(flood_padded, flood_mask, (0, 0), 255)
+                    internal_holes = ((flood_padded[1:-1, 1:-1] == 0) & (p_bin == 0)).astype(np.float32)
+                    p_person = np.maximum(p_person, internal_holes * 0.98)
+
+                    # 1. Hand isolation (excluding face and strictly anatomical throat)
                     hand_skin = body_skin.copy()
                     if face_info.get("has_face"):
                         fx, fy, fw, fh = face_info["box"]
@@ -1636,20 +1835,20 @@ def main():
                         fw_s = int(fw * 256 / out_w)
                         fh_s = int(fh * 256 / out_h)
                         # Head / Face exclusion box
-                        y1_ex = max(0, fy_s - int(fh_s * 0.25))
-                        y2_ex = min(256, fy_s + int(fh_s * 1.25))
-                        x1_ex = max(0, fx_s - int(fw_s * 0.30))
-                        x2_ex = min(256, fx_s + int(fw_s * 1.30))
+                        y1_ex = max(0, fy_s - int(fh_s * 0.20))
+                        y2_ex = min(256, fy_s + int(fh_s * 1.15))
+                        x1_ex = max(0, fx_s - int(fw_s * 0.20))
+                        x2_ex = min(256, fx_s + int(fw_s * 1.20))
                         hand_skin[y1_ex:y2_ex, x1_ex:x2_ex] = 0.0
 
-                        # Neck & central chest corridor exclusion
-                        y1_neck = max(0, fy_s + int(fh_s * 0.85))
-                        y2_neck = min(256, fy_s + int(fh_s * 2.80))
-                        x1_neck = max(0, fx_s - int(fw_s * 0.40))
-                        x2_neck = min(256, fx_s + int(fw_s * 1.40))
+                        # Anatomical throat / neck exclusion (strictly between chin and collarbone)
+                        y1_neck = max(0, fy_s + int(fh_s * 0.92))
+                        y2_neck = min(256, fy_s + int(fh_s * 1.45))
+                        x1_neck = max(0, fx_s + int(fw_s * 0.18))
+                        x2_neck = min(256, fx_s + int(fw_s * 0.82))
                         hand_skin[y1_neck:y2_neck, x1_neck:x2_neck] = 0.0
 
-                    has_hands = bool(np.max(hand_skin) > 0.25)
+                    has_hands = bool(np.max(hand_skin) > 0.20)
 
                     # 2. Handheld Object Retention (Preservação de Objetos Segurados na Mão)
                     if cfg.get("object_retention_enabled", True) and has_hands:
@@ -1691,36 +1890,46 @@ def main():
                             g_type, g_pos = detect_hand_gesture(hand_skin, out_w, out_h)
 
                         if g_type is not None:
-                            if candidate_gesture == g_type:
-                                # Stable gesture held for at least 0.28 seconds
-                                if (now - candidate_gesture_time) >= 0.28:
-                                    # Trigger once per gesture presentation (one-shot latch)
-                                    if not gesture_latched and (now >= gesture_cooldown_until):
-                                        if g_act in ["reaction", "all"]:
-                                            gesture_animation = {
-                                                "type": g_type,
-                                                "pos": g_pos,
-                                                "start_time": now,
-                                                "duration": 1.6
-                                            }
-                                        if g_type == "open_palm" and g_act in ["mute_toggle", "all"]:
-                                            if (now - last_gesture_mute_time) > 1.8:
-                                                is_currently_muted = check_audio_muted()
-                                                set_audio_mute(not is_currently_muted)
-                                                last_gesture_mute_time = now
-
-                                        gesture_latched = True
-                                        gesture_cooldown_until = now + 1.2
+                            no_hand_count = 0
+                            if g_type == candidate_gesture:
+                                gesture_match_count += 1
                             else:
                                 candidate_gesture = g_type
+                                gesture_match_count = 1
                                 candidate_gesture_time = now
-                                gesture_latched = False
+
+                            # Only consider gesture after strictly 0.5 seconds of uninterrupted detection of the exact same gesture
+                            time_held = now - candidate_gesture_time
+                            if time_held >= 0.50:
+                                if not gesture_latched and (now >= gesture_cooldown_until):
+                                    if g_act in ["reaction", "all"]:
+                                        gesture_animation = {
+                                            "type": g_type,
+                                            "pos": g_pos,
+                                            "start_time": now,
+                                            "duration": 1.8
+                                        }
+                                    if g_type == "open_palm" and g_act in ["mute_toggle", "all"]:
+                                        if (now - last_gesture_mute_time) > 1.8:
+                                            is_currently_muted = check_audio_muted()
+                                            set_audio_mute(not is_currently_muted)
+                                            last_gesture_mute_time = now
+
+                                    gesture_latched = True
+                                    gesture_cooldown_until = now + 0.9
                         else:
-                            # Hand is hidden, lowered, or returned to neutral
+                            # Hand absent or gesture broken: reset candidate and streak immediately
                             candidate_gesture = None
-                            gesture_latched = False
+                            candidate_gesture_time = 0.0
+                            gesture_match_count = 0
+                            no_hand_count += 1
+                            if no_hand_count >= 2:
+                                gesture_latched = False
                     else:
                         candidate_gesture = None
+                        candidate_gesture_time = 0.0
+                        gesture_match_count = 0
+                        no_hand_count = 0
                         gesture_latched = False
                 else:
                     # Legacy 144x256 model fallback
@@ -1751,29 +1960,25 @@ def main():
                     cached_glasses_mask = None
 
                 # Motion-Adaptive Temporal Filtering:
-                # Kills pixel jitter on static areas, but responds instantly (alpha=0.96) to arm/hand motion
+                # Kills pixel jitter on static areas, but responds promptly to arm/hand motion
                 if prev_mask is None:
                     mask_256 = p_person
                 else:
                     motion_delta = np.abs(p_person - prev_mask)
-                    adaptive_alpha = np.clip(0.70 + motion_delta * 1.6, 0.70, 0.96)
+                    adaptive_alpha = np.clip(0.35 + motion_delta * 1.2, 0.35, 0.85)
                     mask_256 = prev_mask * (1.0 - adaptive_alpha) + p_person * adaptive_alpha
                 prev_mask = mask_256
 
                 # Natural Smoothstep Feathering
                 feather_px = float(cfg.get("mask_feather", 40))
                 feather_px = max(10.0, min(80.0, feather_px))
-                half_width = 0.22 * (feather_px / 40.0)
-                center = 0.42
-                low = max(0.08, center - half_width)
+                half_width = 0.20 * (feather_px / 40.0)
+                center = 0.32
+                low = max(0.06, center - half_width)
                 high = min(0.92, center + half_width)
 
                 u = np.clip((mask_256 - low) / (high - low), 0.0, 1.0)
                 p_curved = u * u * (3.0 - 2.0 * u)
-
-                # Subtle 1px erosion to eliminate light boundary fringe
-                if is_multiclass:
-                    p_curved = cv2.erode(p_curved, morph_kernel, iterations=1)
 
                 # Fast Guided Filter:
                 # Uses 640x360 camera luminance to snap the mask to exact real-world 1080p hair & finger edges!
@@ -1781,6 +1986,10 @@ def main():
                 mask_full = fast_guided_filter(guide_small, p_curved, r=5, eps=1e-3, out_shape=(out_w, out_h))
                 if cached_glasses_mask is not None:
                     mask_full = np.maximum(mask_full, cached_glasses_mask)
+
+                # Solid Core Protection:
+                # Ensure the body interior is 100% opaque without virtual background bleeding through clothes!
+                mask_full = np.where(mask_full > 0.80, 1.0, mask_full)
                 mask_3c = cv2.merge([mask_full, mask_full, mask_full])
 
                 # Rim Light (Contour / Hair Light)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import ctypes, ctypes.util, logging, os.path, getopt, sys, subprocess, select, time, math, configparser, json
+import ctypes, ctypes.util, logging, os.path, getopt, sys, subprocess, select, time, math, configparser, json, shutil
 from fcntl import ioctl
 from threading import Thread
 from errno import EIO
@@ -2138,8 +2138,12 @@ NPU_TR = {
         'menu': {'standard': 'Standard (Uniform)', 'portrait_depth': 'Optical Portrait (Depth / Bokeh)'},
     },
     'npu_bg_image': {
-        'name': 'Virtual Background (Image)',
-        'tooltip': 'Choose the desired background image from the ~/.config/npu-effects/backgrounds/ folder',
+        'name': 'Virtual Background (Presets)',
+        'tooltip': 'Choose a preset virtual background image from the ~/.config/npu-effects/backgrounds/ folder.',
+    },
+    'npu_bg_file': {
+        'name': 'Custom Background Image',
+        'tooltip': 'Select any image file (.jpg, .png, .webp) from your computer to use as virtual background.',
     },
     'npu_blur_strength': {
         'name': 'Blur Intensity',
@@ -2470,11 +2474,27 @@ class IntelNPUCtrls:
         priv_fade_val = bool(v_cfg.get("privacy_fade_enabled", True))
 
         bg_dir = os.path.expanduser('~/.config/npu-effects/backgrounds')
+        os.makedirs(bg_dir, exist_ok=True)
+        # Pre-populate defaults if folder is empty
+        if not any(f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')) for f in os.listdir(bg_dir)):
+            for candidate in [
+                os.path.expanduser('~/.local/share/npu-effects/backgrounds'),
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'assets', 'backgrounds'),
+                '/opt/npu-effects/backgrounds',
+            ]:
+                if os.path.isdir(candidate):
+                    for f in os.listdir(candidate):
+                        if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                            try:
+                                shutil.copy2(os.path.join(candidate, f), os.path.join(bg_dir, f))
+                            except Exception:
+                                pass
+
         bg_menu = []
         current_bg_file = os.path.basename(bg_image) if bg_image else ""
         if os.path.isdir(bg_dir):
             for f in sorted(os.listdir(bg_dir)):
-                if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
                     bg_name = os.path.splitext(f)[0].replace('_', ' ').title()
                     bg_menu.append(BaseCtrlMenu(f, bg_name, f))
 
@@ -2527,14 +2547,27 @@ class IntelNPUCtrls:
             self.ctrls.append(
                 IntelNPUCtrl(
                     'npu_bg_image',
-                    T('npu_bg_image', 'name', 'Fundo Virtual (Imagem)'),
+                    T('npu_bg_image', 'name', 'Fundo Virtual (Presets)'),
                     'menu',
-                    T('npu_bg_image', 'tooltip', 'Escolha a imagem de fundo desejada da pasta ~/.config/npu-effects/backgrounds/'),
+                    T('npu_bg_image', 'tooltip', 'Escolha uma imagem de fundo pré-instalada ou salva da pasta ~/.config/npu-effects/backgrounds/'),
                     value=current_bg_file,
                     default=bg_menu[0].text_id,
-                    menu=bg_menu
+                    menu=bg_menu,
+                    menu_dd=True
                 )
             )
+
+        self.ctrls.append(
+            IntelNPUCtrl(
+                'npu_bg_file',
+                T('npu_bg_file', 'name', 'Selecionar Imagem do Computador...'),
+                'file',
+                T('npu_bg_file', 'tooltip', 'Clique para abrir o seletor de arquivos e escolher qualquer imagem (.jpg, .png, .webp) do seu computador como fundo virtual.'),
+                value=bg_image if (bg_image and os.path.isfile(bg_image)) else "",
+                default="",
+                reopener=True
+            )
+        )
 
         self.ctrls.extend([
             IntelNPUCtrl(
@@ -2836,7 +2869,7 @@ class IntelNPUCtrls:
                 'npu_gesture_detect',
                 T('npu_gesture_detect', 'name', 'Reconhecimento de Gestos (AI)'),
                 'boolean',
-                T('npu_gesture_detect', 'tooltip', 'Identifica gestos manuais (Joinha, Vitória, Mão Aberta) para reações e atalhos.'),
+                T('npu_gesture_detect', 'tooltip', 'Identifica gestos manuais (👍, 👎, ✌️, 🖐️, 🤘, 🤙, ☝️, ✊, 👌) para reações animadas com emojis e atalhos.'),
                 value=gesture_det_val,
                 default=True
             ),
@@ -2849,9 +2882,9 @@ class IntelNPUCtrls:
                 default='all',
                 menu_dd=True,
                 menu=[
-                    BaseCtrlMenu('reaction', T('npu_gesture_action', 'menu', 'Reações Visuais na Tela (Joinha, Vitoria, Aceno)', menu_id='reaction'), 0),
-                    BaseCtrlMenu('mute_toggle', T('npu_gesture_action', 'menu', 'Gatilho de Mudo com Mão Aberta (Aceno)', menu_id='mute_toggle'), 1),
-                    BaseCtrlMenu('all', T('npu_gesture_action', 'menu', 'Reações Visuais + Gatilho de Mudo', menu_id='all'), 2),
+                    BaseCtrlMenu('reaction', T('npu_gesture_action', 'menu', 'Subir Emoji Flutuante na Tela (👍, ✌️, 🖐️, 🤘, 🤙, ...)', menu_id='reaction'), 0),
+                    BaseCtrlMenu('mute_toggle', T('npu_gesture_action', 'menu', 'Gatilho de Mudo com Mão Aberta (🖐️)', menu_id='mute_toggle'), 1),
+                    BaseCtrlMenu('all', T('npu_gesture_action', 'menu', 'Subir Emoji + Gatilho de Mudo', menu_id='all'), 2),
                 ]
             ),
             IntelNPUCtrl(
@@ -2995,12 +3028,23 @@ class IntelNPUCtrls:
                 elif v == 'image':
                     cfg["video"]["blur_enabled"] = False
                     img_ctrl = find_by_text_id(self.ctrls, 'npu_bg_image')
-                    chosen_file = img_ctrl.value if img_ctrl and img_ctrl.value else "default.jpg"
-                    img_path = os.path.join(bg_dir, chosen_file)
+                    chosen_file = img_ctrl.value if img_ctrl and img_ctrl.value else ""
+                    img_path = os.path.join(bg_dir, chosen_file) if chosen_file else ""
                     if not os.path.exists(img_path):
-                        sample = os.path.expanduser("~/.local/share/npu-effects/sample_background.jpg")
-                        img_path = sample if os.path.exists(sample) else ""
+                        cur_cfg_img = cfg["video"].get("background_image", "")
+                        if cur_cfg_img and os.path.exists(cur_cfg_img):
+                            img_path = cur_cfg_img
+                        else:
+                            for f in sorted(os.listdir(bg_dir)):
+                                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                                    img_path = os.path.join(bg_dir, f)
+                                    break
                     cfg["video"]["background_image"] = img_path
+                    if img_ctrl and img_path:
+                        img_ctrl.value = os.path.basename(img_path)
+                    file_ctrl = find_by_text_id(self.ctrls, 'npu_bg_file')
+                    if file_ctrl:
+                        file_ctrl.value = img_path
                 changed = True
 
             elif k == 'npu_blur_mode':
@@ -3017,6 +3061,29 @@ class IntelNPUCtrls:
                     mode_ctrl = find_by_text_id(self.ctrls, 'npu_bg_mode')
                     if mode_ctrl:
                         mode_ctrl.value = 'image'
+                    file_ctrl = find_by_text_id(self.ctrls, 'npu_bg_file')
+                    if file_ctrl:
+                        file_ctrl.value = img_path
+                    changed = True
+
+            elif k == 'npu_bg_file':
+                ctrl.value = v
+                if v and os.path.isfile(v):
+                    dest_file = os.path.join(bg_dir, os.path.basename(v))
+                    if not os.path.exists(dest_file):
+                        try:
+                            shutil.copy2(v, dest_file)
+                            v = dest_file
+                        except Exception:
+                            pass
+                    cfg["video"]["background_image"] = v
+                    cfg["video"]["blur_enabled"] = False
+                    mode_ctrl = find_by_text_id(self.ctrls, 'npu_bg_mode')
+                    if mode_ctrl:
+                        mode_ctrl.value = 'image'
+                    img_ctrl = find_by_text_id(self.ctrls, 'npu_bg_image')
+                    if img_ctrl:
+                        img_ctrl.value = os.path.basename(v)
                     changed = True
 
             elif k == 'npu_blur_strength':
@@ -4309,6 +4376,8 @@ class CameraCtrls:
                         print(', '.join([m.text_id for m in c.menu]), end = ' )')
                     elif c.type == 'info':
                         print(f' = {c.value}', end = '')
+                    elif c.type == 'file':
+                        print(f' = {c.value}\t( default: {c.default} )', end = '')
                     elif c.type in ['integer', 'boolean']:
                         print(f' = {c.value}\t( default: {c.default} min: {c.min} max: {c.max}', end = '')
                         if c.step and c.step != 1:
@@ -4346,6 +4415,7 @@ class CameraCtrls:
                         'npu_bg_mode',
                         'npu_blur_mode',
                         'npu_bg_image',
+                        'npu_bg_file',
                         'npu_blur_strength',
                         'npu_feather',
                         'npu_preserve_glasses',

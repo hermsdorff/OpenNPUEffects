@@ -444,6 +444,42 @@ class CameraCtrlsWindow(Gtk.ApplicationWindow):
                         c.gui_value_set = label.set_label
                         c.gui_default_btn = None
 
+                    elif c.type == 'file':
+                        fcb = Gtk.FileChooserButton(title=c.name, action=Gtk.FileChooserAction.OPEN, valign=Gtk.Align.CENTER)
+                        fcb.set_width_chars(18)
+                        filter_img = Gtk.FileFilter()
+                        filter_img.set_name("Imagens (*.jpg, *.png, *.webp)")
+                        filter_img.add_mime_type("image/jpeg")
+                        filter_img.add_mime_type("image/png")
+                        filter_img.add_mime_type("image/webp")
+                        filter_img.add_pattern("*.jpg")
+                        filter_img.add_pattern("*.jpeg")
+                        filter_img.add_pattern("*.png")
+                        filter_img.add_pattern("*.webp")
+                        fcb.add_filter(filter_img)
+
+                        if c.value and os.path.isfile(c.value):
+                            fcb.set_filename(c.value)
+
+                        fcb.connect('file-set', lambda b, c=c: self.update_ctrl(c, b.get_filename()))
+
+                        refresh = Gtk.Button(image=Gtk.Image(icon_name='edit-undo-symbolic', icon_size=Gtk.IconSize.BUTTON), valign=Gtk.Align.CENTER, halign=Gtk.Align.START, relief=Gtk.ReliefStyle.NONE)
+                        if c.default is not None:
+                            refresh.connect('clicked', lambda e, c=c, fcb=fcb: [fcb.set_filename(c.default) if c.default else fcb.unselect_all(), self.update_ctrl(c, c.default)])
+
+                        ctrl_box.pack_start(refresh, False, False, 0)
+                        ctrl_box.pack_end(fcb, False, False, 0)
+
+                        def set_file_val(path, fcb=fcb):
+                            if path and os.path.isfile(path):
+                                fcb.set_filename(path)
+                            else:
+                                fcb.unselect_all()
+
+                        c.gui_value_set = set_file_val
+                        c.gui_ctrls += [fcb, refresh]
+                        c.gui_default_btn = refresh
+
                     elif c.type == 'menu':
                         if len(c.menu) < 4 and not c.menu_dd:
                             box = Gtk.ButtonBox(valign=Gtk.Align.CENTER)
