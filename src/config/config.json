@@ -9,6 +9,7 @@
     "blur_enabled": false,
     "blur_strength": 15,
     "mask_feather": 42,
+    "segmentation_model": "multiclass",
     "auto_standby": true,
     "standby_timeout": 3.0,
     "auto_framing": true,

@@ -33,6 +33,21 @@ SEG_MULTICLASS_PATH = MODEL_DIR / "selfie_multiclass.xml"
 SEG_MODEL_PATH = MODEL_DIR / "selfie_segmentation_static.xml"
 YUNET_MODEL_PATH = MODEL_DIR / "face_detection_yunet_2023mar.onnx"
 
+# MODNet Portrait Matting (Apache 2.0) - optional alternative to Selfie Multiclass with
+# higher-fidelity edges (hair/fingers), selectable via cfg["video"]["segmentation_model"] == "modnet"
+SEG_MODNET_PATH = None
+for p in [
+    USER_MODEL_DIR / "modnet_portrait_matting.xml",
+    REPO_MODEL_DIR / "modnet_portrait_matting.xml",
+    OPT_MODEL_DIR / "modnet_portrait_matting.xml",
+    MODEL_DIR / "modnet_portrait_matting.xml",
+]:
+    if p.exists():
+        SEG_MODNET_PATH = p
+        break
+if SEG_MODNET_PATH is None:
+    SEG_MODNET_PATH = MODEL_DIR / "modnet_portrait_matting.xml"
+
 SEG_CHAIR_PATH = None
 for p in [
     USER_MODEL_DIR / "chair_instance_segmenter.xml",
@@ -103,6 +118,7 @@ def load_config():
             "blur_strength": 35,
             "blur_mode": "standard",
             "mask_feather": 40,
+            "segmentation_model": "multiclass",
             "auto_standby": True,
             "standby_timeout": 3.0,
             "auto_framing": True,
@@ -1506,7 +1522,15 @@ def main():
     npu_device = "NPU" if "NPU" in devices else "CPU"
     logging.info(f"Targeting inference device: {npu_device} (Available: {devices})")
 
-    active_seg_path = SEG_MULTICLASS_PATH if SEG_MULTICLASS_PATH.exists() else SEG_MODEL_PATH
+    wants_modnet = (cfg.get("video", {}).get("segmentation_model", "multiclass") == "modnet")
+    if wants_modnet and SEG_MODNET_PATH.exists():
+        active_seg_path = SEG_MODNET_PATH
+    elif SEG_MULTICLASS_PATH.exists():
+        active_seg_path = SEG_MULTICLASS_PATH
+    else:
+        active_seg_path = SEG_MODEL_PATH
+    if wants_modnet and not SEG_MODNET_PATH.exists():
+        logging.warning(f"segmentation_model=modnet requested but {SEG_MODNET_PATH} not found. Falling back to {active_seg_path}.")
     if not active_seg_path.exists():
         logging.error(f"Model not found at {active_seg_path}")
         sys.exit(1)
@@ -1518,8 +1542,10 @@ def main():
     seg_inp_name = model.inputs[0].get_any_name()
     seg_out_name = model.outputs[0].get_any_name()
     seg_inp_shape = list(model.inputs[0].get_shape())
-    is_multiclass = (active_seg_path == SEG_MULTICLASS_PATH) or (len(seg_inp_shape) == 4 and seg_inp_shape[-1] == 3)
-    logging.info(f"NPU segmentation model compiled successfully! Type: {'Multiclass (6-class + Hand/Skin)' if is_multiclass else 'Legacy Landscape'}, In: {seg_inp_shape}")
+    is_modnet = (active_seg_path == SEG_MODNET_PATH)
+    is_multiclass = (not is_modnet) and ((active_seg_path == SEG_MULTICLASS_PATH) or (len(seg_inp_shape) == 4 and seg_inp_shape[-1] == 3))
+    seg_type_label = "MODNet Portrait Matting" if is_modnet else ("Multiclass (6-class + Hand/Skin)" if is_multiclass else "Legacy Landscape")
+    logging.info(f"NPU segmentation model compiled successfully! Type: {seg_type_label}, In: {seg_inp_shape}")
 
     # Load Neural Chair Segmentation Model (YOLACT Instance Segmenter - MIT License)
     chair_infer_req = None

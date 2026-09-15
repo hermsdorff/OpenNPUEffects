@@ -210,6 +210,29 @@ SOFTWARE.
 
 ---
 
+## 7. MODNet Portrait Matting (ZHKKKe / Intel OMZ)
+- **Files:** `video/modnet_portrait_matting.xml`, `video/modnet_portrait_matting.bin`
+- **Source:** [ZHKKKe/MODNet](https://github.com/ZHKKKe/MODNet) (paper: https://arxiv.org/abs/2011.11961), checkpoint mirrored by Intel at [Open Model Zoo - modnet-photographic-portrait-matting](https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/modnet-photographic-portrait-matting)
+- **Copyright:** Copyright (c) 2020 Zhanghan Ke
+- **License:** **Apache License, Version 2.0**
+- **Conversion notes:** PyTorch checkpoint (`modnet_photographic_portrait_matting.ckpt`, MobileNetV2 backbone) exported to ONNX via the official `onnx/modnet_onnx.py` script from the source repo, then converted to OpenVINO IR. Preprocessing (BGR->RGB channel reversal, mean=127.5, scale=127.5) is baked into the IR graph via OpenVINO's PrePostProcessor, so the model accepts a raw `[1, 512, 512, 3]` uint8 BGR frame directly (no manual normalization needed in Python). Output is a `[1, 1, 512, 512]` float32 alpha matte in the `[0, 1]` range.
+
+```text
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+---
+
 ## Full Text of the Apache License, Version 2.0
 
 ```text
