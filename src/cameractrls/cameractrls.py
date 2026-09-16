@@ -2342,6 +2342,10 @@ NPU_TR = {
         'name': 'Room De-Reverberation (De-Reverb)',
         'tooltip': 'Reduces the metallic echo of empty rooms and cold floors, bringing the voice closer to an acoustic studio.',
     },
+    'npu_standby_timeout': {
+        'name': 'Video Standby Timeout (s)',
+        'tooltip': 'Time with no app using the virtual camera before turning off the physical sensor.',
+    },
     'npu_audio_standby': {
         'name': 'Automatic Audio Standby (On-Demand)',
         'tooltip': "Releases the physical microphone when no application is consuming the NPU's virtual microphone.",
@@ -2981,6 +2985,17 @@ class IntelNPUCtrls:
                 default=True
             ),
             IntelNPUCtrl(
+                'npu_standby_timeout',
+                T('npu_standby_timeout', 'name', 'Tempo de Espera do Standby de Vídeo (s)'),
+                'integer',
+                T('npu_standby_timeout', 'tooltip', 'Tempo sem nenhum app usando a câmera virtual antes de desativar o sensor físico.'),
+                value=int(round(float(v_cfg.get("standby_timeout", 1.0)))),
+                default=1,
+                min=1,
+                max=30,
+                step=1
+            ),
+            IntelNPUCtrl(
                 'npu_ptz_park',
                 T('npu_ptz_park', 'name', 'Recolher Câmera PTZ em Standby'),
                 'boolean',
@@ -3044,8 +3059,8 @@ class IntelNPUCtrls:
                 T('npu_audio_standby_timeout', 'name', 'Tempo de Espera do Standby de Áudio (s)'),
                 'integer',
                 T('npu_audio_standby_timeout', 'tooltip', 'Tempo sem nenhum app usando o microfone virtual antes de liberar o microfone físico.'),
-                value=int(round(float(a_cfg.get("standby_timeout", 3.0)))),
-                default=3,
+                value=int(round(float(a_cfg.get("standby_timeout", 1.0)))),
+                default=1,
                 min=1,
                 max=30,
                 step=1
@@ -3354,6 +3369,11 @@ class IntelNPUCtrls:
             elif k == 'npu_standby':
                 ctrl.value = bool(v)
                 cfg["video"]["auto_standby"] = bool(v)
+                changed = True
+
+            elif k == 'npu_standby_timeout':
+                ctrl.value = int(v)
+                cfg["video"]["standby_timeout"] = float(v)
                 changed = True
 
             elif k == 'npu_ptz_park':

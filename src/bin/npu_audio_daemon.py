@@ -38,9 +38,28 @@ def handle_signal(sig, frame):
 signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
 
+def stop_process(p, timeout=0.4):
+    if p is None:
+        return
+    try:
+        if hasattr(p, "stdin") and p.stdin and not p.stdin.closed:
+            try:
+                p.stdin.close()
+            except Exception:
+                pass
+        p.terminate()
+        p.wait(timeout=timeout)
+    except Exception:
+        try:
+            p.kill()
+            p.wait(timeout=timeout)
+        except Exception:
+            pass
+
 def run_cmd(cmd):
     try:
-        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
+        env = dict(os.environ, LC_ALL="C")
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True, env=env)
         return res.stdout.strip()
     except Exception as e:
         logging.error(f"Command failed '{cmd}': {e}")
@@ -65,7 +84,7 @@ def load_config():
             "dereverb_enabled": True,
             "dereverb_strength": 40,
             "auto_standby": True,
-            "standby_timeout": 3.0
+            "standby_timeout": 1.0
         }
     }
     try:
@@ -145,13 +164,28 @@ def count_active_source_consumers(source_name):
     src_id = get_pactl_object_id("pactl list sources short", source_name)
     if src_id is None:
         return 0
+    try:
+        src_id_int = int(src_id)
+    except ValueError:
+        src_id_int = None
+
+    # 1. Metodo primario estruturado via JSON (imune a locale)
+    out_json = run_cmd("pactl --format=json list source-outputs")
+    if out_json:
+        try:
+            data = json.loads(out_json)
+            return sum(1 for item in data if item.get("source") in (src_id, src_id_int))
+        except Exception:
+            pass
+
+    # 2. Fallback de texto com suporte multi-idioma (English, Portugues, Espanhol)
     out = run_cmd("pactl list source-outputs")
     consumer_count = 0
     for raw_line in out.splitlines():
-        line = raw_line.strip()
-        if line.startswith("Source:"):
+        line = raw_line.strip().lower()
+        if line.startswith("source:") or line.startswith("fonte:") or line.startswith("fuente:"):
             current_source_id = line.split(":", 1)[1].strip()
-            if current_source_id == src_id:
+            if current_source_id == str(src_id):
                 consumer_count += 1
     return consumer_count
 
@@ -370,6 +404,7 @@ def main():
 
     logging.info(f"Starting real-time audio filter stream via PipeWire (chunk={chunk_size}, rate={rate}Hz)...")
     play_node_name = f"npu_mic_feed_{os.getpid()}"
+    rec_node_name = f"npu_mic_capture_{os.getpid()}"
     out_cmd = ["pw-play", "--target", "0", "-P", f"node.name={play_node_name}", "--format", "f32", "--rate", str(rate), "--channels", "1", "-"]
 
     def spawn_out_proc():
@@ -385,6 +420,7 @@ def main():
         cmd = [
             "pw-record",
             "--target", target_mic,
+            "-P", f"node.name={rec_node_name}",
             "-P", "node.dont-reconnect=true",
             "--format", "f32",
             "--rate", str(rate),
@@ -423,40 +459,43 @@ def main():
                 best_mic = select_hardware_microphone(cfg)
                 if best_mic and best_mic != hw_mic:
                     logging.info(f"Preferred physical microphone '{best_mic}' detected (was '{hw_mic}'). Switching...")
-                    if in_proc:
-                        try:
-                            in_proc.terminate()
-                            in_proc.wait(timeout=0.3)
-                        except Exception:
-                            pass
+                    stop_process(in_proc)
                     hw_mic = best_mic
-                    in_proc = spawn_in_proc(hw_mic)
+                    if not in_standby:
+                        in_proc = spawn_in_proc(hw_mic)
+                    else:
+                        in_proc = None
                     states = {n: np.zeros(inp_shapes[n], dtype=np.float32) for n in state_names}
+
+                # Maintain virtual microphone as default source (re-assert if stolen by hotplug)
+                cur_def = run_cmd("pactl get-default-source")
+                if cur_def and cur_def != source_name and not is_virtual_source(cur_def):
+                    original_default_source = cur_def
+                    run_cmd(f"pactl set-default-source {source_name}")
 
             # Standby automatico de audio (on-demand): libera o microfone fisico
             # quando nenhum app (Zoom/Teams/Meet/etc.) estiver consumindo o
             # microfone virtual 'npu_clearvoice' por mais que standby_timeout.
             if cfg.get("auto_standby", True):
-                if now - last_consumer_check > 0.5:
+                check_interval = 0.2 if in_standby else 0.25
+                if now - last_consumer_check > check_interval:
                     last_consumer_check = now
                     active_consumers = count_active_source_consumers(source_name)
                     if active_consumers > 0:
                         last_active_time = now
                         if in_standby:
-                            logging.info("Consumidor detectado no microfone virtual. Saindo do standby de audio...")
+                            logging.info(f"Consumidor detectado no microfone virtual ({active_consumers} ativo(s)). Saindo do standby de audio...")
                             in_standby = False
+                            if in_proc is None and hw_mic:
+                                in_proc = spawn_in_proc(hw_mic)
+                                states = {n: np.zeros(inp_shapes[n], dtype=np.float32) for n in state_names}
 
-                    standby_timeout = float(cfg.get("standby_timeout", 3.0))
+                    standby_timeout = float(cfg.get("standby_timeout", 1.0))
                     if active_consumers == 0 and not in_standby and (now - last_active_time) > standby_timeout:
                         logging.info(f"Nenhum consumidor do microfone virtual ha {standby_timeout:.1f}s. Entrando em standby de audio (liberando microfone fisico)...")
                         in_standby = True
-                        if in_proc:
-                            try:
-                                in_proc.terminate()
-                                in_proc.wait(timeout=0.3)
-                            except Exception:
-                                pass
-                            in_proc = None
+                        stop_process(in_proc)
+                        in_proc = None
 
                 if in_standby:
                     # Mantem o stream vivo com silencio limpo, sem tocar no microfone fisico
@@ -465,20 +504,17 @@ def main():
                         out_proc.stdin.write(silence_chunk)
                         out_proc.stdin.flush()
                     except (BrokenPipeError, OSError):
+                        stop_process(out_proc)
                         out_proc = spawn_out_proc()
                     continue
 
-            # Safeguard: prevent illegal loopback (pw-record connected to npu_clearvoice)
+            # Safeguard: prevent illegal loopback (our capture node connected to npu_clearvoice)
             if in_proc and (now - last_loopback_check > 3.0):
                 last_loopback_check = now
-                loop_check = run_cmd("pw-link -l | grep -A 1 '^pw-record:input' | grep npu_clearvoice || true")
+                loop_check = run_cmd(f"pw-link -l | grep -A 1 '^{rec_node_name}:input' | grep npu_clearvoice || true")
                 if loop_check:
-                    logging.warning("Detected illegal loopback routing (pw-record connected to npu_clearvoice). Resetting capture...")
-                    try:
-                        in_proc.terminate()
-                        in_proc.wait(timeout=0.3)
-                    except Exception:
-                        pass
+                    logging.warning(f"Detected illegal loopback routing ({rec_node_name} connected to npu_clearvoice). Resetting capture...")
+                    stop_process(in_proc)
                     in_proc = None
 
             # Handle case where physical microphone is temporarily unavailable (e.g. USB adapter restarted)
@@ -495,6 +531,7 @@ def main():
                         out_proc.stdin.write(silence_chunk)
                         out_proc.stdin.flush()
                     except (BrokenPipeError, OSError):
+                        stop_process(out_proc)
                         out_proc = spawn_out_proc()
                     continue
 
@@ -506,11 +543,7 @@ def main():
             # Handle physical microphone disconnect (read returns empty or short)
             if not raw or len(raw) < chunk_size * 4:
                 logging.warning(f"Physical microphone '{hw_mic}' disconnected or stream ended. Waiting for reconnection...")
-                try:
-                    in_proc.terminate()
-                    in_proc.wait(timeout=0.3)
-                except Exception:
-                    pass
+                stop_process(in_proc)
                 in_proc = None
                 continue
 
@@ -543,21 +576,14 @@ def main():
                 if not running:
                     break
                 logging.warning("PipeWire playback process pipe closed, restarting...")
+                stop_process(out_proc)
                 out_proc = spawn_out_proc()
 
     except Exception as e:
         logging.error(f"Error in audio streaming loop: {e}")
     finally:
-        if in_proc:
-            try:
-                in_proc.terminate()
-            except Exception:
-                pass
-        try:
-            out_proc.stdin.close()
-            out_proc.terminate()
-        except Exception:
-            pass
+        stop_process(in_proc)
+        stop_process(out_proc)
         cleanup()
         logging.info("Audio daemon stopped.")
 

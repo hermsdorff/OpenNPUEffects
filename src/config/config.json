@@ -11,7 +11,7 @@
     "mask_feather": 42,
     "segmentation_model": "multiclass",
     "auto_standby": true,
-    "standby_timeout": 3.0,
+    "standby_timeout": 1.0,
     "auto_framing": true,
     "framing_smoothness": 0.04,
     "framing_smoothness_int": 4,
@@ -84,6 +84,6 @@
     "dereverb_enabled": true,
     "dereverb_strength": 40,
     "auto_standby": true,
-    "standby_timeout": 3.0
+    "standby_timeout": 1.0
   }
 }

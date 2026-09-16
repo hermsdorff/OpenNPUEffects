@@ -122,7 +122,7 @@ def load_config():
             "mask_feather": 40,
             "segmentation_model": "multiclass",
             "auto_standby": True,
-            "standby_timeout": 3.0,
+            "standby_timeout": 1.0,
             "auto_framing": True,
             "framing_mode": "single",
             "framing_smoothness": 0.04,
@@ -1719,10 +1719,11 @@ def main():
 
             # On-Demand Auto-Standby: Check if any application is reading from /dev/video72
             auto_standby = cfg.get("auto_standby", True)
-            standby_timeout = float(cfg.get("standby_timeout", 3.0))
+            standby_timeout = float(cfg.get("standby_timeout", 1.0))
 
             if auto_standby:
-                if now - last_consumer_check > 0.5:
+                check_interval = 0.2 if in_standby else 0.25
+                if now - last_consumer_check > check_interval:
                     last_consumer_check = now
                     consumer_cnt = count_active_consumers(out_device)
                     if consumer_cnt > 0:
