@@ -14,10 +14,9 @@ The source code of the Open NPU Effects project is distributed under the **MIT L
 | **YuNet Face Detector** | `video/face_detection_yunet_2023mar.onnx` | Fast face detection for Auto-Framing | [Shiqi Yu / OpenCV Zoo](https://github.com/opencv/opencv_zoo) | [Apache 2.0](#2-yunet-face-detector-opencv-zoo) |
 | **MediaPipe Selfie Segmentation** | `video/selfie_segmentation_static.*` | Static person segmentation (144x256 FP16 NPU) | [Google LLC / MediaPipe](https://github.com/google/mediapipe) | [Apache 2.0](#3-mediapipe-selfie-segmentation-google-llc) |
 | **MediaPipe Selfie Multiclass** | `video/selfie_multiclass.*` | Multiclass segmentation (skin, hair, clothes, body) | [Google LLC / MediaPipe](https://github.com/google/mediapipe) | [Apache 2.0](#4-mediapipe-selfie-multiclass-google-llc) |
-| **MobileNetV3 LRASPP** | `video/chair_segmenter.*` | 21-class semantic segmentation (chair fallback) | [PyTorch / TorchVision Contributors](https://github.com/pytorch/vision) | [BSD 3-Clause](#5-mobilenetv3-lraspp-segmenter-pytorch--torchvision) |
-| **YOLACT ResNet-50 FPN** | `video/chair_instance_segmenter.*` | Instance segmentation for precise chair retention | [Daniel Bolya et al. (UC Davis)](https://github.com/dbolya/yolact) | [MIT](#6-yolact-resnet-50-fpn-instance-segmenter-uc-davis--intel-omz) |
-| **BiSeNet ResNet-18 Face Parser** | `video/face_parsing_bisenet.*` | Semantic face parsing & eyeglass preservation | [zllrunning](https://github.com/zllrunning/face-parsing.PyTorch) / [LiteRT Community](https://huggingface.co/litert-community/BiSeNet-Face-Parsing-LiteRT) | [MIT](#7-bisenet-resnet-18-face-parser-celebamask-hq) |
-| **MODNet Portrait Matting** | `video/modnet_portrait_matting.*` | Optional high-fidelity person matting assist (fixes dark-clothing gaps in Selfie Multiclass) | [ZHKKKe (Zhanghan Ke) et al.](https://github.com/ZHKKKe/MODNet) / [Intel Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/modnet-photographic-portrait-matting) | [Apache 2.0](#8-modnet-portrait-matting-zhkkke--intel-omz) |
+| **YOLACT ResNet-50 FPN** | `video/chair_instance_segmenter.*` | Instance segmentation for precise chair retention | [Daniel Bolya et al. (UC Davis)](https://github.com/dbolya/yolact) | [MIT](#5-yolact-resnet-50-fpn-instance-segmenter-uc-davis--intel-omz) |
+| **BiSeNet ResNet-18 Face Parser** | `video/face_parsing_bisenet.*` | Semantic face parsing & eyeglass preservation | [zllrunning](https://github.com/zllrunning/face-parsing.PyTorch) / [LiteRT Community](https://huggingface.co/litert-community/BiSeNet-Face-Parsing-LiteRT) | [MIT](#6-bisenet-resnet-18-face-parser-celebamask-hq) |
+| **MODNet Portrait Matting** | `video/modnet_portrait_matting.*` | Optional high-fidelity person matting assist (fixes dark-clothing gaps in Selfie Multiclass) | [ZHKKKe (Zhanghan Ke) et al.](https://github.com/ZHKKKe/MODNet) / [Intel Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/modnet-photographic-portrait-matting) | [Apache 2.0](#7-modnet-portrait-matting-zhkkke--intel-omz) |
 
 ---
 
@@ -110,42 +109,7 @@ limitations under the License.
 
 ---
 
-## 5. MobileNetV3 LRASPP Segmenter (PyTorch / TorchVision)
-- **Files:** `video/chair_segmenter.xml`, `video/chair_segmenter.bin`
-- **Source:** [PyTorch TorchVision](https://github.com/pytorch/vision)
-- **Copyright:** Copyright (c) Soumith Chintala 2016, PyTorch and TorchVision Contributors
-- **License:** **BSD 3-Clause License**
-
-```text
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-
-* Neither the name of the copyright holder nor the names of its
-  contributors may be used to endorse or promote products derived from
-  this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-```
-
----
-
-## 6. YOLACT ResNet-50 FPN Instance Segmenter (UC Davis / Intel OMZ)
+## 5. YOLACT ResNet-50 FPN Instance Segmenter (UC Davis / Intel OMZ)
 - **Files:** `video/chair_instance_segmenter.xml`, `video/chair_instance_segmenter.bin`
 - **Source:** [dbolya/yolact](https://github.com/dbolya/yolact) / [Intel Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/yolact-resnet50-fpn-pytorch)
 - **Authors:** Daniel Bolya, Chong Zhou, Fanyi Xiao, Yong Jae Lee (University of California, Davis)
@@ -178,7 +142,7 @@ SOFTWARE.
 
 ---
 
-## 7. BiSeNet ResNet-18 Face Parser (CelebAMask-HQ)
+## 6. BiSeNet ResNet-18 Face Parser (CelebAMask-HQ)
 - **Files:** `video/face_parsing_bisenet.xml`, `video/face_parsing_bisenet.bin`
 - **Source:** [zllrunning/face-parsing.PyTorch](https://github.com/zllrunning/face-parsing.PyTorch) / [LiteRT Community BiSeNet-Face-Parsing-LiteRT](https://huggingface.co/litert-community/BiSeNet-Face-Parsing-LiteRT)
 - **Authors:** zllrunning (PyTorch implementation & CelebAMask-HQ training) / LiteRT Community (on-device conversion)
@@ -211,7 +175,7 @@ SOFTWARE.
 
 ---
 
-## 8. MODNet Portrait Matting (ZHKKKe / Intel OMZ)
+## 7. MODNet Portrait Matting (ZHKKKe / Intel OMZ)
 - **Files:** `video/modnet_portrait_matting.xml`, `video/modnet_portrait_matting.bin`
 - **Source:** [ZHKKKe/MODNet](https://github.com/ZHKKKe/MODNet) (paper: https://arxiv.org/abs/2011.11961), checkpoint mirrored by Intel at [Open Model Zoo - modnet-photographic-portrait-matting](https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/modnet-photographic-portrait-matting)
 - **Copyright:** Copyright (c) 2020 Zhanghan Ke

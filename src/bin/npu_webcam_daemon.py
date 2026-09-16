@@ -48,13 +48,15 @@ for p in [
 if SEG_MODNET_PATH is None:
     SEG_MODNET_PATH = MODEL_DIR / "modnet_portrait_matting.xml"
 
+# Nota: o antigo fallback "chair_segmenter.xml" (MobileNetV3 LRASPP) foi removido
+# do repositorio - o YOLACT chair_instance_segmenter.xml sempre tinha prioridade
+# e era o unico modelo de cadeira efetivamente carregado em producao.
 SEG_CHAIR_PATH = None
 for p in [
     USER_MODEL_DIR / "chair_instance_segmenter.xml",
     REPO_MODEL_DIR / "chair_instance_segmenter.xml",
     OPT_MODEL_DIR / "chair_instance_segmenter.xml",
-    MODEL_DIR / "chair_instance_segmenter.xml",
-    MODEL_DIR / "chair_segmenter.xml"
+    MODEL_DIR / "chair_instance_segmenter.xml"
 ]:
     if p.exists():
         SEG_CHAIR_PATH = p
@@ -1541,12 +1543,12 @@ def main():
     seg_type_label = "Multiclass (6-class + Hand/Skin)" if is_multiclass else "Legacy Landscape"
     logging.info(f"NPU segmentation model compiled successfully! Type: {seg_type_label}, In: {seg_inp_shape}")
 
-    # MODNet Portrait Matting (Apache 2.0) nunca é usado como modelo PRIMÁRIO - ele não tem os
-    # canais de mão/pele/roupa necessários para detecção de gestos, retenção de objetos na mão
-    # e retenção de cadeira. Em vez disso, é carregado abaixo como modelo SECUNDÁRIO opcional
-    # ("assist") e combinado com a máscara do Multiclass para corrigir um ponto fraco conhecido
-    # do Multiclass: roupas escuras/pretas lisas às vezes são classificadas como fundo mesmo no
-    # meio da silhueta, não só nas bordas (confirmado com foto real de teste).
+    # MODNet Portrait Matting (Apache 2.0) is never used as the PRIMARY model - it lacks the
+    # hand/skin/clothes channels needed for gesture detection, hand-held object retention and
+    # chair retention. Instead it is loaded below as an OPTIONAL SECONDARY "assist" model and
+    # blended into the multiclass mask to fix a known multiclass weak spot: plain dark/black
+    # clothing is sometimes misclassified as background well inside the silhouette, not just
+    # at the edges (confirmed with a real test photo).
     modnet_assist_enabled = (
         cfg.get("video", {}).get("segmentation_model", "multiclass") == "modnet"
         or cfg.get("segmentation_model", "multiclass") == "modnet"
@@ -1616,7 +1618,7 @@ def main():
         except Exception as e2:
             logging.error(f"Failed to load BiSeNet Face Parsing model: {e2}")
 
-    # MODNet Portrait Matting - modelo secundário opcional "assist" (ver comentário acima).
+    # MODNet Portrait Matting - optional secondary "assist" model (see comment above).
     modnet_infer_req = None
     modnet_inp_name = None
     modnet_out_name = None
@@ -1665,10 +1667,15 @@ def main():
         gesture_latched = False
         gesture_cooldown_until = 0.0
         prev_mask = None
-        chair_frame_counter = 0
+        # Contador compartilhado de rotacao entre os modelos "assist" pesados da NPU
+        # (cadeira YOLACT, oculos BiSeNet, MODNet). Cada um so faz inferencia nova em
+        # 1 a cada 3 quadros, em fases diferentes - garante que nunca dois modelos
+        # pesados disputem a NPU no mesmo quadro. Nos outros 2 quadros a mascara em
+        # cache e reaproveitada.
+        heavy_assist_phase = 0
         cached_chair_mask = None
-        glasses_frame_counter = 0
         cached_glasses_mask = None
+        cached_modnet_mask = None
         morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
         # Pre-warm gesture emoji cache into memory
@@ -1986,7 +1993,7 @@ def main():
                     # 2.1 Neural Chair & Headrest Retention (Modelo de Segmentacao de Instancias YOLACT na NPU)
                     if cfg.get("chair_retention_enabled", True):
                         chair_str = int(cfg.get("chair_retention_strength", 50))
-                        should_infer_chair = (chair_frame_counter % 2 == 0) or (cached_chair_mask is None)
+                        should_infer_chair = (heavy_assist_phase == 0) or (cached_chair_mask is None)
                         p_person, cached_chair_mask = apply_neural_chair_retention(
                             p_person, framed,
                             chair_infer_req=chair_infer_req,
@@ -1997,7 +2004,6 @@ def main():
                             inp_w=chair_inp_w,
                             inp_h=chair_inp_h
                         )
-                        chair_frame_counter += 1
                     else:
                         cached_chair_mask = None
 
@@ -2051,29 +2057,32 @@ def main():
                         no_hand_count = 0
                         gesture_latched = False
 
-                    # Optional MODNet Assist Pass (modo híbrido, Apache 2.0):
-                    # Validado com foto real que o Multiclass sozinho frequentemente classifica
-                    # roupas escuras/pretas lisas como fundo mesmo no meio da silhueta (não só
-                    # nas bordas). Pegar o MÁXIMO pixel a pixel entre os dois modelos resolve
-                    # isso - quem estiver mais confiante de que é "pessoa" vence - sem nunca
-                    # remover regiões já corretamente detectadas pelo Multiclass, ou seja, é uma
-                    # combinação segura e estritamente aditiva.
+                    # Optional MODNet Assist Pass (hybrid mode, Apache 2.0):
+                    # Validated on a real test photo that multiclass alone frequently
+                    # misclassifies plain dark/black clothing as background well inside the
+                    # silhouette (not just at the edges). Taking the pixel-wise MAX of both
+                    # models' person confidence fixes that - whichever model is more sure
+                    # about a pixel wins - while never removing correctly-detected multiclass
+                    # regions, so this is a safe, strictly additive combination.
                     if modnet_infer_req is not None:
-                        fh, fw = framed.shape[:2]
-                        lb_scale = min(512.0 / fw, 512.0 / fh)
-                        lb_w, lb_h = max(1, int(round(fw * lb_scale))), max(1, int(round(fh * lb_scale)))
-                        lb_resized = cv2.resize(framed, (lb_w, lb_h), interpolation=cv2.INTER_AREA)
-                        lb_pad_x, lb_pad_y = (512 - lb_w) // 2, (512 - lb_h) // 2
-                        modnet_canvas = np.zeros((512, 512, 3), dtype=np.uint8)
-                        modnet_canvas[lb_pad_y:lb_pad_y + lb_h, lb_pad_x:lb_pad_x + lb_w] = lb_resized
-                        modnet_blob = np.expand_dims(modnet_canvas, axis=0)
+                        should_infer_modnet = (heavy_assist_phase == 2) or (cached_modnet_mask is None)
+                        if should_infer_modnet:
+                            fh, fw = framed.shape[:2]
+                            lb_scale = min(512.0 / fw, 512.0 / fh)
+                            lb_w, lb_h = max(1, int(round(fw * lb_scale))), max(1, int(round(fh * lb_scale)))
+                            lb_resized = cv2.resize(framed, (lb_w, lb_h), interpolation=cv2.INTER_AREA)
+                            lb_pad_x, lb_pad_y = (512 - lb_w) // 2, (512 - lb_h) // 2
+                            modnet_canvas = np.zeros((512, 512, 3), dtype=np.uint8)
+                            modnet_canvas[lb_pad_y:lb_pad_y + lb_h, lb_pad_x:lb_pad_x + lb_w] = lb_resized
+                            modnet_blob = np.expand_dims(modnet_canvas, axis=0)
 
-                        modnet_infer_req.infer({modnet_inp_name: modnet_blob})
-                        modnet_alpha = modnet_infer_req.get_tensor(modnet_out_name).data[0, 0]
-                        modnet_alpha_cropped = modnet_alpha[lb_pad_y:lb_pad_y + lb_h, lb_pad_x:lb_pad_x + lb_w]
-                        modnet_256 = cv2.resize(modnet_alpha_cropped, (256, 256), interpolation=cv2.INTER_LINEAR)
+                            modnet_infer_req.infer({modnet_inp_name: modnet_blob})
+                            modnet_alpha = modnet_infer_req.get_tensor(modnet_out_name).data[0, 0]
+                            modnet_alpha_cropped = modnet_alpha[lb_pad_y:lb_pad_y + lb_h, lb_pad_x:lb_pad_x + lb_w]
+                            cached_modnet_mask = cv2.resize(modnet_alpha_cropped, (256, 256), interpolation=cv2.INTER_LINEAR)
 
-                        p_person = np.maximum(p_person, modnet_256)
+                        if cached_modnet_mask is not None:
+                            p_person = np.maximum(p_person, cached_modnet_mask)
                 else:
                     # Legacy 144x256 model fallback
                     small = cv2.resize(framed, (256, 144))
@@ -2084,7 +2093,7 @@ def main():
                 # 2.2 Neural Eyeglasses & Frame Retention (Modelo BiSeNet Face Parsing na NPU - MIT License)
                 preserve_glasses = cfg.get("preserve_glasses", cfg.get("glasses_protection", True))
                 if preserve_glasses and face_info.get("has_face") and glasses_infer_req is not None:
-                    should_infer_glasses = (glasses_frame_counter % 2 == 1) or (cached_glasses_mask is None)
+                    should_infer_glasses = (heavy_assist_phase == 1) or (cached_glasses_mask is None)
                     cached_glasses_mask = apply_neural_glasses_retention(
                         framed, face_info,
                         glasses_infer_req=glasses_infer_req,
@@ -2095,12 +2104,15 @@ def main():
                         inp_w=glasses_inp_w,
                         inp_h=glasses_inp_h
                     )
-                    glasses_frame_counter += 1
                     if cached_glasses_mask is not None:
                         g_low = cv2.resize(cached_glasses_mask, (p_person.shape[1], p_person.shape[0]), interpolation=cv2.INTER_LINEAR)
                         p_person = np.maximum(p_person, g_low)
                 else:
                     cached_glasses_mask = None
+
+                # Avanca a fase da rotacao compartilhada (cadeira/oculos/MODNet) uma
+                # unica vez por quadro, depois que os tres ja leram o mesmo valor acima.
+                heavy_assist_phase = (heavy_assist_phase + 1) % 3
 
                 # Motion-Adaptive Temporal Filtering:
                 # Kills pixel jitter on static areas, but responds promptly to arm/hand motion
@@ -2252,6 +2264,7 @@ def main():
                 prev_mask = None
                 cached_glasses_mask = None
                 cached_chair_mask = None
+                cached_modnet_mask = None
                 output_frame = processed_fg
 
                 # Post-Processing: Cinematic Color Grading & Artistic Filters even without blur
