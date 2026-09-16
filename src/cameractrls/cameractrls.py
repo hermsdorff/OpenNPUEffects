@@ -2354,6 +2354,10 @@ NPU_TR = {
         'name': 'Audio Standby Timeout (s)',
         'tooltip': 'Time with no app using the virtual microphone before releasing the physical microphone.',
     },
+    'npu_modnet_assist': {
+        'name': 'Hair & Portrait Refinement (MODNet AI)',
+        'tooltip': 'Uses MODNet neural model on NPU/GPU to precisely segment hair strands and head contour.',
+    },
 }
 
 def npu_translate(lang, text_id, field, pt_text, menu_id=None):
@@ -2680,6 +2684,14 @@ class IntelNPUCtrls:
                 default=50,
                 min=10,
                 max=100
+            ),
+            IntelNPUCtrl(
+                'npu_modnet_assist',
+                T('npu_modnet_assist', 'name', 'Refinamento de Cabelo (MODNet IA)'),
+                'boolean',
+                T('npu_modnet_assist', 'tooltip', 'Ativa o modelo neural MODNet na NPU/GPU para recortar fios finos de cabelo e contorno da cabeça com alta precisão.'),
+                value=bool(v_cfg.get("modnet_assist_enabled", v_cfg.get("segmentation_model", "multiclass") == "modnet")),
+                default=False
             ),
             IntelNPUCtrl(
                 'npu_artistic_filter',
@@ -3196,6 +3208,11 @@ class IntelNPUCtrls:
             elif k == 'npu_chair_strength':
                 ctrl.value = int(v)
                 cfg["video"]["chair_retention_strength"] = int(v)
+                changed = True
+
+            elif k == 'npu_modnet_assist':
+                ctrl.value = bool(v)
+                cfg["video"]["modnet_assist_enabled"] = bool(v)
                 changed = True
 
             elif k == 'npu_artistic_filter':
@@ -4528,6 +4545,7 @@ class CameraCtrls:
                         'npu_preserve_glasses',
                         'npu_chair_retention',
                         'npu_chair_strength',
+                        'npu_modnet_assist',
                         'npu_parallax',
                         'npu_parallax_strength',
                     ])

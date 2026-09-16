@@ -161,6 +161,7 @@ def load_config():
             "privacy_image": "",
             "preserve_glasses": True,
             "glasses_protection": True,
+            "modnet_assist_enabled": False,
             "guided_filter_guide_size": [640, 360],
             "guided_filter_radius": 5,
             "guided_filter_eps": 0.001,
@@ -1564,6 +1565,8 @@ def main():
     modnet_assist_enabled = (
         cfg.get("video", {}).get("segmentation_model", "multiclass") == "modnet"
         or cfg.get("segmentation_model", "multiclass") == "modnet"
+        or cfg.get("video", {}).get("modnet_assist_enabled", False)
+        or cfg.get("modnet_assist_enabled", False)
     )
 
     # Load Neural Chair Segmentation Model (YOLACT Instance Segmenter - MIT License)
@@ -1634,7 +1637,7 @@ def main():
     modnet_infer_req = None
     modnet_inp_name = None
     modnet_out_name = None
-    if modnet_assist_enabled and SEG_MODNET_PATH.exists():
+    if SEG_MODNET_PATH and SEG_MODNET_PATH.exists():
         try:
             logging.info(f"Loading MODNet assist model {SEG_MODNET_PATH}...")
             modnet_model = core.read_model(str(SEG_MODNET_PATH))
@@ -1645,8 +1648,6 @@ def main():
             logging.info(f"MODNet assist model compiled successfully on {inference_device}!")
         except Exception as e:
             logging.warning(f"Could not compile MODNet assist model: {e}. Continuing without it.")
-    elif modnet_assist_enabled:
-        logging.warning(f"segmentation_model=modnet requested but {SEG_MODNET_PATH} not found. Continuing with multiclass only.")
 
     last_bg_path = ""
     cached_bg = None
@@ -1916,7 +1917,7 @@ def main():
                     # Boost human foreground components: body-skin and clothes (arms, sleeves, torso)
                     body_skin = probs[:, :, 2]
                     clothes = probs[:, :, 4]
-                    human_body = np.maximum(body_skin * 1.45, clothes * 1.40)
+                    human_body = np.maximum(body_skin * 1.25, clothes * 1.35)
                     p_person = np.maximum(p_person, np.clip(human_body, 0.0, 1.0))
 
                     # Anatomical Torso Core Boost:
@@ -1946,12 +1947,14 @@ def main():
                             if len(torso_signal) > 0 and np.mean(torso_signal) > 0.15:
                                 p_person[torso_mask] = np.maximum(p_person[torso_mask], 0.92)
 
-                    # Morphological vertical closing to seal cloth folds, buttons, creases and arm-torso gaps
-                    torso_close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 21))
+                    # Compact torso closing: only seal tiny cloth folds within the central torso
+                    # Avoid large kernels that bridge the arm to the head, neck or outer gaps!
+                    torso_close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
                     p_closed = cv2.morphologyEx(p_person, cv2.MORPH_CLOSE, torso_close_k)
                     p_person = np.maximum(p_person, p_closed)
 
-                    # Solidify interior holes inside the silhouette (flood-fill background from corners)
+                    # Solidify interior dropouts (e.g. dark shirt buttons, creases) without filling real
+                    # background cavities such as the triangular opening when touching the head or putting arms on hips!
                     p_bin = (p_person > 0.25).astype(np.uint8)
                     if face_info.get("has_face"):
                         b_x1 = max(0, cx_sb - int(fw_sb * 1.4))
@@ -1962,8 +1965,21 @@ def main():
                     f_h, f_w = flood_padded.shape
                     flood_mask = np.zeros((f_h + 2, f_w + 2), np.uint8)
                     cv2.floodFill(flood_padded, flood_mask, (0, 0), 255)
-                    internal_holes = ((flood_padded[1:-1, 1:-1] == 0) & (p_bin == 0)).astype(np.float32)
-                    p_person = np.maximum(p_person, internal_holes * 0.98)
+                    raw_holes = ((flood_padded[1:-1, 1:-1] == 0) & (p_bin == 0)).astype(np.uint8)
+
+                    if np.any(raw_holes):
+                        num_h, h_labels, h_stats, _ = cv2.connectedComponentsWithStats(raw_holes, connectivity=8)
+                        valid_fill = np.zeros_like(p_person)
+                        for h_i in range(1, num_h):
+                            h_area = h_stats[h_i, cv2.CC_STAT_AREA]
+                            # Anatomical cavities (arm-head triangle, arm-torso loop) are large (> 35 pixels).
+                            # True shirt dropouts or dark buttons are tiny (<= 30 pixels).
+                            # Also protect genuine background: if the model is confident in background, do not fill!
+                            if h_area <= 35:
+                                comp_mask = (h_labels == h_i)
+                                if np.mean(probs[comp_mask, 0]) < 0.60:
+                                    valid_fill[comp_mask] = 0.95
+                        p_person = np.maximum(p_person, valid_fill)
 
                     # 1. Hand isolation (excluding face and strictly anatomical throat)
                     hand_skin = body_skin.copy()
@@ -1990,18 +2006,20 @@ def main():
                     has_hands = bool(np.max(hand_skin) > 0.20)
 
                     # 2. Handheld Object Retention (Preservação de Objetos Segurados na Mão)
+                    # Retém objetos segurados (caneca, celular, caneta) dentro da palma/pegada sem
+                    # expandir uma bolha sólida para o fundo ou fundir os dedos ao gesticular.
                     if cfg.get("object_retention_enabled", True) and has_hands:
                         obj_str = int(cfg.get("object_retention_strength", 60))
-                        k_sz = max(7, int(15 * (obj_str / 50.0)))
-                        if k_sz % 2 == 0:
-                            k_sz += 1
-                        k_el = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_sz, k_sz))
-                        hand_bin = (hand_skin > 0.22).astype(np.uint8)
-                        interaction_zone = cv2.dilate(hand_bin, k_el, iterations=2)
-                        close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_sz * 2 + 1, k_sz * 2 + 1))
-                        closed_mask = cv2.morphologyEx(p_person, cv2.MORPH_CLOSE, close_k)
-                        retained_candidate = np.where(interaction_zone > 0, closed_mask, p_person)
-                        p_person = np.maximum(p_person, retained_candidate)
+                        if obj_str > 0:
+                            k_sz = max(3, min(9, int(5 * (obj_str / 50.0)) * 2 + 1))
+                            k_el = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_sz, k_sz))
+                            hand_bin = (hand_skin > 0.22).astype(np.uint8)
+                            # Expansão mínima (1 iteração pequena) para não criar bolha ao redor dos dedos
+                            interaction_zone = cv2.dilate(hand_bin, k_el, iterations=1)
+                            closed_mask = cv2.morphologyEx(p_person, cv2.MORPH_CLOSE, k_el)
+                            # Retém apenas onde o modelo não tiver alta certeza de ser fundo puro
+                            retained_candidate = np.where((interaction_zone > 0) & (probs[:, :, 0] < 0.65), closed_mask, p_person)
+                            p_person = np.maximum(p_person, retained_candidate)
 
                     # 2.1 Neural Chair & Headrest Retention (Modelo de Segmentacao de Instancias YOLACT na NPU)
                     if cfg.get("chair_retention_enabled", True):
@@ -2077,7 +2095,13 @@ def main():
                     # models' person confidence fixes that - whichever model is more sure
                     # about a pixel wins - while never removing correctly-detected multiclass
                     # regions, so this is a safe, strictly additive combination.
-                    if modnet_infer_req is not None:
+                    is_modnet_active = (
+                        cfg.get("video", {}).get("modnet_assist_enabled", False)
+                        or cfg.get("modnet_assist_enabled", False)
+                        or cfg.get("video", {}).get("segmentation_model", "multiclass") == "modnet"
+                        or cfg.get("segmentation_model", "multiclass") == "modnet"
+                    )
+                    if modnet_infer_req is not None and is_modnet_active:
                         should_infer_modnet = (heavy_assist_phase == 2) or (cached_modnet_mask is None)
                         if should_infer_modnet:
                             fh, fw = framed.shape[:2]
@@ -2096,6 +2120,8 @@ def main():
 
                         if cached_modnet_mask is not None:
                             p_person = np.maximum(p_person, cached_modnet_mask)
+                    else:
+                        cached_modnet_mask = None
                 else:
                     # Legacy 144x256 model fallback
                     small = cv2.resize(framed, (256, 144))
@@ -2137,13 +2163,25 @@ def main():
                     mask_256 = prev_mask * (1.0 - adaptive_alpha) + p_person * adaptive_alpha
                 prev_mask = mask_256
 
-                # Natural Smoothstep Feathering
+                is_bg_replacement = bool(bg_path and os.path.exists(bg_path))
+
+                # Adaptive Feathering Curve:
+                # Mode-aware: In virtual background mode, the transition must be tightly aligned
+                # with the true silhouette boundary (center=0.50) without expanding into the room.
+                # In blur mode, a softer curve is used for smooth bokeh rolloff.
                 feather_px = float(cfg.get("mask_feather", 40))
                 feather_px = max(10.0, min(80.0, feather_px))
-                half_width = 0.20 * (feather_px / 40.0)
-                center = 0.32
-                low = max(0.06, center - half_width)
-                high = min(0.92, center + half_width)
+
+                if is_bg_replacement:
+                    center = 0.50
+                    half_width = 0.12 * (feather_px / 40.0)
+                    low = max(0.18, center - half_width)
+                    high = min(0.82, center + half_width)
+                else:
+                    center = 0.35
+                    half_width = 0.18 * (feather_px / 40.0)
+                    low = max(0.08, center - half_width)
+                    high = min(0.92, center + half_width)
 
                 u = np.clip((mask_256 - low) / (high - low), 0.0, 1.0)
                 p_curved = u * u * (3.0 - 2.0 * u)
@@ -2162,6 +2200,15 @@ def main():
                 gf_eps = float(cfg.get("guided_filter_eps", 0.001))
                 gf_color = bool(cfg.get("guided_filter_color_guide", True))
 
+                if is_bg_replacement:
+                    # Tighter radius and smaller eps force guided filter to adhere strictly
+                    # to hair strands and finger contours without blurring out into background
+                    gf_r_eff = max(2, min(gf_r, 4))
+                    gf_eps_eff = max(1e-5, min(gf_eps, 0.0003))
+                else:
+                    gf_r_eff = gf_r
+                    gf_eps_eff = gf_eps
+
                 if gf_color:
                     guide_small = cv2.resize(framed, (gw, gh))
                 else:
@@ -2169,16 +2216,27 @@ def main():
 
                 mask_full = fast_guided_filter(
                     guide_small, p_curved,
-                    r=gf_r, eps=gf_eps,
+                    r=gf_r_eff, eps=gf_eps_eff,
                     out_shape=(out_w, out_h),
                     color_guide=gf_color
                 )
                 if cached_glasses_mask is not None:
                     mask_full = np.maximum(mask_full, cached_glasses_mask)
 
-                # Solid Core Protection:
-                # Ensure the body interior is 100% opaque without virtual background bleeding through clothes!
-                mask_full = np.where(mask_full > 0.80, 1.0, mask_full)
+                # Clean Matte Clamping:
+                # 1. White clamp: Ensure body/clothes interior is 100% solid (no virtual background bleeding through).
+                # 2. Black clamp: In background replacement, eliminate any residual ghost halo from the real room (bookshelf).
+                if is_bg_replacement:
+                    black_cut = 0.06
+                    white_cut = 0.78
+                    mask_full = np.where(mask_full < black_cut, 0.0, mask_full)
+                    mask_full = np.where(mask_full > white_cut, 1.0, mask_full)
+                    trans = (mask_full >= black_cut) & (mask_full <= white_cut)
+                    mask_full[trans] = (mask_full[trans] - black_cut) / (white_cut - black_cut)
+                else:
+                    mask_full = np.where(mask_full > 0.80, 1.0, mask_full)
+                    mask_full = np.where(mask_full < 0.02, 0.0, mask_full)
+
                 mask_3c = cv2.merge([mask_full, mask_full, mask_full])
 
                 # Rim Light (Contour / Hair Light)
