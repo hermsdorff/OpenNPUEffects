@@ -1517,12 +1517,24 @@ def main():
     out_h = int(cfg.get("height", 1080))
     target_fps = int(cfg.get("fps", 30))
 
-    # Initialize OpenVINO for NPU
-    logging.info("Initializing OpenVINO NPU Core...")
+    # Initialize OpenVINO and target the AUTO meta-device instead of a single hardcoded
+    # accelerator. AUTO transparently places/balances inference across whichever of the
+    # Intel Core Ultra's own accelerators are actually present, in priority order: NPU
+    # first (best performance-per-watt for the always-on primary segmentation model),
+    # integrated Arc GPU next (extra headroom for the heavier assist models so they stop
+    # fully time-sharing the NPU with each other and with the audio daemon's NPU model),
+    # and CPU last as the universal safety net. This is Intel-stack only: OpenVINO's GPU
+    # plugin does not support non-Intel (e.g. NVIDIA) GPUs, so a discrete NVIDIA card is
+    # never a candidate here. The explicit CPU try/except fallbacks below are kept as-is
+    # since they guard against per-model compile *failures*, which AUTO's own priority
+    # list does not catch.
+    logging.info("Initializing OpenVINO Core...")
     core = ov.Core()
     devices = core.available_devices
-    npu_device = "NPU" if "NPU" in devices else "CPU"
-    logging.info(f"Targeting inference device: {npu_device} (Available: {devices})")
+    _device_priority = [d for d in ("NPU", "GPU") if d in devices]
+    _device_priority.append("CPU")
+    inference_device = "AUTO:" + ",".join(_device_priority)
+    logging.info(f"Targeting inference device: {inference_device} (Available: {devices})")
 
     if SEG_MULTICLASS_PATH.exists():
         active_seg_path = SEG_MULTICLASS_PATH
@@ -1534,7 +1546,7 @@ def main():
 
     logging.info(f"Loading segmentation model {active_seg_path}...")
     model = core.read_model(str(active_seg_path))
-    compiled_model = core.compile_model(model, npu_device)
+    compiled_model = core.compile_model(model, inference_device)
     infer_request = compiled_model.create_infer_request()
     seg_inp_name = model.inputs[0].get_any_name()
     seg_out_name = model.outputs[0].get_any_name()
@@ -1563,16 +1575,16 @@ def main():
         try:
             logging.info(f"Loading neural chair model {SEG_CHAIR_PATH}...")
             chair_model = core.read_model(str(SEG_CHAIR_PATH))
-            chair_compiled = core.compile_model(chair_model, npu_device)
+            chair_compiled = core.compile_model(chair_model, inference_device)
             chair_infer_req = chair_compiled.create_infer_request()
             chair_inp_name = chair_model.inputs[0].get_any_name()
             c_shape = chair_model.inputs[0].shape
             if len(c_shape) >= 4:
                 chair_inp_h = int(c_shape[2])
                 chair_inp_w = int(c_shape[3])
-            logging.info(f"Neural chair model (YOLACT) compiled successfully on {npu_device} ({chair_inp_w}x{chair_inp_h})!")
+            logging.info(f"Neural chair model (YOLACT) compiled successfully on {inference_device} ({chair_inp_w}x{chair_inp_h})!")
         except Exception as e:
-            logging.warning(f"Could not compile chair model on {npu_device}: {e}. Retrying on CPU...")
+            logging.warning(f"Could not compile chair model on {inference_device}: {e}. Retrying on CPU...")
             try:
                 chair_compiled = core.compile_model(chair_model, "CPU")
                 chair_infer_req = chair_compiled.create_infer_request()
@@ -1595,7 +1607,7 @@ def main():
         try:
             glasses_model = core.read_model(str(SEG_GLASSES_PATH))
             try:
-                glasses_compiled = core.compile_model(glasses_model, npu_device)
+                glasses_compiled = core.compile_model(glasses_model, inference_device)
                 glasses_infer_req = glasses_compiled.create_infer_request()
                 glasses_inp_name = glasses_model.inputs[0].get_any_name()
                 glasses_out_name = glasses_model.outputs[0].get_any_name()
@@ -1603,9 +1615,9 @@ def main():
                 if len(g_shape) >= 4:
                     glasses_inp_h = int(g_shape[2])
                     glasses_inp_w = int(g_shape[3])
-                logging.info(f"BiSeNet Face Parsing model (CelebAMask-HQ) compiled successfully on {npu_device} ({glasses_inp_w}x{glasses_inp_h})!")
+                logging.info(f"BiSeNet Face Parsing model (CelebAMask-HQ) compiled successfully on {inference_device} ({glasses_inp_w}x{glasses_inp_h})!")
             except Exception as e:
-                logging.warning(f"Could not compile BiSeNet Face Parsing model on {npu_device}: {e}. Retrying on CPU...")
+                logging.warning(f"Could not compile BiSeNet Face Parsing model on {inference_device}: {e}. Retrying on CPU...")
                 glasses_compiled = core.compile_model(glasses_model, "CPU")
                 glasses_infer_req = glasses_compiled.create_infer_request()
                 glasses_inp_name = glasses_model.inputs[0].get_any_name()
@@ -1626,11 +1638,11 @@ def main():
         try:
             logging.info(f"Loading MODNet assist model {SEG_MODNET_PATH}...")
             modnet_model = core.read_model(str(SEG_MODNET_PATH))
-            modnet_compiled = core.compile_model(modnet_model, npu_device)
+            modnet_compiled = core.compile_model(modnet_model, inference_device)
             modnet_infer_req = modnet_compiled.create_infer_request()
             modnet_inp_name = modnet_model.inputs[0].get_any_name()
             modnet_out_name = modnet_model.outputs[0].get_any_name()
-            logging.info(f"MODNet assist model compiled successfully on {npu_device}!")
+            logging.info(f"MODNet assist model compiled successfully on {inference_device}!")
         except Exception as e:
             logging.warning(f"Could not compile MODNet assist model: {e}. Continuing without it.")
     elif modnet_assist_enabled:
