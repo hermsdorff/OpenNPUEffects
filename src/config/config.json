@@ -13,6 +13,7 @@
     "auto_standby": true,
     "standby_timeout": 1.0,
     "auto_framing": true,
+    "framing_zoom": 50,
     "framing_smoothness": 0.04,
     "framing_smoothness_int": 4,
     "framing_deadzone": 0.1,

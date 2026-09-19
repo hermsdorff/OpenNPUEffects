@@ -116,6 +116,7 @@ npu-ctl status
 npu-ctl blur on | off | 20          # Toggle / adjust background blur
 npu-ctl chair on | off | 60         # Toggle exact chair retention (YOLACT NPU)
 npu-ctl framing on | off            # Auto-framing face tracking
+npu-ctl framing zoom 50             # Framing zoom (0=wide open, 100=close-up)
 npu-ctl eye-contact on | off        # Teleprompter gaze correction
 npu-ctl bg "/path/to/image.jpg"     # Set virtual background
 npu-ctl rim-light on warm 50        # Studio rim light

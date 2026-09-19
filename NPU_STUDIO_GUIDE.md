@@ -186,6 +186,7 @@ npu-ctl color none|teal_orange|vintage|noir|vibrant [10-100]  # Cinematic LUTs
 npu-ctl rim on | off | 50 warm|white|cool # Studio rim/hair contour lighting
 npu-ctl glare on | off | 50     # Monitor blue glare reduction
 npu-ctl framing on | off        # Auto-framing face tracking
+npu-ctl framing zoom 50         # Auto-framing crop zoom (0=wide open, 100=tight close-up)
 npu-ctl framing-mode single|group # Single subject vs Group framing
 npu-ctl framing smooth 3        # Framing pan speed (1=slow cinematic, 10=fast)
 npu-ctl eyecontact off|natural|teleprompter # Eye contact correction

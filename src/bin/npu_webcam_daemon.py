@@ -64,6 +64,29 @@ for p in [
 if SEG_CHAIR_PATH is None:
     SEG_CHAIR_PATH = MODEL_DIR / "chair_instance_segmenter.xml"
 
+# Mapa de nomes -> indice de classe do YOLACT (treinado no COCO, 81 classes com fundo em 0).
+# O mesmo modelo chair_instance_segmenter.xml ja usado para cadeira/sofa calcula a
+# confianca de todas as 80 classes em toda inferencia - aproveitamos isso sem custo
+# adicional de NPU/GPU para reter outros objetos comuns (celular, caneca, etc.)
+# quando segurados na mao.
+COCO_CLASS_NAME_TO_INDEX = {
+    "person": 1, "bicycle": 2, "car": 3, "motorcycle": 4, "airplane": 5, "bus": 6, "train": 7,
+    "truck": 8, "boat": 9, "traffic light": 10, "fire hydrant": 11, "stop sign": 12,
+    "parking meter": 13, "bench": 14, "bird": 15, "cat": 16, "dog": 17, "horse": 18,
+    "sheep": 19, "cow": 20, "elephant": 21, "bear": 22, "zebra": 23, "giraffe": 24,
+    "backpack": 25, "umbrella": 26, "handbag": 27, "tie": 28, "suitcase": 29, "frisbee": 30,
+    "skis": 31, "snowboard": 32, "sports ball": 33, "kite": 34, "baseball bat": 35,
+    "baseball glove": 36, "skateboard": 37, "surfboard": 38, "tennis racket": 39,
+    "bottle": 40, "wine glass": 41, "cup": 42, "fork": 43, "knife": 44, "spoon": 45,
+    "bowl": 46, "banana": 47, "apple": 48, "sandwich": 49, "orange": 50, "broccoli": 51,
+    "carrot": 52, "hot dog": 53, "pizza": 54, "donut": 55, "cake": 56, "chair": 57,
+    "couch": 58, "potted plant": 59, "bed": 60, "dining table": 61, "toilet": 62, "tv": 63,
+    "laptop": 64, "mouse": 65, "remote": 66, "keyboard": 67, "cell phone": 68,
+    "microwave": 69, "oven": 70, "toaster": 71, "sink": 72, "refrigerator": 73, "book": 74,
+    "clock": 75, "vase": 76, "scissors": 77, "teddy bear": 78, "hair drier": 79,
+    "toothbrush": 80,
+}
+
 SEG_GLASSES_PATH = None
 for p in [
     USER_MODEL_DIR / "face_parsing_bisenet.xml",
@@ -125,6 +148,7 @@ def load_config():
             "standby_timeout": 1.0,
             "auto_framing": True,
             "framing_mode": "single",
+            "framing_zoom": 50,
             "framing_smoothness": 0.04,
             "framing_deadzone": 0.10,
             "smooth_enabled": True,
@@ -151,6 +175,8 @@ def load_config():
             "color_strength": 70,
             "object_retention_enabled": True,
             "object_retention_strength": 60,
+            "handheld_object_classes": ["cell phone", "cup", "book"],
+            "handheld_object_strength": 60,
             "gesture_detection_enabled": True,
             "gesture_action": "all",
             "privacy_fade_enabled": True,
@@ -219,7 +245,7 @@ def resolve_cam_index(device_str="auto"):
     return 48
 
 class AutoFramer:
-    def __init__(self, in_w, in_h, out_w, out_h, smoothness=0.04, deadzone=0.10, framing_mode="single"):
+    def __init__(self, in_w, in_h, out_w, out_h, smoothness=0.04, deadzone=0.10, framing_mode="single", zoom=50):
         self.in_w = in_w
         self.in_h = in_h
         self.out_w = out_w
@@ -228,6 +254,7 @@ class AutoFramer:
         self.deadzone = deadzone
         self.aspect_ratio = out_w / out_h
         self.framing_mode = framing_mode
+        self.framing_zoom = max(0, min(100, int(zoom)))
         
         self.curr_box = np.array([0.0, 0.0, float(in_w), float(in_h)], dtype=np.float32)
         self.target_box = np.copy(self.curr_box)
@@ -253,7 +280,14 @@ class AutoFramer:
             except Exception as e:
                 logging.error(f"Failed to initialize YuNet detector: {e}")
 
-    def update(self, frame, enabled=True, framing_mode="single"):
+    def update(self, frame, enabled=True, framing_mode="single", zoom=50, smoothness=None, deadzone=None):
+        if smoothness is not None:
+            self.smoothness = float(smoothness)
+        if deadzone is not None:
+            self.deadzone = float(deadzone)
+        zoom = max(0, min(100, int(zoom)))
+        zoom_changed = (abs(self.framing_zoom - zoom) >= 1)
+        self.framing_zoom = zoom
         self.framing_mode = framing_mode
         now = time.time()
         faces = None
@@ -328,6 +362,27 @@ class AutoFramer:
             scale_x = self.in_w / self.det_w
             scale_y = self.in_h / self.det_h
 
+            # Calibracao dinamica do zoom de enquadramento (0 = mais aberto / amplo, 50 = equilibrado padrao, 100 = mais fechado / close-up)
+            t = self.framing_zoom / 100.0
+            if t <= 0.5:
+                alpha = t / 0.5
+                face_mult = 5.5 * (1.0 - alpha) + 3.2 * alpha
+                min_crop_ratio = 1.00 * (1.0 - alpha) + 0.55 * alpha
+                headroom = 0.42 * (1.0 - alpha) + 0.40 * alpha
+
+                g_mult = 3.6 * (1.0 - alpha) + 2.2 * alpha
+                g_min_crop = 1.00 * (1.0 - alpha) + 0.58 * alpha
+                g_pad_w = 1.60 * (1.0 - alpha) + 1.35 * alpha
+            else:
+                beta = (t - 0.5) / 0.5
+                face_mult = 3.2 * (1.0 - beta) + 1.85 * beta
+                min_crop_ratio = 0.55 * (1.0 - beta) + 0.30 * beta
+                headroom = 0.40 * (1.0 - beta) + 0.36 * beta
+
+                g_mult = 2.2 * (1.0 - beta) + 1.50 * beta
+                g_min_crop = 0.58 * (1.0 - beta) + 0.35 * beta
+                g_pad_w = 1.35 * (1.0 - beta) + 1.15 * beta
+
             if self.framing_mode == "group" and len(faces) > 1:
                 # Group mode: calculate bounding box enclosing all detected people
                 all_boxes = []
@@ -356,11 +411,11 @@ class AutoFramer:
 
                 g_fx, g_fy, g_fw, g_fh = min_x, min_y, group_w, group_h
 
-                target_h = max(g_fh * 2.2, self.in_h * 0.58)
+                target_h = max(g_fh * g_mult, self.in_h * g_min_crop)
                 target_h = min(target_h, float(self.in_h))
                 target_w = target_h * self.aspect_ratio
-                if target_w < (g_fw * 1.35):
-                    target_w = min(float(self.in_w), g_fw * 1.35)
+                if target_w < (g_fw * g_pad_w):
+                    target_w = min(float(self.in_w), g_fw * g_pad_w)
                     target_h = target_w / self.aspect_ratio
                     if target_h > self.in_h:
                         target_h = float(self.in_h)
@@ -375,8 +430,7 @@ class AutoFramer:
             else:
                 s_fx, s_fy, s_fw, s_fh, s_rx, s_ry, s_lx, s_ly = self.smooth_face
 
-                # Comfortable framing: ~3.2x face height, min crop 55% of sensor height
-                target_h = max(s_fh * 3.2, self.in_h * 0.55)
+                target_h = max(s_fh * face_mult, self.in_h * min_crop_ratio)
                 target_h = min(target_h, float(self.in_h))
                 target_w = target_h * self.aspect_ratio
                 if target_w > self.in_w:
@@ -387,7 +441,7 @@ class AutoFramer:
                 center_y = s_fy + s_fh * 0.52
 
                 x1 = center_x - target_w / 2.0
-                y1 = center_y - target_h * 0.40
+                y1 = center_y - target_h * headroom
                 x2 = x1 + target_w
                 y2 = y1 + target_h
 
@@ -433,7 +487,7 @@ class AutoFramer:
                 pos_threshold = self.deadzone
                 zoom_threshold = self.deadzone * 1.3  # Extra deadband tolerance against zoom hunting
 
-                if pos_diff > pos_threshold or zoom_diff > zoom_threshold:
+                if zoom_changed or pos_diff > pos_threshold or zoom_diff > zoom_threshold:
                     self.target_box = cand_box
 
         else:
@@ -707,7 +761,10 @@ def check_audio_muted():
     except Exception:
         return False
 
-def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_inp_name=None, strength=50, cached_chair_mask=None, run_inference=True, inp_w=550, inp_h=550):
+def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_inp_name=None, strength=50,
+                                  cached_chair_mask=None, run_inference=True, inp_w=550, inp_h=550,
+                                  retain_chair=True, hand_mask=None, handheld_class_indices=None,
+                                  handheld_strength=60, cached_handheld_mask=None):
     """
     Retencao Neural Exata de Cadeira & Encosto com Segmentacao de Instancias (YOLACT - MIT License) na NPU:
     Detecta os contornos e bordas anatomicas reais da cadeira (encosto, apoio de cabeca, abas e bracos),
@@ -717,14 +774,24 @@ def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_i
     3. NMS por classe e combinacao linear dos coeficientes com os mapas prototipo (Protonet).
     4. Ancoragem espacial: retem apenas a cadeira conectada/apoiada ao corpo do usuario.
     5. Suavizacao temporal e fusao limpa na mascara p_person.
+
+    Adicionalmente (mesma inferencia, sem custo extra de NPU/GPU), decodifica quaisquer outras
+    classes COCO configuradas em handheld_class_indices (ex.: celular, caneca, livro) e as retem
+    quando ancoradas espacialmente na regiao de mao detectada (hand_mask), complementando a
+    heuristica morfologica de "objeto na mao" ja existente.
     """
     try:
         if chair_infer_req is None or chair_inp_name is None:
-            return p_person, cached_chair_mask
+            return p_person, cached_chair_mask, cached_handheld_mask
 
-        # Reutiliza mascara estavel no frame intermediario para manter 30+ FPS solidos
-        if not run_inference and cached_chair_mask is not None:
-            return np.maximum(p_person, cached_chair_mask), cached_chair_mask
+        # Reutiliza mascaras estaveis no frame intermediario para manter 30+ FPS solidos
+        if not run_inference:
+            merged = p_person
+            if cached_chair_mask is not None:
+                merged = np.maximum(merged, cached_chair_mask)
+            if cached_handheld_mask is not None:
+                merged = np.maximum(merged, cached_handheld_mask)
+            return merged, cached_chair_mask, cached_handheld_mask
 
         h_orig, w_orig = framed.shape[:2]
         scale = min(inp_w / float(w_orig), inp_h / float(h_orig))
@@ -750,67 +817,129 @@ def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_i
         is_yolact = ("conf" in out_dict and "proto" in out_dict and "mask" in out_dict and "boxes" in out_dict)
         thr_chair = max(0.12, 0.36 - (float(strength) / 100.0) * 0.24)
 
+        updated_chair_cache = None
+        updated_handheld_cache = cached_handheld_mask
+
         if is_yolact:
             conf = np.squeeze(out_dict["conf"], axis=0)          # (19248, 81)
             mask_coeffs = np.squeeze(out_dict["mask"], axis=0)   # (19248, 32)
             proto = np.squeeze(out_dict["proto"], axis=0)        # (138, 138, 32)
             boxes = np.squeeze(out_dict["boxes"], axis=0)        # (19248, 4)
 
-            # Em YOLACT COCO (81 classes com fundo em 0): 57 = cadeira, 58 = sofa/poltrona
-            chair_scores = conf[:, 57]
-            couch_scores = conf[:, 58]
-            c_scores = np.maximum(chair_scores, couch_scores)
-
-            c_mask = c_scores > thr_chair
-            if not np.any(c_mask):
-                return p_person, None
-
-            sel_indices = np.where(c_mask)[0]
-            sel_boxes = boxes[sel_indices]
-            sel_confs = c_scores[sel_indices]
-
-            x1 = sel_boxes[:, 0] * inp_w
-            y1 = sel_boxes[:, 1] * inp_h
-            x2 = sel_boxes[:, 2] * inp_w
-            y2 = sel_boxes[:, 3] * inp_h
-            bw = np.maximum(0.0, x2 - x1)
-            bh = np.maximum(0.0, y2 - y1)
-            nms_boxes = np.stack([x1, y1, bw, bh], axis=1).tolist()
-
-            nms_res = cv2.dnn.NMSBoxes(nms_boxes, sel_confs.tolist(), score_threshold=thr_chair, nms_threshold=0.45)
-            if len(nms_res) == 0:
-                return p_person, None
-
-            nms_keep = np.array(nms_res).flatten()
-            final_sel_idx = sel_indices[nms_keep]
-            final_boxes = sel_boxes[nms_keep]
-
             if proto.ndim == 3 and proto.shape[-1] == 32:
-                mh, mw, c = proto.shape
-                proto_flat = proto.reshape(-1, c)
-                coeffs = mask_coeffs[final_sel_idx]
-                raw_masks = (coeffs @ proto_flat.T).reshape(-1, mh, mw)
+                mh, mw = proto.shape[0], proto.shape[1]
             else:
-                c, mh, mw = proto.shape
-                coeffs = mask_coeffs[final_sel_idx]
-                raw_masks = (coeffs @ proto.reshape(c, -1)).reshape(-1, mh, mw)
-
-            sig_masks = 1.0 / (1.0 + np.exp(-raw_masks))
-
-            proto_chair = np.zeros((mh, mw), dtype=np.float32)
-            for i in range(len(final_boxes)):
-                bx1 = max(0, int(final_boxes[i, 0] * mw))
-                by1 = max(0, int(final_boxes[i, 1] * mh))
-                bx2 = min(mw, int(np.ceil(final_boxes[i, 2] * mw)))
-                by2 = min(mh, int(np.ceil(final_boxes[i, 3] * mh)))
-
-                m = np.zeros((mh, mw), dtype=np.float32)
-                m[by1:by2, bx1:bx2] = sig_masks[i, by1:by2, bx1:bx2]
-                proto_chair = np.maximum(proto_chair, m)
+                mh, mw = proto.shape[1], proto.shape[2]
 
             rx = mw / float(inp_w)
             ry = mh / float(inp_h)
+            p_top = int(round(pad_top * ry))
+            p_bottom = mh - int(round(pad_bottom * ry))
+            p_left = int(round(pad_left * rx))
+            p_right = mw - int(round(pad_right * rx))
+
+            def _decode_yolact_classes(class_indices, threshold):
+                scores = None
+                for ci in class_indices:
+                    s = conf[:, ci]
+                    scores = s if scores is None else np.maximum(scores, s)
+                if scores is None:
+                    return None
+                sel_mask = scores > threshold
+                if not np.any(sel_mask):
+                    return None
+                sel_indices = np.where(sel_mask)[0]
+                sel_boxes = boxes[sel_indices]
+                sel_confs = scores[sel_indices]
+
+                x1 = sel_boxes[:, 0] * inp_w
+                y1 = sel_boxes[:, 1] * inp_h
+                x2 = sel_boxes[:, 2] * inp_w
+                y2 = sel_boxes[:, 3] * inp_h
+                bw = np.maximum(0.0, x2 - x1)
+                bh = np.maximum(0.0, y2 - y1)
+                nms_boxes = np.stack([x1, y1, bw, bh], axis=1).tolist()
+
+                nms_res = cv2.dnn.NMSBoxes(nms_boxes, sel_confs.tolist(), score_threshold=threshold, nms_threshold=0.45)
+                if len(nms_res) == 0:
+                    return None
+                nms_keep = np.array(nms_res).flatten()
+                final_sel_idx = sel_indices[nms_keep]
+                final_boxes = sel_boxes[nms_keep]
+
+                if proto.ndim == 3 and proto.shape[-1] == 32:
+                    proto_flat = proto.reshape(-1, proto.shape[-1])
+                    coeffs = mask_coeffs[final_sel_idx]
+                    raw_masks = (coeffs @ proto_flat.T).reshape(-1, mh, mw)
+                else:
+                    c = proto.shape[0]
+                    coeffs = mask_coeffs[final_sel_idx]
+                    raw_masks = (coeffs @ proto.reshape(c, -1)).reshape(-1, mh, mw)
+
+                sig_masks = 1.0 / (1.0 + np.exp(-raw_masks))
+
+                out_mask = np.zeros((mh, mw), dtype=np.float32)
+                for i in range(len(final_boxes)):
+                    bx1 = max(0, int(final_boxes[i, 0] * mw))
+                    by1 = max(0, int(final_boxes[i, 1] * mh))
+                    bx2 = min(mw, int(np.ceil(final_boxes[i, 2] * mw)))
+                    by2 = min(mh, int(np.ceil(final_boxes[i, 3] * mh)))
+                    m = np.zeros((mh, mw), dtype=np.float32)
+                    m[by1:by2, bx1:bx2] = sig_masks[i, by1:by2, bx1:bx2]
+                    out_mask = np.maximum(out_mask, m)
+                return out_mask
+
+            # --- Cadeira / sofa (ancoragem: conectado/apoiado ao corpo) ---
+            if retain_chair:
+                proto_chair = _decode_yolact_classes([57, 58], thr_chair)
+                if proto_chair is not None:
+                    chair_unpad = proto_chair[p_top:p_bottom, p_left:p_right]
+                    chair_mask = cv2.resize(chair_unpad, (p_person.shape[1], p_person.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+                    person_bin = (p_person > 0.18).astype(np.uint8)
+                    person_anchor = cv2.dilate(person_bin, np.ones((11, 11), np.uint8))
+                    chair_bin = (chair_mask > 0.32).astype(np.uint8)
+
+                    num_labels, labels, _, _ = cv2.connectedComponentsWithStats(chair_bin)
+                    valid_chair = np.zeros_like(chair_mask)
+                    for lbl in range(1, num_labels):
+                        comp = (labels == lbl)
+                        if np.any(comp & (person_anchor > 0)):
+                            valid_chair = np.maximum(valid_chair, np.where(comp, chair_mask, 0.0))
+
+                    if cached_chair_mask is not None:
+                        updated_chair_cache = cached_chair_mask * 0.70 + valid_chair * 0.30
+                    else:
+                        updated_chair_cache = valid_chair
+
+            # --- Objetos segurados na mao (ancoragem: proximo/sobreposto a mao detectada) ---
+            if handheld_class_indices and hand_mask is not None:
+                thr_obj = max(0.15, 0.40 - (float(handheld_strength) / 100.0) * 0.25)
+                proto_obj = _decode_yolact_classes(handheld_class_indices, thr_obj)
+                if proto_obj is not None:
+                    obj_unpad = proto_obj[p_top:p_bottom, p_left:p_right]
+                    obj_mask = cv2.resize(obj_unpad, (p_person.shape[1], p_person.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+                    hand_bin_full = (hand_mask > 0.20).astype(np.uint8)
+                    hand_anchor = cv2.dilate(hand_bin_full, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)), iterations=2)
+                    obj_bin = (obj_mask > 0.32).astype(np.uint8)
+
+                    num_labels_o, labels_o, _, _ = cv2.connectedComponentsWithStats(obj_bin)
+                    valid_obj = np.zeros_like(obj_mask)
+                    for lbl in range(1, num_labels_o):
+                        comp = (labels_o == lbl)
+                        if np.any(comp & (hand_anchor > 0)):
+                            valid_obj = np.maximum(valid_obj, np.where(comp, obj_mask, 0.0))
+
+                    if cached_handheld_mask is not None:
+                        updated_handheld_cache = cached_handheld_mask * 0.60 + valid_obj * 0.40
+                    else:
+                        updated_handheld_cache = valid_obj
+                elif cached_handheld_mask is not None:
+                    updated_handheld_cache = cached_handheld_mask * 0.85
         else:
+            # Formato alternativo (nao-YOLACT) - mantem apenas a retencao de cadeira/sofa original.
+            # Objetos segurados na mao nao sao processados neste formato de saida.
             out_boxes = None
             out_protos = None
             for v in res.values():
@@ -820,7 +949,7 @@ def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_i
                     out_protos = v
 
             if out_boxes is None or out_protos is None:
-                return p_person, cached_chair_mask
+                return p_person, cached_chair_mask, cached_handheld_mask
 
             preds = np.squeeze(out_boxes, axis=0).T  # (5040, 116)
             scores_chair = preds[:, 4 + 56]
@@ -828,77 +957,77 @@ def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_i
             c_scores = np.maximum(scores_chair, scores_couch)
 
             c_mask = c_scores > thr_chair
-            if not np.any(c_mask):
-                return p_person, None
+            if retain_chair and np.any(c_mask):
+                c_preds = preds[c_mask]
+                cx = c_preds[:, 0]
+                cy = c_preds[:, 1]
+                w = c_preds[:, 2]
+                h = c_preds[:, 3]
+                x1 = cx - w / 2.0
+                y1 = cy - h / 2.0
+                boxes_list = np.stack([x1, y1, w, h], axis=1).tolist()
+                confs_list = c_scores[c_mask].tolist()
 
-            c_preds = preds[c_mask]
-            cx = c_preds[:, 0]
-            cy = c_preds[:, 1]
-            w = c_preds[:, 2]
-            h = c_preds[:, 3]
-            x1 = cx - w / 2.0
-            y1 = cy - h / 2.0
-            boxes_list = np.stack([x1, y1, w, h], axis=1).tolist()
-            confs_list = c_scores[c_mask].tolist()
+                nms_idx = cv2.dnn.NMSBoxes(boxes_list, confs_list, score_threshold=thr_chair, nms_threshold=0.45)
+                if len(nms_idx) > 0:
+                    nms_idx = np.array(nms_idx).flatten()
+                    sel_preds = c_preds[nms_idx]
+                    sel_boxes = np.array(boxes_list)[nms_idx]
 
-            nms_idx = cv2.dnn.NMSBoxes(boxes_list, confs_list, score_threshold=thr_chair, nms_threshold=0.45)
-            if len(nms_idx) == 0:
-                return p_person, None
+                    protos = np.squeeze(out_protos, axis=0)  # (32, 96, 160)
+                    c, mh, mw = protos.shape
+                    mask_coeffs = sel_preds[:, 84:]
 
-            nms_idx = np.array(nms_idx).flatten()
-            sel_preds = c_preds[nms_idx]
-            sel_boxes = np.array(boxes_list)[nms_idx]
+                    raw_masks = (mask_coeffs @ protos.reshape(c, -1)).reshape(-1, mh, mw)
+                    sig_masks = 1.0 / (1.0 + np.exp(-raw_masks))
 
-            protos = np.squeeze(out_protos, axis=0)  # (32, 96, 160)
-            c, mh, mw = protos.shape
-            mask_coeffs = sel_preds[:, 84:]
+                    rx = mw / float(inp_w)
+                    ry = mh / float(inp_h)
 
-            raw_masks = (mask_coeffs @ protos.reshape(c, -1)).reshape(-1, mh, mw)
-            sig_masks = 1.0 / (1.0 + np.exp(-raw_masks))
+                    proto_chair = np.zeros((mh, mw), dtype=np.float32)
+                    for i in range(len(nms_idx)):
+                        bx1 = max(0, int(sel_boxes[i, 0] * rx))
+                        by1 = max(0, int(sel_boxes[i, 1] * ry))
+                        bx2 = min(mw, int(np.ceil((sel_boxes[i, 0] + sel_boxes[i, 2]) * rx)))
+                        by2 = min(mh, int(np.ceil((sel_boxes[i, 1] + sel_boxes[i, 3]) * ry)))
 
-            rx = mw / float(inp_w)
-            ry = mh / float(inp_h)
+                        m = np.zeros((mh, mw), dtype=np.float32)
+                        m[by1:by2, bx1:bx2] = sig_masks[i, by1:by2, bx1:bx2]
+                        proto_chair = np.maximum(proto_chair, m)
 
-            proto_chair = np.zeros((mh, mw), dtype=np.float32)
-            for i in range(len(nms_idx)):
-                bx1 = max(0, int(sel_boxes[i, 0] * rx))
-                by1 = max(0, int(sel_boxes[i, 1] * ry))
-                bx2 = min(mw, int(np.ceil((sel_boxes[i, 0] + sel_boxes[i, 2]) * rx)))
-                by2 = min(mh, int(np.ceil((sel_boxes[i, 1] + sel_boxes[i, 3]) * ry)))
+                    p_top = int(round(pad_top * ry))
+                    p_bottom = mh - int(round(pad_bottom * ry))
+                    p_left = int(round(pad_left * rx))
+                    p_right = mw - int(round(pad_right * rx))
 
-                m = np.zeros((mh, mw), dtype=np.float32)
-                m[by1:by2, bx1:bx2] = sig_masks[i, by1:by2, bx1:bx2]
-                proto_chair = np.maximum(proto_chair, m)
+                    chair_unpad = proto_chair[p_top:p_bottom, p_left:p_right]
+                    chair_mask = cv2.resize(chair_unpad, (p_person.shape[1], p_person.shape[0]), interpolation=cv2.INTER_LINEAR)
 
-        p_top = int(round(pad_top * ry))
-        p_bottom = mh - int(round(pad_bottom * ry))
-        p_left = int(round(pad_left * rx))
-        p_right = mw - int(round(pad_right * rx))
+                    person_bin = (p_person > 0.18).astype(np.uint8)
+                    person_anchor = cv2.dilate(person_bin, np.ones((11, 11), np.uint8))
+                    chair_bin = (chair_mask > 0.32).astype(np.uint8)
 
-        chair_unpad = proto_chair[p_top:p_bottom, p_left:p_right]
-        chair_mask = cv2.resize(chair_unpad, (p_person.shape[1], p_person.shape[0]), interpolation=cv2.INTER_LINEAR)
+                    num_labels, labels, _, _ = cv2.connectedComponentsWithStats(chair_bin)
+                    valid_chair = np.zeros_like(chair_mask)
+                    for lbl in range(1, num_labels):
+                        comp = (labels == lbl)
+                        if np.any(comp & (person_anchor > 0)):
+                            valid_chair = np.maximum(valid_chair, np.where(comp, chair_mask, 0.0))
 
-        # Ancoragem espacial: reter apenas componentes da cadeira que tocam ou estao atras do usuario
-        person_bin = (p_person > 0.18).astype(np.uint8)
-        person_anchor = cv2.dilate(person_bin, np.ones((11, 11), np.uint8))
-        chair_bin = (chair_mask > 0.32).astype(np.uint8)
+                    if cached_chair_mask is not None:
+                        updated_chair_cache = cached_chair_mask * 0.70 + valid_chair * 0.30
+                    else:
+                        updated_chair_cache = valid_chair
 
-        num_labels, labels, _, _ = cv2.connectedComponentsWithStats(chair_bin)
-        valid_chair = np.zeros_like(chair_mask)
-        for lbl in range(1, num_labels):
-            comp = (labels == lbl)
-            if np.any(comp & (person_anchor > 0)):
-                valid_chair = np.maximum(valid_chair, np.where(comp, chair_mask, 0.0))
+        merged = p_person
+        if updated_chair_cache is not None:
+            merged = np.maximum(merged, updated_chair_cache)
+        if updated_handheld_cache is not None:
+            merged = np.maximum(merged, updated_handheld_cache)
 
-        # Suavizacao temporal com mascara cacheada
-        if cached_chair_mask is not None:
-            updated_cache = cached_chair_mask * 0.70 + valid_chair * 0.30
-        else:
-            updated_cache = valid_chair
-
-        return np.maximum(p_person, updated_cache), updated_cache
+        return merged, updated_chair_cache, updated_handheld_cache
     except Exception as e:
-        return p_person, cached_chair_mask
+        return p_person, cached_chair_mask, cached_handheld_mask
 
 def apply_neural_glasses_retention(
     framed,
@@ -1687,6 +1816,7 @@ def main():
         # cache e reaproveitada.
         heavy_assist_phase = 0
         cached_chair_mask = None
+        cached_handheld_obj_mask = None
         cached_glasses_mask = None
         cached_modnet_mask = None
         morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -1786,7 +1916,9 @@ def main():
                         framer = AutoFramer(
                             actual_w, actual_h, out_w, out_h,
                             smoothness=float(cfg.get("framing_smoothness", 0.04)),
-                            deadzone=float(cfg.get("framing_deadzone", 0.10))
+                            deadzone=float(cfg.get("framing_deadzone", 0.10)),
+                            framing_mode=cfg.get("framing_mode", "single"),
+                            zoom=int(cfg.get("framing_zoom", 50))
                         )
                         logging.info(f"Physical camera /dev/video{idx} connected at {actual_w}x{actual_h} ({target_fps} FPS)!")
                     else:
@@ -1812,7 +1944,17 @@ def main():
             # 1. Framing and Face Landmark Tracking (Single vs Group Mode)
             auto_framing_enabled = cfg.get("auto_framing", True)
             framing_mode = cfg.get("framing_mode", "single")
-            framed = framer.update(frame, enabled=auto_framing_enabled, framing_mode=framing_mode) if framer else cv2.resize(frame, (out_w, out_h))
+            framing_zoom = int(cfg.get("framing_zoom", 50))
+            framing_smoothness = float(cfg.get("framing_smoothness", 0.04))
+            framing_deadzone = float(cfg.get("framing_deadzone", 0.10))
+            framed = framer.update(
+                frame,
+                enabled=auto_framing_enabled,
+                framing_mode=framing_mode,
+                zoom=framing_zoom,
+                smoothness=framing_smoothness,
+                deadzone=framing_deadzone
+            ) if framer else cv2.resize(frame, (out_w, out_h))
 
             # 2. Smart Auto-Privacy on Absence with Smooth Fade-in / Fade-out Transition
             privacy_enabled = cfg.get("privacy_enabled", False)
@@ -2021,11 +2163,17 @@ def main():
                             retained_candidate = np.where((interaction_zone > 0) & (probs[:, :, 0] < 0.65), closed_mask, p_person)
                             p_person = np.maximum(p_person, retained_candidate)
 
-                    # 2.1 Neural Chair & Headrest Retention (Modelo de Segmentacao de Instancias YOLACT na NPU)
-                    if cfg.get("chair_retention_enabled", True):
+                    # 2.1 Neural Chair & Headrest Retention + Handheld Object Retention (COCO)
+                    # (Modelo de Segmentacao de Instancias YOLACT na NPU - mesma inferencia reaproveitada)
+                    retain_chair_cfg = cfg.get("chair_retention_enabled", True)
+                    retain_handheld_cfg = cfg.get("object_retention_enabled", True) and has_hands
+                    if retain_chair_cfg or retain_handheld_cfg:
                         chair_str = int(cfg.get("chair_retention_strength", 50))
-                        should_infer_chair = (heavy_assist_phase == 0) or (cached_chair_mask is None)
-                        p_person, cached_chair_mask = apply_neural_chair_retention(
+                        handheld_str = int(cfg.get("handheld_object_strength", 60))
+                        handheld_names = cfg.get("handheld_object_classes", ["cell phone", "cup", "book"])
+                        handheld_indices = [COCO_CLASS_NAME_TO_INDEX[n] for n in handheld_names if n in COCO_CLASS_NAME_TO_INDEX] if retain_handheld_cfg else []
+                        should_infer_chair = (heavy_assist_phase == 0) or (cached_chair_mask is None) or (cached_handheld_obj_mask is None)
+                        p_person, cached_chair_mask, cached_handheld_obj_mask = apply_neural_chair_retention(
                             p_person, framed,
                             chair_infer_req=chair_infer_req,
                             chair_inp_name=chair_inp_name,
@@ -2033,10 +2181,16 @@ def main():
                             cached_chair_mask=cached_chair_mask,
                             run_inference=should_infer_chair,
                             inp_w=chair_inp_w,
-                            inp_h=chair_inp_h
+                            inp_h=chair_inp_h,
+                            retain_chair=retain_chair_cfg,
+                            hand_mask=hand_skin,
+                            handheld_class_indices=handheld_indices,
+                            handheld_strength=handheld_str,
+                            cached_handheld_mask=cached_handheld_obj_mask
                         )
                     else:
                         cached_chair_mask = None
+                        cached_handheld_obj_mask = None
 
                     # 3. Real-time Hand Gesture Recognition & Triggers
                     if cfg.get("gesture_detection_enabled", True):
@@ -2335,6 +2489,7 @@ def main():
                 prev_mask = None
                 cached_glasses_mask = None
                 cached_chair_mask = None
+                cached_handheld_obj_mask = None
                 cached_modnet_mask = None
                 output_frame = processed_fg
 

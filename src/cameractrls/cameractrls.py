@@ -2256,6 +2256,10 @@ NPU_TR = {
         'name': 'Automatic Framing',
         'tooltip': 'Smart Auto-Framing with facial tracking and smooth transitions.',
     },
+    'npu_framing_zoom': {
+        'name': 'Framing Zoom Level',
+        'tooltip': 'Adjusts the framing crop level: higher values zoom in closer to the face (tighter crop), lower values widen the view to show more surroundings.',
+    },
     'npu_framing_smoothness': {
         'name': 'Auto-Framing Smoothness',
         'tooltip': 'Speed and smoothness of the camera transition (1 = ultra smooth, 10 = fast).',
@@ -2404,6 +2408,8 @@ class IntelNPUCtrls:
                 "blur_mode": "standard",
                 "auto_framing": True,
                 "framing_mode": "single",
+                "framing_zoom": 50,
+                "framing_smoothness_int": 4,
                 "smooth_enabled": True,
                 "smooth_strength": 50,
                 "background_image": ""
@@ -2866,6 +2872,16 @@ class IntelNPUCtrls:
                 default=False
             ),
             IntelNPUCtrl(
+                'npu_framing_zoom',
+                T('npu_framing_zoom', 'name', 'Zoom do Enquadramento'),
+                'integer',
+                T('npu_framing_zoom', 'tooltip', 'Ajusta a proximidade do enquadramento (zoom): valores maiores aproximam o plano (mais fechado no rosto), valores menores mostram mais do ambiente (mais aberto).'),
+                value=int(v_cfg.get("framing_zoom", 50)),
+                default=50,
+                min=0,
+                max=100
+            ),
+            IntelNPUCtrl(
                 'npu_framing_smoothness',
                 T('npu_framing_smoothness', 'name', 'Fluidez do Auto-Framing'),
                 'integer',
@@ -3298,6 +3314,11 @@ class IntelNPUCtrls:
             elif k == 'npu_auto_framing':
                 ctrl.value = bool(v)
                 cfg["video"]["auto_framing"] = bool(v)
+                changed = True
+
+            elif k == 'npu_framing_zoom':
+                ctrl.value = int(v)
+                cfg["video"]["framing_zoom"] = int(v)
                 changed = True
 
             elif k == 'npu_framing_smoothness':
