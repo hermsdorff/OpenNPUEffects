@@ -4598,6 +4598,7 @@ class CameraCtrls:
                     pop_list_by_text_ids(ctrls, [
                         'npu_framing_mode',
                         'npu_auto_framing',
+                        'npu_framing_zoom',
                         'npu_framing_smoothness',
                         'npu_eye_contact_mode',
                         'npu_smooth',
