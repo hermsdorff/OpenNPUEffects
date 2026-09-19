@@ -11,6 +11,7 @@ import json
 import signal
 import logging
 import subprocess
+import struct
 from pathlib import Path
 import numpy as np
 import openvino as ov
@@ -253,6 +254,7 @@ class AudioEffectsChain:
 
         # 4. Smart Noise Gate (VAD)
         self.gate_gain = 1.0
+        self.last_speech_time = 0.0
 
         # 5. Compressor / AGC
         self.comp_gain = 1.0
@@ -309,16 +311,18 @@ class AudioEffectsChain:
                 out = out - sibilance * (1.0 - deess_gain)
 
         # 5. Smart Noise Gate (VAD - Silêncio absoluto durante pausas na fala)
+        is_speech = False
+        rms = float(np.sqrt(np.mean(out**2) + 1e-9))
         if studio_on and cfg.get("gate_enabled", True):
             thresh_db = float(cfg.get("gate_threshold_db", -45.0))
             thresh_lin = 10 ** (thresh_db / 20.0)
-            rms = np.sqrt(np.mean(out**2) + 1e-9)
             if rms < thresh_lin:
                 target_gain = 0.0
                 attack_coeff = 0.15
             else:
                 target_gain = 1.0
                 attack_coeff = 0.70
+                is_speech = True
             gains = np.linspace(
                 self.gate_gain,
                 self.gate_gain * (1.0 - attack_coeff) + target_gain * attack_coeff,
@@ -327,6 +331,21 @@ class AudioEffectsChain:
             )
             self.gate_gain = float(gains[-1])
             out = out * gains
+        else:
+            is_speech = (rms > 0.015)
+
+        now = time.time()
+        if is_speech:
+            self.last_speech_time = now
+
+        # Atualiza estado de fala em memória compartilhada (/dev/shm) para o auto-zoom do daemon de vídeo
+        try:
+            shm_path = f"/dev/shm/npu_speech_{os.getuid()}.bin"
+            data = struct.pack("?ddf", is_speech, self.last_speech_time, now, rms)
+            with open(shm_path, "wb") as f_shm:
+                f_shm.write(data)
+        except Exception:
+            pass
 
         # 6. Compressor Vocal & Auto Gain Control (AGC / Normalizador de Ganho)
         if studio_on and cfg.get("compressor_enabled", True):
@@ -476,7 +495,25 @@ def main():
             # Standby automatico de audio (on-demand): libera o microfone fisico
             # quando nenhum app (Zoom/Teams/Meet/etc.) estiver consumindo o
             # microfone virtual 'npu_clearvoice' por mais que standby_timeout.
-            if cfg.get("auto_standby", True):
+            # Se o Zoom por Voz estiver ativado no video, mantem o audio ativo para deteccao em tempo real.
+            voice_zoom_requested = False
+            try:
+                if CONFIG_PATH.exists():
+                    with open(CONFIG_PATH, "r") as f_cfg:
+                        full_c = json.load(f_cfg)
+                        voice_zoom_requested = bool(full_c.get("video", {}).get("framing_voice_zoom", False))
+            except Exception:
+                pass
+
+            if voice_zoom_requested and in_standby:
+                logging.info("Zoom por Voz ativado no vídeo. Saindo do standby de áudio para monitorar fala...")
+                in_standby = False
+                last_active_time = now
+                if in_proc is None and hw_mic:
+                    in_proc = spawn_in_proc(hw_mic)
+                    states = {n: np.zeros(inp_shapes[n], dtype=np.float32) for n in state_names}
+
+            if cfg.get("auto_standby", True) and not voice_zoom_requested:
                 check_interval = 0.2 if in_standby else 0.25
                 if now - last_consumer_check > check_interval:
                     last_consumer_check = now

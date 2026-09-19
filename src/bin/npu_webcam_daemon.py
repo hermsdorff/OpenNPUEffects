@@ -11,6 +11,7 @@ import time
 import json
 import signal
 import subprocess
+import struct
 import logging
 from pathlib import Path
 import numpy as np
@@ -149,6 +150,10 @@ def load_config():
             "auto_framing": True,
             "framing_mode": "single",
             "framing_zoom": 50,
+            "framing_voice_zoom": False,
+            "framing_zoom_silence": 50,
+            "framing_zoom_speech": 70,
+            "framing_voice_hold": 1.5,
             "framing_smoothness": 0.04,
             "framing_deadzone": 0.10,
             "smooth_enabled": True,
@@ -243,6 +248,60 @@ def resolve_cam_index(device_str="auto"):
         except Exception:
             pass
     return 48
+
+class VoiceActivityTracker:
+    def __init__(self, hold_time=1.5):
+        self.hold_time = hold_time
+        self.shm_path = f"/dev/shm/npu_speech_{os.getuid()}.bin"
+        self.fallback_stream = None
+        self.fallback_last_speech = 0.0
+
+    def _audio_callback(self, indata, frames, time_info, status):
+        try:
+            rms = float(np.sqrt(np.mean(indata**2)))
+            if rms > 0.015:
+                self.fallback_last_speech = time.time()
+        except Exception:
+            pass
+
+    def start_fallback(self):
+        if self.fallback_stream is None:
+            try:
+                import sounddevice as sd
+                self.fallback_stream = sd.InputStream(
+                    channels=1, samplerate=16000, blocksize=1600, callback=self._audio_callback
+                )
+                self.fallback_stream.start()
+            except Exception as e:
+                logging.debug(f"Could not start sounddevice fallback: {e}")
+
+    def stop_fallback(self):
+        if self.fallback_stream:
+            try:
+                self.fallback_stream.stop()
+                self.fallback_stream.close()
+            except Exception:
+                pass
+            self.fallback_stream = None
+
+    def is_speaking(self, now):
+        # 1. Prioridade: estado de voz NPU limpo publicado pelo npu_audio_daemon em /dev/shm
+        if os.path.exists(self.shm_path):
+            try:
+                with open(self.shm_path, "rb") as f:
+                    content = f.read()
+                if len(content) >= 21:
+                    is_spk, last_spk, update_time, rms = struct.unpack("?ddf", content[:21])
+                    if (now - update_time) < 2.0:
+                        if self.fallback_stream:
+                            self.stop_fallback()
+                        return bool(is_spk or ((now - last_spk) < self.hold_time))
+            except Exception:
+                pass
+
+        # 2. Fallback resiliente: monitoramento direto via sounddevice se o daemon de audio estiver offline
+        self.start_fallback()
+        return bool((now - self.fallback_last_speech) < self.hold_time)
 
 class AutoFramer:
     def __init__(self, in_w, in_h, out_w, out_h, smoothness=0.04, deadzone=0.10, framing_mode="single", zoom=50):
@@ -1829,6 +1888,8 @@ def main():
         last_active_time = 0.0
         has_active_consumers = False
         in_standby = False
+        voice_tracker = VoiceActivityTracker(hold_time=float(cfg.get("framing_voice_hold", 1.5)))
+        current_voice_zoom = float(cfg.get("framing_zoom", 50))
 
         while running:
             now = time.time()
@@ -1947,6 +2008,21 @@ def main():
             framing_zoom = int(cfg.get("framing_zoom", 50))
             framing_smoothness = float(cfg.get("framing_smoothness", 0.04))
             framing_deadzone = float(cfg.get("framing_deadzone", 0.10))
+
+            # Dynamic Voice-Activated Zoom (50% silencio, 70% fala)
+            framing_voice_zoom = cfg.get("framing_voice_zoom", False)
+            if framing_voice_zoom:
+                hold_sec = float(cfg.get("framing_voice_hold", 1.5))
+                voice_tracker.hold_time = hold_sec
+                speaking = voice_tracker.is_speaking(now)
+                target_voice_zoom = float(cfg.get("framing_zoom_speech", 70)) if speaking else float(cfg.get("framing_zoom_silence", 50))
+                current_voice_zoom += (target_voice_zoom - current_voice_zoom) * 0.10
+                framing_zoom = int(round(current_voice_zoom))
+            else:
+                if voice_tracker.fallback_stream:
+                    voice_tracker.stop_fallback()
+                current_voice_zoom = float(framing_zoom)
+
             framed = framer.update(
                 frame,
                 enabled=auto_framing_enabled,
@@ -2533,6 +2609,11 @@ def main():
                 time.sleep(park_delay)
             phys_dev = f"/dev/video{resolve_cam_index(cfg.get('input_device', 'auto'))}"
             execute_standby_hooks(cfg, phys_dev)
+        except Exception:
+            pass
+
+        try:
+            voice_tracker.stop_fallback()
         except Exception:
             pass
 

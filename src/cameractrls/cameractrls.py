@@ -2260,6 +2260,10 @@ NPU_TR = {
         'name': 'Framing Zoom Level',
         'tooltip': 'Adjusts the framing crop level: higher values zoom in closer to the face (tighter crop), lower values widen the view to show more surroundings.',
     },
+    'npu_framing_voice_zoom': {
+        'name': 'Auto Voice Zoom (Silence 50% / Speech 70%)',
+        'tooltip': 'Dynamically adjusts framing zoom based on speech: 50% during silence and 70% when speaking.',
+    },
     'npu_framing_smoothness': {
         'name': 'Auto-Framing Smoothness',
         'tooltip': 'Speed and smoothness of the camera transition (1 = ultra smooth, 10 = fast).',
@@ -2409,6 +2413,10 @@ class IntelNPUCtrls:
                 "auto_framing": True,
                 "framing_mode": "single",
                 "framing_zoom": 50,
+                "framing_voice_zoom": False,
+                "framing_zoom_silence": 50,
+                "framing_zoom_speech": 70,
+                "framing_voice_hold": 1.5,
                 "framing_smoothness_int": 4,
                 "smooth_enabled": True,
                 "smooth_strength": 50,
@@ -2882,6 +2890,14 @@ class IntelNPUCtrls:
                 max=100
             ),
             IntelNPUCtrl(
+                'npu_framing_voice_zoom',
+                T('npu_framing_voice_zoom', 'name', 'Zoom Automático por Voz'),
+                'boolean',
+                T('npu_framing_voice_zoom', 'tooltip', 'Ajusta o zoom dinamicamente com base na fala: 50% em silêncio e 70% quando você estiver falando.'),
+                value=bool(v_cfg.get("framing_voice_zoom", False)),
+                default=False
+            ),
+            IntelNPUCtrl(
                 'npu_framing_smoothness',
                 T('npu_framing_smoothness', 'name', 'Fluidez do Auto-Framing'),
                 'integer',
@@ -3319,6 +3335,11 @@ class IntelNPUCtrls:
             elif k == 'npu_framing_zoom':
                 ctrl.value = int(v)
                 cfg["video"]["framing_zoom"] = int(v)
+                changed = True
+
+            elif k == 'npu_framing_voice_zoom':
+                ctrl.value = bool(v)
+                cfg["video"]["framing_voice_zoom"] = bool(v)
                 changed = True
 
             elif k == 'npu_framing_smoothness':
@@ -4599,6 +4620,7 @@ class CameraCtrls:
                         'npu_framing_mode',
                         'npu_auto_framing',
                         'npu_framing_zoom',
+                        'npu_framing_voice_zoom',
                         'npu_framing_smoothness',
                         'npu_eye_contact_mode',
                         'npu_smooth',

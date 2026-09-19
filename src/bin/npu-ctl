@@ -33,7 +33,7 @@ ensure_config() {
         if [ -f "$def_cfg" ]; then
             cp "$def_cfg" "$CONFIG_FILE"
         else
-            echo '{"video":{"enabled":true,"blur_enabled":true,"blur_strength":35,"auto_framing":true,"framing_zoom":50,"framing_smoothness":0.04,"framing_smoothness_int":4,"framing_deadzone":0.10,"smooth_enabled":true,"smooth_strength":50,"background_image":""},"audio":{"enabled":true,"noise_suppression":true}}' > "$CONFIG_FILE"
+            echo '{"video":{"enabled":true,"blur_enabled":true,"blur_strength":35,"auto_framing":true,"framing_zoom":50,"framing_voice_zoom":false,"framing_zoom_silence":50,"framing_zoom_speech":70,"framing_voice_hold":1.5,"framing_smoothness":0.04,"framing_smoothness_int":4,"framing_deadzone":0.10,"smooth_enabled":true,"smooth_strength":50,"background_image":""},"audio":{"enabled":true,"noise_suppression":true}}' > "$CONFIG_FILE"
         fi
     elif [ -f "$def_cfg" ] && [ -x "$VENV_PYTHON" ]; then
         $VENV_PYTHON -c "
@@ -121,8 +121,11 @@ with open('$CONFIG_FILE') as f:
     cfg = json.load(f)
 v = cfg.get('video', {})
 a = cfg.get('audio', {})
+v_zoom = v.get('framing_zoom', 50)
+v_voice = v.get('framing_voice_zoom', False)
+voice_str = (\", Zoom Voz: ATIVO (\" + str(v.get(\"framing_zoom_silence\", 50)) + \"% silêncio -> \" + str(v.get(\"framing_zoom_speech\", 70)) + \"% fala)\") if v_voice else \"\"
 print(f'  Webcam Desfoque Fundo: {\"ATIVO\" if v.get(\"blur_enabled\") else \"DESATIVADO\"} (Modo: {v.get(\"blur_mode\", \"standard\").upper()}, Intensidade: {v.get(\"blur_strength\", 35)}, Borda: {v.get(\"mask_feather\", 40)}px)')
-print(f'  Webcam Auto-Framing:   {\"ATIVO\" if v.get(\"auto_framing\") else \"DESATIVADO\"} (Modo: {v.get(\"framing_mode\", \"single\").upper()}, Zoom: {v.get(\"framing_zoom\", 50)}%, Fluidez: {v.get(\"framing_smoothness_int\", 4)}/10, Zona Morta: {int(v.get(\"framing_deadzone\", 0.10) * 100)}%)')
+print(f'  Webcam Auto-Framing:   {\"ATIVO\" if v.get(\"auto_framing\") else \"DESATIVADO\"} (Modo: {v.get(\"framing_mode\", \"single\").upper()}, Zoom: {v_zoom}%{voice_str}, Fluidez: {v.get(\"framing_smoothness_int\", 4)}/10, Zona Morta: {int(v.get(\"framing_deadzone\", 0.10) * 100)}%)')
 print(f'  Webcam Filtro Artístico: {v.get(\"artistic_filter\", \"off\").upper()} (Intensidade: {v.get(\"artistic_strength\", 70)})')
 print(f'  Webcam Cor Cinema:     {v.get(\"color_filter\", \"none\").upper()} (Intensidade: {v.get(\"color_strength\", 70)})')
 print(f'  Webcam Luz de Recorte: {\"ATIVO (\" + str(v.get(\"rim_light_color\", \"warm\")) + \", \" + str(v.get(\"rim_light_intensity\", 50)) + \"%)\" if v.get(\"rim_light_enabled\") else \"DESATIVADO\"}')
@@ -272,13 +275,24 @@ elif arg1 in ['zoom', 'enquadramento']:
     cfg['video']['auto_framing'] = True
     cfg['video']['framing_zoom'] = val
     print(f'Zoom do Auto-Framing ajustado para {val}%!')
+elif arg1 in ['voice', 'voz', 'fala']:
+    if arg2 in ['on', '1', 'true', 'sim', 'enable']:
+        cfg['video']['framing_voice_zoom'] = True
+        print('Zoom Automático por Voz ATIVADO (50% no silêncio -> 70% ao falar)!')
+    elif arg2 in ['off', '0', 'false', 'nao', 'não', 'disable']:
+        cfg['video']['framing_voice_zoom'] = False
+        print('Zoom Automático por Voz DESATIVADO.')
+    else:
+        cur = cfg['video'].get('framing_voice_zoom', False)
+        msg = \"ATIVO (50% silêncio -> 70% fala)\" if cur else \"DESATIVADO\"
+        print(\"Zoom Automático por Voz: \" + msg + \". Use: npu-ctl framing voice [on|off]\")
 elif arg1 in ['deadzone', 'zonamorta', 'zona']:
     val = int(arg2) if arg2.isdigit() else 10
     val = max(5, min(30, val))
     cfg['video']['framing_deadzone'] = round(val / 100.0, 2)
     print(f'Zona morta (deadzone) do Auto-Framing ajustada para {val}%!')
 else:
-    print('Uso: npu-ctl framing [on | off | zoom <0-100> | smooth <1-10> | deadzone <5-30>]')
+    print('Uso: npu-ctl framing [on | off | zoom <0-100> | voice <on|off> | smooth <1-10> | deadzone <5-30>]')
     exit(1)
 
 with open('$CONFIG_FILE', 'w') as f:
@@ -2018,7 +2032,7 @@ case "$1" in
         echo "  npu-ctl restore-cameractrls      Restaura a aba NPU no Cameractrls caso seja sobrescrito por update"
         echo "  npu-ctl privacy [on|off|foto.jpg]  Ativa/desativa privacidade ou define foto de ausência"
         echo "  npu-ctl privacy-image <foto|padrao> Define imagem de ausência (ou 'padrao' para tela gráfica)"
-        echo "  npu-ctl framing [on|off|zoom <0-100>|smooth <1-10>|deadzone <5-30>] Ativa, desativa ou calibra o auto-framing"
+        echo "  npu-ctl framing [on|off|zoom <0-100>|voice <on|off>|smooth <1-10>|deadzone <5-30>] Ativa, desativa ou calibra o auto-framing"
         echo "  npu-ctl background <img|none>    Define imagem de fundo virtual ou remove"
         echo "  npu-ctl start                    Inicia os serviços de segundo plano"
         echo "  npu-ctl stop                     Para os serviços de segundo plano"
