@@ -341,7 +341,7 @@ class AudioEffectsChain:
         # Atualiza estado de fala em memória compartilhada (/dev/shm) para o auto-zoom do daemon de vídeo
         try:
             shm_path = f"/dev/shm/npu_speech_{os.getuid()}.bin"
-            data = struct.pack("?ddf", is_speech, self.last_speech_time, now, rms)
+            data = struct.pack("<?ddf", is_speech, self.last_speech_time, now, rms)
             with open(shm_path, "wb") as f_shm:
                 f_shm.write(data)
         except Exception:

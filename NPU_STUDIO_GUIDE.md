@@ -40,7 +40,7 @@ We have established a complete hardware-accelerated video and audio processing s
    - Device node `/dev/accel/accel0` integrated directly with OpenVINO Runtime.
 2. **V4L2 Virtual Camera (`v4l2loopback`)**:
    - Kernel module configured in `/etc/modprobe.d/v4l2loopback.conf` exposing `/dev/video72` with the friendly label `"Intel NPU Enhanced Webcam"`.
-   - Native support for 6 streaming queue buffers (`max_buffers=6`), ensuring total compatibility with Cameractrls and stutter-free 1080p @ 30 FPS video delivery.
+   - Low-latency streaming queue (`max_buffers=2`), limiting virtual camera buffer backlog (~66ms) and maintaining lip-sync synchronization across Google Meet, Zoom, Teams, and Chrome.
 3. **Background Daemons (`systemd --user`)**:
    - `npu-webcam.service`: Video daemon with automatic startup, on-demand standby, and motorized PTZ gimbal control.
    - `npu-audio.service`: Audio daemon with instant hot-reload upon configuration changes.
@@ -304,6 +304,26 @@ Example structure of `config.json`:
     npu-ctl restore-cameractrls
     ```
   - Backups of modified files are saved with the `.npu_backup` extension.
+* **Audio/Video Latency Optimization (`max_buffers=2`):**
+  - If you previously configured or upgraded from an earlier installation with `max_buffers=6`, reduce the virtual device queue depth to 2 buffers to eliminate video lag relative to audio without rebooting:
+    ```bash
+    # 1. Stop daemons and release the virtual camera
+    npu-ctl stop
+
+    # 2. Update buffer queue size in kernel module configuration
+    sudo sed -i 's/max_buffers=6/max_buffers=2/' /etc/modprobe.d/v4l2loopback.conf
+
+    # 3. Reload module with the new low-latency configuration
+    sudo rmmod v4l2loopback
+    sudo modprobe v4l2loopback
+
+    # 4. Verify configuration
+    cat /etc/modprobe.d/v4l2loopback.conf | grep max_buffers
+
+    # 5. Restart daemons
+    npu-ctl start
+    ```
+    *(Note: If `rmmod` reports "Device or resource busy", close any open video applications like Meet, Zoom, Teams, or Cameractrls first).*
 
 ---
 

@@ -291,7 +291,7 @@ class VoiceActivityTracker:
                 with open(self.shm_path, "rb") as f:
                     content = f.read()
                 if len(content) >= 21:
-                    is_spk, last_spk, update_time, rms = struct.unpack("?ddf", content[:21])
+                    is_spk, last_spk, update_time, rms = struct.unpack("<?ddf", content[:21])
                     if (now - update_time) < 2.0:
                         if self.fallback_stream:
                             self.stop_fallback()
@@ -1889,7 +1889,6 @@ def main():
         has_active_consumers = False
         in_standby = False
         voice_tracker = VoiceActivityTracker(hold_time=float(cfg.get("framing_voice_hold", 1.5)))
-        current_voice_zoom = float(cfg.get("framing_zoom", 50))
 
         while running:
             now = time.time()
@@ -1970,6 +1969,12 @@ def main():
                     cap.set(cv2.CAP_PROP_FRAME_WIDTH, out_w)
                     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, out_h)
                     cap.set(cv2.CAP_PROP_FPS, target_fps)
+                    # Latencia: com 1 unico buffer de captura, o daemon sempre processa o
+                    # quadro MAIS RECENTE da camera fisica. O backend V4L2 entrega sempre o
+                    # quadro mais ANTIGO da fila - com varios buffers enfileirados, um loop
+                    # de processamento mais lento que a camera acumula atraso de varios
+                    # quadros (efeito de video atrasado em relacao ao audio).
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     ret, test_frame = cap.read()
                     if ret and test_frame is not None:
                         actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -2010,18 +2015,18 @@ def main():
             framing_deadzone = float(cfg.get("framing_deadzone", 0.10))
 
             # Dynamic Voice-Activated Zoom (50% silencio, 70% fala)
+            # Nota: a transicao suave ja e feita pelo proprio AutoFramer (curr_box em direcao
+            # a target_box, controlado por framing_smoothness) - aplicar um segundo filtro EMA
+            # aqui apenas dobraria o tempo de assentamento (>2s) sem nenhum ganho de suavidade.
             framing_voice_zoom = cfg.get("framing_voice_zoom", False)
             if framing_voice_zoom:
                 hold_sec = float(cfg.get("framing_voice_hold", 1.5))
                 voice_tracker.hold_time = hold_sec
                 speaking = voice_tracker.is_speaking(now)
-                target_voice_zoom = float(cfg.get("framing_zoom_speech", 70)) if speaking else float(cfg.get("framing_zoom_silence", 50))
-                current_voice_zoom += (target_voice_zoom - current_voice_zoom) * 0.10
-                framing_zoom = int(round(current_voice_zoom))
+                framing_zoom = int(cfg.get("framing_zoom_speech", 70)) if speaking else int(cfg.get("framing_zoom_silence", 50))
             else:
                 if voice_tracker.fallback_stream:
                     voice_tracker.stop_fallback()
-                current_voice_zoom = float(framing_zoom)
 
             framed = framer.update(
                 frame,

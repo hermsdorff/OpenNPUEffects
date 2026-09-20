@@ -94,7 +94,7 @@ for idx, line in enumerate(lines):
         break
 
 if opt_idx == -1:
-    lines.append(f'options v4l2loopback devices=1 video_nr={target_nr} card_label="{target_label}" exclusive_caps=1 max_buffers=6')
+    lines.append(f'options v4l2loopback devices=1 video_nr={target_nr} card_label="{target_label}" exclusive_caps=1 max_buffers=2')
 else:
     opt_line = lines[opt_idx]
     m_card = re.search(r"card_label=(.*?)(?=\s+[a-z_]+|\s*$)", opt_line)
@@ -109,7 +109,10 @@ else:
     existing_caps = [c for c in m_caps.group(1).split(",") if c] if m_caps else []
 
     m_buf = re.search(r"max_buffers=(\d+)", opt_line)
-    max_buf = max(6, int(m_buf.group(1))) if m_buf else 6
+    # Latencia: max_buffers=2 (padrao do v4l2loopback) limita a profundidade da fila do
+    # dispositivo virtual. O consumidor (Zoom/Meet/Chrome) sempre recebe o quadro mais
+    # ANTIGO da fila - com 6 buffers, um consumidor lento acumula ate ~200ms de atraso.
+    max_buf = 2
 
     if target_label not in existing_labels:
         existing_labels.append(target_label)

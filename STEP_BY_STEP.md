@@ -17,7 +17,7 @@ OpenNPUEffects/
 ├── NPU_STUDIO_GUIDE.md               # User manual with effect catalogue and commands
 ├── scripts/
 │   ├── 01_install_npu_drivers.sh     # Level Zero drivers and NPU UMD packages
-│   ├── 02_setup_v4l2loopback.sh      # Virtual camera /dev/video72 with 6 buffers
+│   ├── 02_setup_v4l2loopback.sh      # Virtual camera /dev/video72 with low-latency queue (2 buffers)
 │   ├── 03_setup_dependencies.sh      # System dependencies and Python venv
 │   ├── 04_download_models.sh         # Download and optimization of neural models (Audio & Video)
 │   ├── 05_setup_pipeline_daemons.sh  # Streaming daemons, npu-ctl utility, and systemd services
@@ -114,11 +114,11 @@ dmesg | grep -i vpu
 1. Installs dynamic kernel module support (`v4l2loopback-dkms`) and video utilities (`v4l-utils`).
 2. Safely configures persistent kernel module options at `/etc/modprobe.d/v4l2loopback.conf` (preserving any existing virtual cameras without modifying them):
    ```ini
-   options v4l2loopback devices=... video_nr=... card_label="...,Intel NPU Enhanced Webcam" exclusive_caps=... max_buffers=6
+   options v4l2loopback devices=... video_nr=... card_label="...,Intel NPU Enhanced Webcam" exclusive_caps=... max_buffers=2
    ```
    - **`video_nr=72`**: Allocates a high, deterministic minor number to prevent collisions with physical USB webcams on `/dev/video0` or `/dev/video1`.
    - **`card_label`**: Adds *"Intel NPU Enhanced Webcam"*, making device selection seamless in Google Meet, Zoom, Teams, OBS, and Slack.
-   - **`max_buffers=6`**: **Critical requirement!** Cameractrls (`cameraview.py:509`) strictly requires 6 streaming queue buffers. Without this setting, Cameractrls fails with an *insufficient buffer memory* error.
+   - **`max_buffers=2`**: Low-latency streaming queue limit (v4l2loopback default). Minimizes accumulated frame delay down to ~66ms (2 frames @ 30 FPS) compared to ~200ms with 6 buffers, keeping video in tight synchronization with processed audio.
    - **`exclusive_caps=1`**: Ensures Chromium and WebRTC recognize the virtual device strictly as a capture camera.
 3. Adds `v4l2loopback` to `/etc/modules-load.d/v4l2loopback.conf` to guarantee loading on every system boot.
 
@@ -281,6 +281,27 @@ npu-ctl mic-source
   ```bash
   npu-ctl cam-source notebook
   ```
+
+### Video lag / lip-sync delay with audio (manual `max_buffers` configuration):
+- If you installed an earlier version with `max_buffers=6`, reduce the virtual device queue depth to 2 buffers to prevent accumulated latency (~66ms vs ~200ms) without rebooting:
+  ```bash
+  # 1. Stop daemons and release the virtual camera
+  npu-ctl stop
+
+  # 2. Update buffer queue size in kernel module configuration
+  sudo sed -i 's/max_buffers=6/max_buffers=2/' /etc/modprobe.d/v4l2loopback.conf
+
+  # 3. Reload module with the new low-latency configuration
+  sudo rmmod v4l2loopback
+  sudo modprobe v4l2loopback
+
+  # 4. Verify that the module loaded with 2 buffers
+  cat /etc/modprobe.d/v4l2loopback.conf | grep max_buffers
+
+  # 5. Restart daemons
+  npu-ctl start
+  ```
+  *(Note: If `rmmod` reports "Device or resource busy", close any apps holding `/dev/video72` open—such as Google Meet, Zoom, Teams, or Cameractrls—and retry).*
 
 ---
 
