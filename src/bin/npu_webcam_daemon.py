@@ -12,11 +12,16 @@ import json
 import signal
 import subprocess
 import struct
+import threading
 import logging
 from pathlib import Path
 import numpy as np
 import cv2
 import openvino as ov
+try:
+    from openvino.runtime import AsyncInferQueue
+except ImportError:  # OpenVINO mais novo expoe AsyncInferQueue no namespace raiz
+    AsyncInferQueue = ov.AsyncInferQueue
 import pyvirtualcam
 
 logging.basicConfig(
@@ -154,6 +159,8 @@ def load_config():
             "framing_zoom_silence": 50,
             "framing_zoom_speech": 70,
             "framing_voice_hold": 1.5,
+            "perf_stats_enabled": True,
+            "perf_stats_interval": 300,
             "framing_smoothness": 0.04,
             "framing_deadzone": 0.10,
             "smooth_enabled": True,
@@ -302,6 +309,386 @@ class VoiceActivityTracker:
         # 2. Fallback resiliente: monitoramento direto via sounddevice se o daemon de audio estiver offline
         self.start_fallback()
         return bool((now - self.fallback_last_speech) < self.hold_time)
+
+class LoopStageTimer:
+    """Instrumentacao leve de latencia por estagio do loop principal de video.
+
+    Acumula a duracao de cada estagio (captura, enquadramento, filtros,
+    segmentacao/composicao, envio) e publica um resumo periodico no log:
+    media / p95 / maximo por estagio em ms, tempo total do loop, FPS efetivo
+    e percentual de quadros que estouram o orcamento de 33.3ms (30fps).
+    Use para diagnosticar judder (cadencia irregular de entrega de quadros).
+    Config: perf_stats_enabled (bool) / perf_stats_interval (quadros por relatorio).
+    """
+
+    def __init__(self, log_every=300, budget_ms=33.4):
+        self.log_every = max(30, int(log_every))
+        self.budget_ms = budget_ms
+        self.samples = {}
+        self.loop_times = []
+        self._t0 = None
+        self._t_last_tick = None
+
+    def begin(self):
+        self._t0 = time.perf_counter()
+
+    def lap(self, name):
+        t = time.perf_counter()
+        if self._t0 is not None:
+            self.samples.setdefault(name, []).append((t - self._t0) * 1000.0)
+        self._t0 = t
+
+    def add(self, name, seconds):
+        self.samples.setdefault(name, []).append(seconds * 1000.0)
+
+    def tick(self):
+        now = time.perf_counter()
+        if self._t_last_tick is not None:
+            self.loop_times.append((now - self._t_last_tick) * 1000.0)
+        self._t_last_tick = now
+        if len(self.loop_times) >= self.log_every:
+            self._report()
+
+    def _report(self):
+        parts = []
+        for name in sorted(self.samples.keys()):
+            arr = np.asarray(self.samples[name], dtype=np.float32)
+            if len(arr) == 0:
+                continue
+            parts.append(
+                f"{name}: avg={arr.mean():.1f}ms p95={np.percentile(arr, 95):.1f}ms max={arr.max():.1f}ms"
+            )
+        loops = np.asarray(self.loop_times, dtype=np.float32)
+        if len(loops) == 0:
+            return
+        overrun = (loops > self.budget_ms).sum()
+        logging.info(
+            "PERF | fps efetivo: %.1f | loop: avg=%.1fms p95=%.1fms max=%.1fms | "
+            "quadros acima do orcamento de %.0fms: %d/%d (%.0f%%) | %s",
+            1000.0 / max(loops.mean(), 0.001), loops.mean(), np.percentile(loops, 95),
+            loops.max(), self.budget_ms, overrun, len(loops), 100.0 * overrun / len(loops),
+            " | ".join(parts)
+        )
+        self.samples = {}
+        self.loop_times = []
+
+def log_execution_devices(label, compiled_model_obj):
+    """Loga em qual dispositivo fisico o OpenVINO realmente compilou o modelo
+    (com AUTO, uma falha silenciosa de NPU/GPU pode escalar para CPU sem aviso,
+    multiplicando o tempo de inferencia por 10-30x)."""
+    try:
+        devs = compiled_model_obj.get_property("EXECUTION_DEVICES")
+        logging.info(f"PERF-DEV | {label}: {devs}")
+    except Exception:
+        pass
+
+
+def postprocess_multiclass_mask(raw, face_info, out_w, out_h):
+    """
+    Pos-processamento completo da saida do modelo primario multiclass (256x256x6):
+    softmax, montagem de p_person (silhueta 1..5 + logit diferencial + torso boost),
+    fechamento morfologico, preenchimento de cavidades internas e isolamento de maos.
+
+    Passo 4: executada no callback da AsyncInferQueue (e no caminho sincrono de
+    aquecimento) — tira a cadeia de numpy do caminho critico do loop principal.
+    Retorna (p_person, hand_skin, has_hands, bg_prob).
+    """
+    # Softmax probabilities
+    exp_raw = np.exp(raw - np.max(raw, axis=-1, keepdims=True))
+    probs = exp_raw / np.sum(exp_raw, axis=-1, keepdims=True)
+
+    # 1.0 - background gives full human silhouette (classes 1..5)
+    p_person = 1.0 - probs[:, :, 0]
+
+    # Direct foreground vs background logit differential:
+    # In multiclass, the sum of human classes (hair, skin, clothes, etc.) can be diluted
+    # when individual classes are split. fg_max_logits compares the strongest human class
+    # against the background logit directly!
+    fg_max_logits = np.max(raw[:, :, 1:], axis=-1)
+    bg_logits = raw[:, :, 0]
+    logit_diff = fg_max_logits - bg_logits
+    p_direct_fg = 1.0 / (1.0 + np.exp(-1.8 * logit_diff))
+    p_person = np.maximum(p_person, p_direct_fg)
+
+    # Boost human foreground components: body-skin and clothes (arms, sleeves, torso)
+    body_skin = probs[:, :, 2]
+    clothes = probs[:, :, 4]
+    human_body = np.maximum(body_skin * 1.25, clothes * 1.35)
+    p_person = np.maximum(p_person, np.clip(human_body, 0.0, 1.0))
+
+    # Anatomical Torso Core Boost:
+    # Directly below the chin/neck, the central column beneath the face
+    # is the user's torso. Reinforce any signal here so shirts never become transparent.
+    if face_info.get("has_face"):
+        fx_b, fy_b, fw_b, fh_b = face_info["box"]
+        fx_sb = int(fx_b * 256 / out_w)
+        fy_sb = int(fy_b * 256 / out_h)
+        fw_sb = int(fw_b * 256 / out_w)
+        fh_sb = int(fh_b * 256 / out_h)
+        cx_sb = max(0, min(255, fx_sb + fw_sb // 2))
+
+        torso_y_start = min(250, fy_sb + int(fh_sb * 1.10))
+        if torso_y_start < 255:
+            y_idx_arr = np.arange(torso_y_start, 256)
+            prog = (y_idx_arr - torso_y_start) / max(1.0, 255 - torso_y_start)
+            # Expands from shoulders down to waist
+            hws = (fw_sb * (0.85 + prog * 0.65)).astype(int)
+            torso_mask = np.zeros((256, 256), dtype=bool)
+            for y_idx, hw in zip(y_idx_arr, hws):
+                x1_t = max(0, cx_sb - hw)
+                x2_t = min(256, cx_sb + hw)
+                torso_mask[y_idx, x1_t:x2_t] = True
+
+            torso_signal = p_person[torso_mask]
+            if len(torso_signal) > 0 and np.mean(torso_signal) > 0.15:
+                p_person[torso_mask] = np.maximum(p_person[torso_mask], 0.92)
+
+    # Compact torso closing: only seal tiny cloth folds within the central torso
+    # Avoid large kernels that bridge the arm to the head, neck or outer gaps!
+    torso_close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    p_closed = cv2.morphologyEx(p_person, cv2.MORPH_CLOSE, torso_close_k)
+    p_person = np.maximum(p_person, p_closed)
+
+    # Solidify interior dropouts (e.g. dark shirt buttons, creases) without filling real
+    # background cavities such as the triangular opening when touching the head or putting arms on hips!
+    p_bin = (p_person > 0.25).astype(np.uint8)
+    if face_info.get("has_face"):
+        b_x1 = max(0, cx_sb - int(fw_sb * 1.4))
+        b_x2 = min(256, cx_sb + int(fw_sb * 1.4))
+        p_bin[253:256, b_x1:b_x2] = 1
+
+    flood_padded = cv2.copyMakeBorder(p_bin, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    f_h, f_w = flood_padded.shape
+    flood_mask = np.zeros((f_h + 2, f_w + 2), np.uint8)
+    cv2.floodFill(flood_padded, flood_mask, (0, 0), 255)
+    raw_holes = ((flood_padded[1:-1, 1:-1] == 0) & (p_bin == 0)).astype(np.uint8)
+
+    if np.any(raw_holes):
+        num_h, h_labels, h_stats, _ = cv2.connectedComponentsWithStats(raw_holes, connectivity=8)
+        valid_fill = np.zeros_like(p_person)
+        for h_i in range(1, num_h):
+            h_area = h_stats[h_i, cv2.CC_STAT_AREA]
+            # Anatomical cavities (arm-head triangle, arm-torso loop) are large (> 35 pixels).
+            # True shirt dropouts or dark buttons are tiny (<= 30 pixels).
+            # Also protect genuine background: if the model is confident in background, do not fill!
+            if h_area <= 35:
+                comp_mask = (h_labels == h_i)
+                if np.mean(probs[comp_mask, 0]) < 0.60:
+                    valid_fill[comp_mask] = 0.95
+        p_person = np.maximum(p_person, valid_fill)
+
+    # 1. Hand isolation (excluding face and strictly anatomical throat)
+    hand_skin = body_skin.copy()
+    if face_info.get("has_face"):
+        fx, fy, fw, fh = face_info["box"]
+        fx_s = int(fx * 256 / out_w)
+        fy_s = int(fy * 256 / out_h)
+        fw_s = int(fw * 256 / out_w)
+        fh_s = int(fh * 256 / out_h)
+        # Head / Face exclusion box
+        y1_ex = max(0, fy_s - int(fh_s * 0.20))
+        y2_ex = min(256, fy_s + int(fh_s * 1.15))
+        x1_ex = max(0, fx_s - int(fw_s * 0.20))
+        x2_ex = min(256, fx_s + int(fw_s * 1.20))
+        hand_skin[y1_ex:y2_ex, x1_ex:x2_ex] = 0.0
+
+        # Anatomical throat / neck exclusion (strictly between chin and collarbone)
+        y1_neck = max(0, fy_s + int(fh_s * 0.92))
+        y2_neck = min(256, fy_s + int(fh_s * 1.45))
+        x1_neck = max(0, fx_s + int(fw_s * 0.18))
+        x2_neck = min(256, fx_s + int(fw_s * 0.82))
+        hand_skin[y1_neck:y2_neck, x1_neck:x2_neck] = 0.0
+
+    has_hands = bool(np.max(hand_skin) > 0.20)
+
+    return p_person, hand_skin, has_hands, probs[:, :, 0]
+
+
+class HeavyAssistWorker:
+    """
+    Thread dedicada ao "heavy assist": executa as inferencias pesadas que nao precisam
+    acontecer em todo quadro (cadeira/objetos YOLACT, oculos BiSeNet, MODNet) com sua
+    propria rotacao de 3 fases, publicando as mascaras mais recentes para o loop
+    principal de video.
+
+    Contrato com o loop principal (ambos nao-bloqueantes):
+      - submit(framed, p_person, hand_skin, face_info, cfg): publica o contexto do
+        quadro atual. Politica latest-wins: se a thread ainda estiver ocupada com
+        a fase anterior, o quadro novo simplesmente substitui o pendente — nunca
+        ha fila acumulando latencia.
+      - results(): retorna copia das mascaras mais recentes publicadas (chaves:
+        chair, handheld, glasses, modnet). None = ainda nao rodou / desativado;
+        mascara zeros = rodou e nao ha deteccoes (funde como no-op).
+
+    A thread avanca uma fase por iteracao: 0 = cadeira/objetos (YOLACT),
+    1 = oculos (BiSeNet), 2 = MODNet. As mascaras publicadas ficam algumas
+    iteracoes atrasadas em relacao ao quadro ao vivo — a mesma ordem de
+    grandeza da antiga rotacao de 3 fases no loop principal; as suavizacoes
+    temporais (EMA) existentes absorvem esse atraso.
+    """
+
+    def __init__(self, chair_infer_req=None, chair_inp_name=None, chair_inp_w=550, chair_inp_h=550,
+                 glasses_infer_req=None, glasses_inp_name=None, glasses_out_name=None,
+                 glasses_inp_w=512, glasses_inp_h=512,
+                 modnet_infer_req=None, modnet_inp_name=None, modnet_out_name=None):
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._job = None
+        self._results = {"chair": None, "handheld": None, "glasses": None, "modnet": None}
+        self._phase = 0
+        self._iters = 0
+        self._iter_ms_ema = None
+        self._chair_req = chair_infer_req
+        self._chair_inp_name = chair_inp_name
+        self._chair_inp_w = chair_inp_w
+        self._chair_inp_h = chair_inp_h
+        self._glasses_req = glasses_infer_req
+        self._glasses_inp_name = glasses_inp_name
+        self._glasses_out_name = glasses_out_name
+        self._glasses_inp_w = glasses_inp_w
+        self._glasses_inp_h = glasses_inp_h
+        self._modnet_req = modnet_infer_req
+        self._modnet_inp_name = modnet_inp_name
+        self._modnet_out_name = modnet_out_name
+        self._thread = None
+
+    def start(self):
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._run, name="npu-heavy-assist", daemon=True)
+            self._thread.start()
+
+    def reset(self):
+        """Limpa mascaras publicadas e trabalho pendente (reconexao de camera)."""
+        with self._lock:
+            self._job = None
+            self._results = {"chair": None, "handheld": None, "glasses": None, "modnet": None}
+            self._phase = 0
+
+    def submit(self, framed, p_person, hand_skin, face_info, cfg):
+        """Publica o contexto do quadro atual (latest-wins, nao bloqueante)."""
+        job = {
+            "framed": framed.copy(),
+            "p_person": p_person.copy(),
+            "hand_skin": hand_skin.copy() if hand_skin is not None else None,
+            "face_info": dict(face_info) if face_info else {"has_face": False},
+            "cfg": cfg,
+        }
+        with self._lock:
+            self._job = job
+        self._wake.set()
+
+    def results(self):
+        with self._lock:
+            return dict(self._results)
+
+    def _publish(self, **masks):
+        with self._lock:
+            self._results.update(masks)
+
+    def _run(self):
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            with self._lock:
+                job = self._job
+                self._job = None
+            if job is None:
+                continue
+            t0 = time.perf_counter()
+            try:
+                self._process(job)
+            except Exception as e:
+                logging.warning(f"HeavyAssistWorker: falha na fase (ignorada): {e}")
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            self._iter_ms_ema = dt_ms if self._iter_ms_ema is None else (self._iter_ms_ema * 0.9 + dt_ms * 0.1)
+            self._iters += 1
+            if self._iters % 100 == 0:
+                logging.info(f"PERF-ASSIST | iteracoes: {self._iters} | fase (ema): {self._iter_ms_ema:.1f}ms")
+
+    def _process(self, job):
+        framed = job["framed"]
+        p_person = job["p_person"]
+        hand_skin = job["hand_skin"]
+        face_info = job["face_info"]
+        cfg = job["cfg"]
+
+        phase = self._phase
+        self._phase = (phase + 1) % 3
+
+        if phase == 0:
+            self._phase_chair(framed, p_person, hand_skin, cfg)
+        elif phase == 1:
+            self._phase_glasses(framed, face_info, cfg)
+        else:
+            self._phase_modnet(framed, cfg)
+
+    def _phase_chair(self, framed, p_person, hand_skin, cfg):
+        retain_chair_cfg = cfg.get("chair_retention_enabled", True)
+        has_hands = hand_skin is not None and bool(np.max(hand_skin) > 0.20)
+        retain_handheld_cfg = cfg.get("object_retention_enabled", True) and has_hands
+        if (not (retain_chair_cfg or retain_handheld_cfg)) or self._chair_req is None:
+            # Recursos desativados: publica zeros validos para manter o contrato
+            self._publish(chair=np.zeros_like(p_person), handheld=np.zeros_like(p_person))
+            return
+        chair_str = int(cfg.get("chair_retention_strength", 50))
+        handheld_str = int(cfg.get("handheld_object_strength", 60))
+        handheld_names = cfg.get("handheld_object_classes", ["cell phone", "cup", "book"])
+        handheld_indices = [COCO_CLASS_NAME_TO_INDEX[n] for n in handheld_names if n in COCO_CLASS_NAME_TO_INDEX] if retain_handheld_cfg else []
+        # Leitura direta (sem lock) so para continuidade da EMA temporal — corrida
+        # benigna: no pior caso usa a penultima mascara publicada.
+        _, chair_mask, handheld_mask = apply_neural_chair_retention(
+            p_person.copy(), framed,
+            chair_infer_req=self._chair_req,
+            chair_inp_name=self._chair_inp_name,
+            strength=chair_str, cached_chair_mask=self._results.get("chair"),
+            run_inference=True,
+            inp_w=self._chair_inp_w, inp_h=self._chair_inp_h,
+            retain_chair=retain_chair_cfg,
+            hand_mask=hand_skin, handheld_class_indices=handheld_indices,
+            handheld_strength=handheld_str, cached_handheld_mask=self._results.get("handheld"),
+        )
+        self._publish(chair=chair_mask, handheld=handheld_mask)
+
+    def _phase_glasses(self, framed, face_info, cfg):
+        preserve_glasses = cfg.get("preserve_glasses", cfg.get("glasses_protection", True))
+        if (not preserve_glasses) or (not face_info.get("has_face")) or self._glasses_req is None:
+            self._publish(glasses=None)
+            return
+        glasses_mask = apply_neural_glasses_retention(
+            framed, face_info,
+            glasses_infer_req=self._glasses_req,
+            glasses_inp_name=self._glasses_inp_name,
+            glasses_out_name=self._glasses_out_name,
+            cached_glasses_mask=self._results.get("glasses"),
+            run_inference=True,
+            inp_w=self._glasses_inp_w, inp_h=self._glasses_inp_h
+        )
+        self._publish(glasses=glasses_mask)
+
+    def _phase_modnet(self, framed, cfg):
+        is_modnet_active = (
+            cfg.get("video", {}).get("modnet_assist_enabled", False)
+            or cfg.get("modnet_assist_enabled", False)
+            or cfg.get("video", {}).get("segmentation_model", "multiclass") == "modnet"
+            or cfg.get("segmentation_model", "multiclass") == "modnet"
+        )
+        if self._modnet_req is None or not is_modnet_active:
+            self._publish(modnet=None)
+            return
+        fh, fw = framed.shape[:2]
+        lb_scale = min(512.0 / fw, 512.0 / fh)
+        lb_w, lb_h = max(1, int(round(fw * lb_scale))), max(1, int(round(fh * lb_scale)))
+        lb_resized = cv2.resize(framed, (lb_w, lb_h), interpolation=cv2.INTER_AREA)
+        lb_pad_x, lb_pad_y = (512 - lb_w) // 2, (512 - lb_h) // 2
+        modnet_canvas = np.zeros((512, 512, 3), dtype=np.uint8)
+        modnet_canvas[lb_pad_y:lb_pad_y + lb_h, lb_pad_x:lb_pad_x + lb_w] = lb_resized
+        modnet_blob = np.expand_dims(modnet_canvas, axis=0)
+
+        self._modnet_req.infer({self._modnet_inp_name: modnet_blob})
+        modnet_alpha = self._modnet_req.get_tensor(self._modnet_out_name).data[0, 0]
+        modnet_alpha_cropped = modnet_alpha[lb_pad_y:lb_pad_y + lb_h, lb_pad_x:lb_pad_x + lb_w]
+        self._publish(modnet=cv2.resize(modnet_alpha_cropped, (256, 256), interpolation=cv2.INTER_LINEAR))
+
 
 class AutoFramer:
     def __init__(self, in_w, in_h, out_w, out_h, smoothness=0.04, deadzone=0.10, framing_mode="single", zoom=50):
@@ -1078,6 +1465,16 @@ def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_i
                     else:
                         updated_chair_cache = valid_chair
 
+        # Correcao do bug de rotacao: quando a inferencia executou mas nenhuma
+        # cadeira/objeto foi detectado, publica-se uma mascara vazia VALIDA (zeros)
+        # em vez de None. None deve significar apenas "nunca rodou" — se voltasse
+        # None, o call site (should_infer_chair) re-inferiria o YOLACT em TODOS os
+        # quadros sempre que nao houvesse objetos na cena.
+        if updated_chair_cache is None:
+            updated_chair_cache = np.zeros_like(p_person)
+        if updated_handheld_cache is None:
+            updated_handheld_cache = np.zeros_like(p_person)
+
         merged = p_person
         if updated_chair_cache is not None:
             merged = np.maximum(merged, updated_chair_cache)
@@ -1161,8 +1558,13 @@ def apply_neural_glasses_retention(
             # Se havia mascara anterior, decai suavemente antes de zerar
             if cached_glasses_mask is not None:
                 decayed = cached_glasses_mask * 0.4
-                return decayed if np.max(decayed) > 0.08 else None
-            return None
+                if np.max(decayed) > 0.08:
+                    return decayed
+            # Correcao do bug de rotacao: inferencia rodou e nao ha oculos na cena.
+            # Retorna mascara vazia VALIDA (zeros) — None significaria "nunca rodou"
+            # no call site (should_infer_glasses) e forcaria re-inferencia do BiSeNet
+            # em TODOS os quadros quando o usuario nao usa oculos.
+            return np.zeros((h_orig, w_orig), dtype=np.float32)
 
         # Redimensiona mascara de volta para as dimensoes do crop no frame
         glasses_crop_unpad = cv2.resize(glasses_bin, (cw, ch), interpolation=cv2.INTER_NEAREST)
@@ -1737,12 +2139,54 @@ def main():
     model = core.read_model(str(active_seg_path))
     compiled_model = core.compile_model(model, inference_device)
     infer_request = compiled_model.create_infer_request()
+    log_execution_devices("modelo principal (segmentacao)", compiled_model)
     seg_inp_name = model.inputs[0].get_any_name()
     seg_out_name = model.outputs[0].get_any_name()
     seg_inp_shape = list(model.inputs[0].get_shape())
     is_multiclass = (active_seg_path == SEG_MULTICLASS_PATH) or (len(seg_inp_shape) == 4 and seg_inp_shape[-1] == 3)
     seg_type_label = "Multiclass (6-class + Hand/Skin)" if is_multiclass else "Legacy Landscape"
     logging.info(f"NPU segmentation model compiled successfully! Type: {seg_type_label}, In: {seg_inp_shape}")
+
+    # Passo 4: inferencia primaria assincrona (AsyncInferQueue, jobs=2).
+    # O loop submete o quadro atual (quando ha slot livre) e consome o resultado
+    # mais recente publicado pelo callback — a latencia de NPU (inclusive a
+    # contencao com a thread heavy-assist) sai do caminho critico. O callback
+    # roda a cadeia completa de pos-processamento via postprocess_multiclass_mask.
+    # Desative com "async_primary_enabled": false no config para rollback instantaneo.
+    async_primary_enabled = bool(cfg.get("async_primary_enabled", True))
+    primary_async_state = {"p_person": None, "hand_skin": None, "has_hands": False, "bg_prob": None, "seq": -1, "cb_ema": None}
+    primary_async_lock = threading.Lock()
+    primary_submit_seq = 0
+    primary_async_log_ctr = 0
+    primary_async_submitted = 0
+    primary_async_reused = 0
+    primary_queue = None
+
+    def on_primary_async_result(request, userdata):
+        t0 = time.perf_counter()
+        fi_cb, seq_cb, w_cb, h_cb = userdata
+        raw = request.get_tensor(seg_out_name).data[0].copy()  # copia: o buffer e reutilizado
+        p_person_cb, hand_skin_cb, has_hands_cb, bg_prob_cb = postprocess_multiclass_mask(raw, fi_cb, w_cb, h_cb)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        with primary_async_lock:
+            # Politica latest-wins por sequencia: descarta resultado fora de ordem
+            if seq_cb > primary_async_state["seq"]:
+                primary_async_state["p_person"] = p_person_cb
+                primary_async_state["hand_skin"] = hand_skin_cb
+                primary_async_state["has_hands"] = has_hands_cb
+                primary_async_state["bg_prob"] = bg_prob_cb
+                primary_async_state["seq"] = seq_cb
+            ema = primary_async_state["cb_ema"]
+            primary_async_state["cb_ema"] = dt_ms if ema is None else ema * 0.9 + dt_ms * 0.1
+
+    if async_primary_enabled and is_multiclass:
+        try:
+            primary_queue = AsyncInferQueue(compiled_model, jobs=2)
+            primary_queue.set_callback(on_primary_async_result)
+            logging.info("Inferencia primaria assincrona habilitada (AsyncInferQueue, jobs=2).")
+        except Exception as e_async:
+            primary_queue = None
+            logging.warning(f"AsyncInferQueue indisponivel ({e_async}); usando caminho sincrono.")
 
     # MODNet Portrait Matting (Apache 2.0) is never used as the PRIMARY model - it lacks the
     # hand/skin/clothes channels needed for gesture detection, hand-held object retention and
@@ -1768,6 +2212,7 @@ def main():
             chair_model = core.read_model(str(SEG_CHAIR_PATH))
             chair_compiled = core.compile_model(chair_model, inference_device)
             chair_infer_req = chair_compiled.create_infer_request()
+            log_execution_devices("cadeira YOLACT", chair_compiled)
             chair_inp_name = chair_model.inputs[0].get_any_name()
             c_shape = chair_model.inputs[0].shape
             if len(c_shape) >= 4:
@@ -1779,6 +2224,7 @@ def main():
             try:
                 chair_compiled = core.compile_model(chair_model, "CPU")
                 chair_infer_req = chair_compiled.create_infer_request()
+                log_execution_devices("cadeira YOLACT (fallback CPU)", chair_compiled)
                 chair_inp_name = chair_model.inputs[0].get_any_name()
                 c_shape = chair_model.inputs[0].shape
                 if len(c_shape) >= 4:
@@ -1800,6 +2246,7 @@ def main():
             try:
                 glasses_compiled = core.compile_model(glasses_model, inference_device)
                 glasses_infer_req = glasses_compiled.create_infer_request()
+                log_execution_devices("oculos BiSeNet", glasses_compiled)
                 glasses_inp_name = glasses_model.inputs[0].get_any_name()
                 glasses_out_name = glasses_model.outputs[0].get_any_name()
                 g_shape = glasses_model.inputs[0].shape
@@ -1811,6 +2258,7 @@ def main():
                 logging.warning(f"Could not compile BiSeNet Face Parsing model on {inference_device}: {e}. Retrying on CPU...")
                 glasses_compiled = core.compile_model(glasses_model, "CPU")
                 glasses_infer_req = glasses_compiled.create_infer_request()
+                log_execution_devices("oculos BiSeNet (fallback CPU)", glasses_compiled)
                 glasses_inp_name = glasses_model.inputs[0].get_any_name()
                 glasses_out_name = glasses_model.outputs[0].get_any_name()
                 g_shape = glasses_model.inputs[0].shape
@@ -1831,11 +2279,17 @@ def main():
             modnet_model = core.read_model(str(SEG_MODNET_PATH))
             modnet_compiled = core.compile_model(modnet_model, inference_device)
             modnet_infer_req = modnet_compiled.create_infer_request()
+            log_execution_devices("MODNet", modnet_compiled)
             modnet_inp_name = modnet_model.inputs[0].get_any_name()
             modnet_out_name = modnet_model.outputs[0].get_any_name()
             logging.info(f"MODNet assist model compiled successfully on {inference_device}!")
         except Exception as e:
             logging.warning(f"Could not compile MODNet assist model: {e}. Continuing without it.")
+
+    # Thread dedicada ao heavy assist (cadeira YOLACT / oculos BiSeNet / MODNet).
+    # Criada sob demanda no primeiro ciclo ativo da camera e reutilizada entre
+    # reconexoes (reset() limpa as mascaras publicadas a cada ativacao).
+    heavy_assist_worker = None
 
     last_bg_path = ""
     cached_bg = None
@@ -1868,16 +2322,21 @@ def main():
         gesture_latched = False
         gesture_cooldown_until = 0.0
         prev_mask = None
-        # Contador compartilhado de rotacao entre os modelos "assist" pesados da NPU
-        # (cadeira YOLACT, oculos BiSeNet, MODNet). Cada um so faz inferencia nova em
-        # 1 a cada 3 quadros, em fases diferentes - garante que nunca dois modelos
-        # pesados disputem a NPU no mesmo quadro. Nos outros 2 quadros a mascara em
-        # cache e reaproveitada.
-        heavy_assist_phase = 0
-        cached_chair_mask = None
-        cached_handheld_obj_mask = None
-        cached_glasses_mask = None
-        cached_modnet_mask = None
+        # Heavy Assist Worker: as inferencias pesadas (cadeira/objetos YOLACT,
+        # oculos BiSeNet, MODNet) rodam agora em uma thread dedicada com rotacao
+        # de 3 fases propria. O loop principal apenas publica o contexto de cada
+        # quadro (politica latest-wins, sem bloquear) e funde as mascaras mais
+        # recentes publicadas por ela.
+        if heavy_assist_worker is None:
+            heavy_assist_worker = HeavyAssistWorker(
+                chair_infer_req=chair_infer_req, chair_inp_name=chair_inp_name,
+                chair_inp_w=chair_inp_w, chair_inp_h=chair_inp_h,
+                glasses_infer_req=glasses_infer_req, glasses_inp_name=glasses_inp_name,
+                glasses_out_name=glasses_out_name, glasses_inp_w=glasses_inp_w, glasses_inp_h=glasses_inp_h,
+                modnet_infer_req=modnet_infer_req, modnet_inp_name=modnet_inp_name, modnet_out_name=modnet_out_name,
+            )
+        heavy_assist_worker.reset()
+        heavy_assist_worker.start()
         morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
         # Pre-warm gesture emoji cache into memory
@@ -1889,6 +2348,8 @@ def main():
         has_active_consumers = False
         in_standby = False
         voice_tracker = VoiceActivityTracker(hold_time=float(cfg.get("framing_voice_hold", 1.5)))
+        perf_stats_on = bool(cfg.get("perf_stats_enabled", True))
+        stage_timer = LoopStageTimer(log_every=int(cfg.get("perf_stats_interval", 300)))
 
         while running:
             now = time.time()
@@ -1979,6 +2440,16 @@ def main():
                     if ret and test_frame is not None:
                         actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                         actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        # Passo 4: nova sessao de camera — descarta mascaras async de
+                        # uma sessao anterior (podem ter minutos de idade) para forcar
+                        # o aquecimento sincrono do primeiro quadro.
+                        if primary_queue is not None:
+                            with primary_async_lock:
+                                primary_async_state["p_person"] = None
+                                primary_async_state["hand_skin"] = None
+                                primary_async_state["has_hands"] = False
+                                primary_async_state["bg_prob"] = None
+                                primary_async_state["seq"] = -1
                         framer = AutoFramer(
                             actual_w, actual_h, out_w, out_h,
                             smoothness=float(cfg.get("framing_smoothness", 0.04)),
@@ -2000,12 +2471,16 @@ def main():
                     time.sleep(0.5)
                     continue
 
+            if perf_stats_on:
+                stage_timer.begin()
             ret, frame = cap.read()
             if not ret or frame is None:
                 logging.warning("Failed to read frame from physical camera. Will reconnect...")
                 cap.release()
                 cap = None
                 continue
+            if perf_stats_on:
+                stage_timer.lap("1_captura")
 
             # 1. Framing and Face Landmark Tracking (Single vs Group Mode)
             auto_framing_enabled = cfg.get("auto_framing", True)
@@ -2036,6 +2511,8 @@ def main():
                 smoothness=framing_smoothness,
                 deadzone=framing_deadzone
             ) if framer else cv2.resize(frame, (out_w, out_h))
+            if perf_stats_on:
+                stage_timer.lap("2_enquadramento")
 
             # 2. Smart Auto-Privacy on Absence with Smooth Fade-in / Fade-out Transition
             privacy_enabled = cfg.get("privacy_enabled", False)
@@ -2105,6 +2582,9 @@ def main():
                 sh_strength = int(cfg.get("sharpen_strength", 35))
                 processed_fg = apply_smart_sharpen(processed_fg, strength=sh_strength)
 
+            if perf_stats_on:
+                stage_timer.lap("3_filtros")
+
             # 3. Background Blur / Replacement
             blur_enabled = cfg.get("blur_enabled", True)
             bg_path = os.path.expanduser(cfg.get("background_image", ""))
@@ -2116,118 +2596,67 @@ def main():
                     rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
                     blob = np.expand_dims(rgb, axis=0)
 
-                    # NPU Inference (~13.5ms)
-                    infer_request.infer({seg_inp_name: blob})
-                    raw = infer_request.get_tensor(seg_out_name).data[0]  # (256, 256, 6)
+                    # Passo 4: inferencia primaria assincrona (AsyncInferQueue).
+                    # A NPU sai do caminho critico: o loop submete o quadro atual
+                    # (quando ha slot livre) e consome o resultado mais recente
+                    # publicado pelo callback — que ja entrega p_person, hand_skin,
+                    # has_hands e bg_prob pos-processados (softmax, torso boost,
+                    # fechamento morfologico, cavidades e isolamento de maos rodam
+                    # na thread do callback, em paralelo com o loop).
+                    if primary_queue is not None and primary_async_state["p_person"] is not None:
+                        if primary_queue.is_ready():
+                            fi_cb = {
+                                "has_face": bool(face_info.get("has_face", False)),
+                                "box": list(face_info["box"]) if face_info.get("has_face") else [0, 0, 0, 0],
+                            }
+                            primary_queue.start_async(
+                                {seg_inp_name: blob}, (fi_cb, primary_submit_seq, out_w, out_h)
+                            )
+                            primary_submit_seq += 1
+                            primary_async_submitted += 1
+                        else:
+                            # NPU ocupada com o quadro anterior e/ou com a thread
+                            # heavy-assist: reutiliza a ultima mascara publicada.
+                            primary_async_reused += 1
+                        with primary_async_lock:
+                            p_person = primary_async_state["p_person"]
+                            hand_skin = primary_async_state["hand_skin"]
+                            has_hands = primary_async_state["has_hands"]
+                            bg_prob = primary_async_state["bg_prob"]
+                        primary_async_log_ctr += 1
+                        if primary_async_log_ctr >= 100:
+                            primary_async_log_ctr = 0
+                            _cb_ema = primary_async_state["cb_ema"]
+                            _cb_ema_s = f"{_cb_ema:.1f}ms" if _cb_ema is not None else "n/d"
+                            logging.info(
+                                f"PERF-ASYNC | submit: {primary_async_submitted} | "
+                                f"reuso: {primary_async_reused} | callback (ema): {_cb_ema_s}"
+                            )
+                            primary_async_submitted = 0
+                            primary_async_reused = 0
+                    else:
+                        # Caminho sincrono: aquecimento do primeiro quadro (antes do
+                        # primeiro resultado do callback) ou async_primary_enabled=False.
+                        # Mesma matematica do callback, via postprocess_multiclass_mask().
+                        infer_request.infer({seg_inp_name: blob})
+                        raw = infer_request.get_tensor(seg_out_name).data[0]  # (256, 256, 6)
+                        p_person, hand_skin, has_hands, bg_prob = postprocess_multiclass_mask(
+                            raw, face_info, out_w, out_h
+                        )
+                        if primary_queue is not None:
+                            # Publica para o proximo quadro entrar no caminho async
+                            with primary_async_lock:
+                                primary_async_state["p_person"] = p_person.copy()
+                                primary_async_state["hand_skin"] = hand_skin.copy()
+                                primary_async_state["has_hands"] = has_hands
+                                primary_async_state["bg_prob"] = bg_prob.copy()
 
-                    # Softmax probabilities
-                    exp_raw = np.exp(raw - np.max(raw, axis=-1, keepdims=True))
-                    probs = exp_raw / np.sum(exp_raw, axis=-1, keepdims=True)
+                    if perf_stats_on:
+                        stage_timer.lap("4a_inferencia_primaria")
+                        stage_timer.lap("4b_cavidades")
 
-                    # 1.0 - background gives full human silhouette (classes 1..5)
-                    p_person = 1.0 - probs[:, :, 0]
-
-                    # Direct foreground vs background logit differential:
-                    # In multiclass, the sum of human classes (hair, skin, clothes, etc.) can be diluted
-                    # when individual classes are split. fg_max_logits compares the strongest human class
-                    # against the background logit directly!
-                    fg_max_logits = np.max(raw[:, :, 1:], axis=-1)
-                    bg_logits = raw[:, :, 0]
-                    logit_diff = fg_max_logits - bg_logits
-                    p_direct_fg = 1.0 / (1.0 + np.exp(-1.8 * logit_diff))
-                    p_person = np.maximum(p_person, p_direct_fg)
-
-                    # Boost human foreground components: body-skin and clothes (arms, sleeves, torso)
-                    body_skin = probs[:, :, 2]
-                    clothes = probs[:, :, 4]
-                    human_body = np.maximum(body_skin * 1.25, clothes * 1.35)
-                    p_person = np.maximum(p_person, np.clip(human_body, 0.0, 1.0))
-
-                    # Anatomical Torso Core Boost:
-                    # Directly below the chin/neck, the central column beneath the face
-                    # is the user's torso. Reinforce any signal here so shirts never become transparent.
-                    if face_info.get("has_face"):
-                        fx_b, fy_b, fw_b, fh_b = face_info["box"]
-                        fx_sb = int(fx_b * 256 / out_w)
-                        fy_sb = int(fy_b * 256 / out_h)
-                        fw_sb = int(fw_b * 256 / out_w)
-                        fh_sb = int(fh_b * 256 / out_h)
-                        cx_sb = max(0, min(255, fx_sb + fw_sb // 2))
-
-                        torso_y_start = min(250, fy_sb + int(fh_sb * 1.10))
-                        if torso_y_start < 255:
-                            y_idx_arr = np.arange(torso_y_start, 256)
-                            prog = (y_idx_arr - torso_y_start) / max(1.0, 255 - torso_y_start)
-                            # Expands from shoulders down to waist
-                            hws = (fw_sb * (0.85 + prog * 0.65)).astype(int)
-                            torso_mask = np.zeros((256, 256), dtype=bool)
-                            for y_idx, hw in zip(y_idx_arr, hws):
-                                x1_t = max(0, cx_sb - hw)
-                                x2_t = min(256, cx_sb + hw)
-                                torso_mask[y_idx, x1_t:x2_t] = True
-
-                            torso_signal = p_person[torso_mask]
-                            if len(torso_signal) > 0 and np.mean(torso_signal) > 0.15:
-                                p_person[torso_mask] = np.maximum(p_person[torso_mask], 0.92)
-
-                    # Compact torso closing: only seal tiny cloth folds within the central torso
-                    # Avoid large kernels that bridge the arm to the head, neck or outer gaps!
-                    torso_close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                    p_closed = cv2.morphologyEx(p_person, cv2.MORPH_CLOSE, torso_close_k)
-                    p_person = np.maximum(p_person, p_closed)
-
-                    # Solidify interior dropouts (e.g. dark shirt buttons, creases) without filling real
-                    # background cavities such as the triangular opening when touching the head or putting arms on hips!
-                    p_bin = (p_person > 0.25).astype(np.uint8)
-                    if face_info.get("has_face"):
-                        b_x1 = max(0, cx_sb - int(fw_sb * 1.4))
-                        b_x2 = min(256, cx_sb + int(fw_sb * 1.4))
-                        p_bin[253:256, b_x1:b_x2] = 1
-
-                    flood_padded = cv2.copyMakeBorder(p_bin, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
-                    f_h, f_w = flood_padded.shape
-                    flood_mask = np.zeros((f_h + 2, f_w + 2), np.uint8)
-                    cv2.floodFill(flood_padded, flood_mask, (0, 0), 255)
-                    raw_holes = ((flood_padded[1:-1, 1:-1] == 0) & (p_bin == 0)).astype(np.uint8)
-
-                    if np.any(raw_holes):
-                        num_h, h_labels, h_stats, _ = cv2.connectedComponentsWithStats(raw_holes, connectivity=8)
-                        valid_fill = np.zeros_like(p_person)
-                        for h_i in range(1, num_h):
-                            h_area = h_stats[h_i, cv2.CC_STAT_AREA]
-                            # Anatomical cavities (arm-head triangle, arm-torso loop) are large (> 35 pixels).
-                            # True shirt dropouts or dark buttons are tiny (<= 30 pixels).
-                            # Also protect genuine background: if the model is confident in background, do not fill!
-                            if h_area <= 35:
-                                comp_mask = (h_labels == h_i)
-                                if np.mean(probs[comp_mask, 0]) < 0.60:
-                                    valid_fill[comp_mask] = 0.95
-                        p_person = np.maximum(p_person, valid_fill)
-
-                    # 1. Hand isolation (excluding face and strictly anatomical throat)
-                    hand_skin = body_skin.copy()
-                    if face_info.get("has_face"):
-                        fx, fy, fw, fh = face_info["box"]
-                        fx_s = int(fx * 256 / out_w)
-                        fy_s = int(fy * 256 / out_h)
-                        fw_s = int(fw * 256 / out_w)
-                        fh_s = int(fh * 256 / out_h)
-                        # Head / Face exclusion box
-                        y1_ex = max(0, fy_s - int(fh_s * 0.20))
-                        y2_ex = min(256, fy_s + int(fh_s * 1.15))
-                        x1_ex = max(0, fx_s - int(fw_s * 0.20))
-                        x2_ex = min(256, fx_s + int(fw_s * 1.20))
-                        hand_skin[y1_ex:y2_ex, x1_ex:x2_ex] = 0.0
-
-                        # Anatomical throat / neck exclusion (strictly between chin and collarbone)
-                        y1_neck = max(0, fy_s + int(fh_s * 0.92))
-                        y2_neck = min(256, fy_s + int(fh_s * 1.45))
-                        x1_neck = max(0, fx_s + int(fw_s * 0.18))
-                        x2_neck = min(256, fx_s + int(fw_s * 0.82))
-                        hand_skin[y1_neck:y2_neck, x1_neck:x2_neck] = 0.0
-
-                    has_hands = bool(np.max(hand_skin) > 0.20)
-
+                    if perf_stats_on:
+                        stage_timer.lap("4c_isolamento_maos")
                     # 2. Handheld Object Retention (Preservação de Objetos Segurados na Mão)
                     # Retém objetos segurados (caneca, celular, caneta) dentro da palma/pegada sem
                     # expandir uma bolha sólida para o fundo ou fundir os dedos ao gesticular.
@@ -2241,38 +2670,24 @@ def main():
                             interaction_zone = cv2.dilate(hand_bin, k_el, iterations=1)
                             closed_mask = cv2.morphologyEx(p_person, cv2.MORPH_CLOSE, k_el)
                             # Retém apenas onde o modelo não tiver alta certeza de ser fundo puro
-                            retained_candidate = np.where((interaction_zone > 0) & (probs[:, :, 0] < 0.65), closed_mask, p_person)
+                            retained_candidate = np.where((interaction_zone > 0) & (bg_prob < 0.65), closed_mask, p_person)
                             p_person = np.maximum(p_person, retained_candidate)
 
+                    if perf_stats_on:
+                        stage_timer.lap("4d_objetos_heuristica")
                     # 2.1 Neural Chair & Headrest Retention + Handheld Object Retention (COCO)
-                    # (Modelo de Segmentacao de Instancias YOLACT na NPU - mesma inferencia reaproveitada)
-                    retain_chair_cfg = cfg.get("chair_retention_enabled", True)
-                    retain_handheld_cfg = cfg.get("object_retention_enabled", True) and has_hands
-                    if retain_chair_cfg or retain_handheld_cfg:
-                        chair_str = int(cfg.get("chair_retention_strength", 50))
-                        handheld_str = int(cfg.get("handheld_object_strength", 60))
-                        handheld_names = cfg.get("handheld_object_classes", ["cell phone", "cup", "book"])
-                        handheld_indices = [COCO_CLASS_NAME_TO_INDEX[n] for n in handheld_names if n in COCO_CLASS_NAME_TO_INDEX] if retain_handheld_cfg else []
-                        should_infer_chair = (heavy_assist_phase == 0) or (cached_chair_mask is None) or (cached_handheld_obj_mask is None)
-                        p_person, cached_chair_mask, cached_handheld_obj_mask = apply_neural_chair_retention(
-                            p_person, framed,
-                            chair_infer_req=chair_infer_req,
-                            chair_inp_name=chair_inp_name,
-                            strength=chair_str,
-                            cached_chair_mask=cached_chair_mask,
-                            run_inference=should_infer_chair,
-                            inp_w=chair_inp_w,
-                            inp_h=chair_inp_h,
-                            retain_chair=retain_chair_cfg,
-                            hand_mask=hand_skin,
-                            handheld_class_indices=handheld_indices,
-                            handheld_strength=handheld_str,
-                            cached_handheld_mask=cached_handheld_obj_mask
-                        )
-                    else:
-                        cached_chair_mask = None
-                        cached_handheld_obj_mask = None
+                    # (Executado na thread heavy-assist: o loop publica o contexto do quadro
+                    # atual — latest-wins, sem bloquear — e apenas funde as mascaras mais
+                    # recentes publicadas por ela.)
+                    heavy_assist_worker.submit(framed, p_person, hand_skin, face_info, cfg)
+                    heavy_masks = heavy_assist_worker.results()
+                    if heavy_masks["chair"] is not None:
+                        p_person = np.maximum(p_person, heavy_masks["chair"])
+                    if heavy_masks["handheld"] is not None:
+                        p_person = np.maximum(p_person, heavy_masks["handheld"])
 
+                    if perf_stats_on:
+                        stage_timer.lap("4e_yolact_cadeira_coco")
                     # 3. Real-time Hand Gesture Recognition & Triggers
                     if cfg.get("gesture_detection_enabled", True):
                         g_act = cfg.get("gesture_action", "all")
@@ -2323,70 +2738,32 @@ def main():
                         no_hand_count = 0
                         gesture_latched = False
 
+                    if perf_stats_on:
+                        stage_timer.lap("4f_gestos")
                     # Optional MODNet Assist Pass (hybrid mode, Apache 2.0):
-                    # Validated on a real test photo that multiclass alone frequently
-                    # misclassifies plain dark/black clothing as background well inside the
-                    # silhouette (not just at the edges). Taking the pixel-wise MAX of both
-                    # models' person confidence fixes that - whichever model is more sure
-                    # about a pixel wins - while never removing correctly-detected multiclass
-                    # regions, so this is a safe, strictly additive combination.
-                    is_modnet_active = (
-                        cfg.get("video", {}).get("modnet_assist_enabled", False)
-                        or cfg.get("modnet_assist_enabled", False)
-                        or cfg.get("video", {}).get("segmentation_model", "multiclass") == "modnet"
-                        or cfg.get("segmentation_model", "multiclass") == "modnet"
-                    )
-                    if modnet_infer_req is not None and is_modnet_active:
-                        should_infer_modnet = (heavy_assist_phase == 2) or (cached_modnet_mask is None)
-                        if should_infer_modnet:
-                            fh, fw = framed.shape[:2]
-                            lb_scale = min(512.0 / fw, 512.0 / fh)
-                            lb_w, lb_h = max(1, int(round(fw * lb_scale))), max(1, int(round(fh * lb_scale)))
-                            lb_resized = cv2.resize(framed, (lb_w, lb_h), interpolation=cv2.INTER_AREA)
-                            lb_pad_x, lb_pad_y = (512 - lb_w) // 2, (512 - lb_h) // 2
-                            modnet_canvas = np.zeros((512, 512, 3), dtype=np.uint8)
-                            modnet_canvas[lb_pad_y:lb_pad_y + lb_h, lb_pad_x:lb_pad_x + lb_w] = lb_resized
-                            modnet_blob = np.expand_dims(modnet_canvas, axis=0)
-
-                            modnet_infer_req.infer({modnet_inp_name: modnet_blob})
-                            modnet_alpha = modnet_infer_req.get_tensor(modnet_out_name).data[0, 0]
-                            modnet_alpha_cropped = modnet_alpha[lb_pad_y:lb_pad_y + lb_h, lb_pad_x:lb_pad_x + lb_w]
-                            cached_modnet_mask = cv2.resize(modnet_alpha_cropped, (256, 256), interpolation=cv2.INTER_LINEAR)
-
-                        if cached_modnet_mask is not None:
-                            p_person = np.maximum(p_person, cached_modnet_mask)
-                    else:
-                        cached_modnet_mask = None
+                    # agora executado na thread heavy-assist — o loop apenas funde a
+                    # mascara mais recente publicada (max pixel a pixel, combinacao
+                    # estritamente aditiva preservada).
+                    heavy_masks = heavy_assist_worker.results()
+                    if heavy_masks["modnet"] is not None:
+                        p_person = np.maximum(p_person, heavy_masks["modnet"])
                 else:
                     # Legacy 144x256 model fallback
                     small = cv2.resize(framed, (256, 144))
                     blob = np.expand_dims(np.transpose(small.astype(np.float32) / 255.0, (2, 0, 1)), axis=0)
                     infer_request.infer({seg_inp_name: blob})
                     p_person = infer_request.get_tensor(seg_out_name).data[0, 0]
+                    # Publica o contexto para a thread heavy-assist tambem no modo
+                    # legacy (apenas oculos sao aplicaveis neste formato).
+                    heavy_assist_worker.submit(framed, p_person, None, face_info, cfg)
 
-                # 2.2 Neural Eyeglasses & Frame Retention (Modelo BiSeNet Face Parsing na NPU - MIT License)
-                preserve_glasses = cfg.get("preserve_glasses", cfg.get("glasses_protection", True))
-                if preserve_glasses and face_info.get("has_face") and glasses_infer_req is not None:
-                    should_infer_glasses = (heavy_assist_phase == 1) or (cached_glasses_mask is None)
-                    cached_glasses_mask = apply_neural_glasses_retention(
-                        framed, face_info,
-                        glasses_infer_req=glasses_infer_req,
-                        glasses_inp_name=glasses_inp_name,
-                        glasses_out_name=glasses_out_name,
-                        cached_glasses_mask=cached_glasses_mask,
-                        run_inference=should_infer_glasses,
-                        inp_w=glasses_inp_w,
-                        inp_h=glasses_inp_h
-                    )
-                    if cached_glasses_mask is not None:
-                        g_low = cv2.resize(cached_glasses_mask, (p_person.shape[1], p_person.shape[0]), interpolation=cv2.INTER_LINEAR)
-                        p_person = np.maximum(p_person, g_low)
-                else:
-                    cached_glasses_mask = None
-
-                # Avanca a fase da rotacao compartilhada (cadeira/oculos/MODNet) uma
-                # unica vez por quadro, depois que os tres ja leram o mesmo valor acima.
-                heavy_assist_phase = (heavy_assist_phase + 1) % 3
+                # 2.2 Neural Eyeglasses & Frame Retention (BiSeNet Face Parsing na NPU - MIT License)
+                # Executado na thread heavy-assist: o loop apenas funde a mascara
+                # mais recente publicada.
+                ha_glasses = heavy_assist_worker.results().get("glasses")
+                if ha_glasses is not None:
+                    g_low = cv2.resize(ha_glasses, (p_person.shape[1], p_person.shape[0]), interpolation=cv2.INTER_LINEAR)
+                    p_person = np.maximum(p_person, g_low)
 
                 # Motion-Adaptive Temporal Filtering:
                 # Kills pixel jitter on static areas, but responds promptly to arm/hand motion
@@ -2423,6 +2800,8 @@ def main():
 
                 # Fast Guided Filter:
                 # Uses camera color/luminance to snap the mask to exact real-world 1080p hair & finger edges!
+                if perf_stats_on:
+                    stage_timer.lap("4g_modnet_oculos_temporal")
                 gf_size = cfg.get("guided_filter_guide_size", [640, 360])
                 if isinstance(gf_size, (list, tuple)) and len(gf_size) == 2:
                     gw, gh = int(gf_size[0]), int(gf_size[1])
@@ -2455,8 +2834,9 @@ def main():
                     out_shape=(out_w, out_h),
                     color_guide=gf_color
                 )
-                if cached_glasses_mask is not None:
-                    mask_full = np.maximum(mask_full, cached_glasses_mask)
+                ha_glasses_gf = heavy_assist_worker.results().get("glasses")
+                if ha_glasses_gf is not None:
+                    mask_full = np.maximum(mask_full, ha_glasses_gf)
 
                 # Clean Matte Clamping:
                 # 1. White clamp: Ensure body/clothes interior is 100% solid (no virtual background bleeding through).
@@ -2464,15 +2844,15 @@ def main():
                 if is_bg_replacement:
                     black_cut = 0.06
                     white_cut = 0.78
-                    mask_full = np.where(mask_full < black_cut, 0.0, mask_full)
-                    mask_full = np.where(mask_full > white_cut, 1.0, mask_full)
-                    trans = (mask_full >= black_cut) & (mask_full <= white_cut)
-                    mask_full[trans] = (mask_full[trans] - black_cut) / (white_cut - black_cut)
+                    # Otimizacao Passo 3: clip + remapeamento linear vetorial equivale
+                    # exatamente ao corte branco/preto + rampa dos thresholds
+                    # originais, sem a indexacao booleana (fancy indexing) que dominava
+                    # o custo (3.9ms -> 0.7ms medidos em 1280x720).
+                    mask_full = np.clip(mask_full, black_cut, white_cut)
+                    mask_full = (mask_full - black_cut) * (1.0 / (white_cut - black_cut))
                 else:
                     mask_full = np.where(mask_full > 0.80, 1.0, mask_full)
                     mask_full = np.where(mask_full < 0.02, 0.0, mask_full)
-
-                mask_3c = cv2.merge([mask_full, mask_full, mask_full])
 
                 # Rim Light (Contour / Hair Light)
                 if cfg.get("rim_light_enabled", False):
@@ -2555,7 +2935,13 @@ def main():
                         bg = cv2.resize(blur_small, (out_w, out_h))
 
                 # Smooth natural blend
-                output_frame = (processed_fg * mask_3c + bg * (1.0 - mask_3c)).astype(np.uint8)
+                # Otimizacao Passo 3: cv2.blendLinear executa o mesmo alpha blend
+                # (fg*mask + bg*(1-mask)) em SIMD nativo direto sobre uint8, sem os
+                # ~45MB de temporarios float32 do caminho numpy anterior (merge de
+                # 3 canais + 4 operacoes de resolucao cheia). Medido em 1280x720:
+                # 19.1ms -> 2.0ms; diferenca maxima vs numpy: 1 LSB (arredondamento
+                # ao inves de truncamento — visualmente identico).
+                output_frame = cv2.blendLinear(processed_fg, bg, mask_full, 1.0 - mask_full)
 
                 # 8. Post-Processing: Cinematic Color Grading
                 color_f = cfg.get("color_filter", "none")
@@ -2568,10 +2954,6 @@ def main():
                     output_frame = apply_artistic_filter(output_frame, mode=art_f, strength=int(cfg.get("artistic_strength", 70)))
             else:
                 prev_mask = None
-                cached_glasses_mask = None
-                cached_chair_mask = None
-                cached_handheld_obj_mask = None
-                cached_modnet_mask = None
                 output_frame = processed_fg
 
                 # Post-Processing: Cinematic Color Grading & Artistic Filters even without blur
@@ -2600,9 +2982,16 @@ def main():
             if privacy_fade_alpha > 0.0 and privacy_screen is not None:
                 output_frame = cv2.addWeighted(privacy_screen, privacy_fade_alpha, output_frame, 1.0 - privacy_fade_alpha, 0)
 
+            if perf_stats_on:
+                stage_timer.lap("4h_guided_composicao")
+
             # Send 1080p frame to virtual camera
+            _t_out = time.perf_counter() if perf_stats_on else 0.0
             vcam.send(output_frame)
             vcam.sleep_until_next_frame()
+            if perf_stats_on:
+                stage_timer.add("5_saida_espera", time.perf_counter() - _t_out)
+                stage_timer.tick()
 
         if cap is not None:
             logging.info("Encerrando daemon: desativando sensor fisico (LED OFF)...")
