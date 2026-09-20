@@ -204,7 +204,9 @@ def load_config():
             "guided_filter_radius": 5,
             "guided_filter_eps": 0.001,
             "guided_filter_color_guide": True,
-            "guided_filter_full_res": True
+            "guided_filter_full_res": True,
+            "primary_async_same_frame": True,
+            "primary_async_same_frame_timeout_ms": 40.0
         }
     }
     try:
@@ -2263,7 +2265,19 @@ def main():
     # roda a cadeia completa de pos-processamento via postprocess_multiclass_mask.
     # Desative com "async_primary_enabled": false no config para rollback instantaneo.
     async_primary_enabled = bool(cfg.get("async_primary_enabled", True))
-    primary_async_state = {"p_person": None, "hand_skin": None, "has_hands": False, "bg_prob": None, "seq": -1, "cb_ema": None}
+    # Passo 7 (same-frame): o loop aguarda o resultado da inferencia do PROPRIO quadro
+    # antes de compor. Elimina a defasagem de 1 quadro entre mascara e guia — causa raiz
+    # do vazamento de fundo (real e virtual) em movimento, que o guided filter full-res
+    # deixou visivel com borda dura. Desative com "primary_async_same_frame": false.
+    primary_async_same_frame = bool(cfg.get("primary_async_same_frame", True))
+    # Passo 7.1: timeout configuravel (default 40ms) — a latencia real do resultado e
+    # NPU (~15-20ms) + pos-processamento (~10-15ms) ≈ 32ms medidos; 25ms iniciais
+    # estouravam em quase todo quadro. A espera usa threading.Event: o loop dorme de
+    # verdade (zero polling de CPU) e o callback o acorda ao publicar o resultado.
+    primary_async_wait_timeout = float(cfg.get("primary_async_same_frame_timeout_ms", 40.0)) / 1000.0
+    primary_async_event = threading.Event()
+    primary_async_wait_timeouts = 0
+    primary_async_state = {"p_person": None, "hand_skin": None, "has_hands": False, "bg_prob": None, "seq": -1, "cb_ema": None, "wait_ema": None}
     primary_async_lock = threading.Lock()
     primary_submit_seq = 0
     primary_async_log_ctr = 0
@@ -2287,6 +2301,10 @@ def main():
                 primary_async_state["seq"] = seq_cb
             ema = primary_async_state["cb_ema"]
             primary_async_state["cb_ema"] = dt_ms if ema is None else ema * 0.9 + dt_ms * 0.1
+        # Passo 7.1: acorda o loop que aguarda o resultado do proprio quadro (same-frame).
+        # Set incondicional: se o resultado for fora de ordem, o loop re-checa o seq e
+        # continua dormindo — sem lost wakeup.
+        primary_async_event.set()
 
     if async_primary_enabled and is_multiclass:
         try:
@@ -2737,20 +2755,51 @@ def main():
                     # fechamento morfologico, cavidades e isolamento de maos rodam
                     # na thread do callback, em paralelo com o loop).
                     if primary_queue is not None and primary_async_state["p_person"] is not None:
+                        submitted_this_frame = False
                         if primary_queue.is_ready():
                             fi_cb = {
                                 "has_face": bool(face_info.get("has_face", False)),
                                 "box": list(face_info["box"]) if face_info.get("has_face") else [0, 0, 0, 0],
                             }
+                            my_seq = primary_submit_seq
+                            primary_async_event.clear()
                             primary_queue.start_async(
-                                {seg_inp_name: blob}, (fi_cb, primary_submit_seq, out_w, out_h)
+                                {seg_inp_name: blob}, (fi_cb, my_seq, out_w, out_h)
                             )
                             primary_submit_seq += 1
                             primary_async_submitted += 1
+                            submitted_this_frame = True
                         else:
                             # NPU ocupada com o quadro anterior e/ou com a thread
                             # heavy-assist: reutiliza a ultima mascara publicada.
                             primary_async_reused += 1
+                        if submitted_this_frame and primary_async_same_frame:
+                            # Passo 7.1 (same-frame): aguarda o resultado do PROPRIO quadro
+                            # via Event — o loop dorme sem gastar CPU (o polling de 0,5ms do
+                            # Passo 7 impedia idle profundo e agravava o throttling).
+                            # Timeout de 40ms (config primary_async_same_frame_timeout_ms):
+                            # se a NPU atrasar (contencao com a thread heavy-assist), cai
+                            # para a mascara mais recente e conta o timeout na telemetria.
+                            _t_wait0 = time.perf_counter()
+                            _wait_deadline = _t_wait0 + primary_async_wait_timeout
+                            while True:
+                                _remaining = _wait_deadline - time.perf_counter()
+                                if _remaining <= 0:
+                                    break
+                                if not primary_async_event.wait(_remaining):
+                                    break
+                                with primary_async_lock:
+                                    if primary_async_state["seq"] >= my_seq:
+                                        break
+                                # Event de callback antigo/fora de ordem: volta a dormir.
+                            _wait_ms = (time.perf_counter() - _t_wait0) * 1000.0
+                            with primary_async_lock:
+                                if primary_async_state["seq"] < my_seq:
+                                    primary_async_wait_timeouts += 1
+                                _w_ema = primary_async_state["wait_ema"]
+                                primary_async_state["wait_ema"] = (
+                                    _wait_ms if _w_ema is None else _w_ema * 0.9 + _wait_ms * 0.1
+                                )
                         with primary_async_lock:
                             p_person = primary_async_state["p_person"]
                             hand_skin = primary_async_state["hand_skin"]
@@ -2761,12 +2810,16 @@ def main():
                             primary_async_log_ctr = 0
                             _cb_ema = primary_async_state["cb_ema"]
                             _cb_ema_s = f"{_cb_ema:.1f}ms" if _cb_ema is not None else "n/d"
+                            _w_ema = primary_async_state.get("wait_ema")
+                            _w_ema_s = f"{_w_ema:.1f}ms" if _w_ema is not None else "n/d"
                             logging.info(
                                 f"PERF-ASYNC | submit: {primary_async_submitted} | "
-                                f"reuso: {primary_async_reused} | callback (ema): {_cb_ema_s}"
+                                f"reuso: {primary_async_reused} | callback (ema): {_cb_ema_s} | "
+                                f"same-frame wait (ema): {_w_ema_s} | timeouts: {primary_async_wait_timeouts}"
                             )
                             primary_async_submitted = 0
                             primary_async_reused = 0
+                            primary_async_wait_timeouts = 0
                     else:
                         # Caminho sincrono: aquecimento do primeiro quadro (antes do
                         # primeiro resultado do callback) ou async_primary_enabled=False.

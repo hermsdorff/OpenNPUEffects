@@ -72,7 +72,9 @@
     "guided_filter_radius": 5,
     "guided_filter_eps": 0.001,
     "guided_filter_color_guide": true,
-    "guided_filter_full_res": true
+    "guided_filter_full_res": true,
+    "primary_async_same_frame": true,
+    "primary_async_same_frame_timeout_ms": 40.0
   },
   "audio": {
     "enabled": true,
