@@ -2741,6 +2741,10 @@ def main():
             bg_path = os.path.expanduser(cfg.get("background_image", ""))
 
             if blur_enabled or bg_path:
+                # Passo 7.2: mascaras de cadeira/objetos COCO da thread heavy-assist.
+                # Inicializadas aqui para valer tambem no caminho legacy/sincrono.
+                ha_chair = None
+                ha_handheld = None
                 if is_multiclass:
                     # High quality 256x256 RGB input for NPU multiclass model
                     small = cv2.resize(framed, (256, 256))
@@ -2867,10 +2871,16 @@ def main():
                     # recentes publicadas por ela.)
                     heavy_assist_worker.submit(framed, p_person, hand_skin, face_info, cfg)
                     heavy_masks = heavy_assist_worker.results()
-                    if heavy_masks["chair"] is not None:
-                        p_person = np.maximum(p_person, heavy_masks["chair"])
-                    if heavy_masks["handheld"] is not None:
-                        p_person = np.maximum(p_person, heavy_masks["handheld"])
+                    # Passo 7.2: cadeira/objetos COCO NAO entram mais na mascara que passa
+                    # pelo guided filter. O cache da cadeira e uma EMA 70/30 de uma mascara
+                    # limitada a 550x550 — sempre alguns quadros atrasada por projeto.
+                    # Com o GF full-res (correcao do serrilhado), as bordas suaves e atrasadas
+                    # desse cache eram "coladas" com dureza nas bordas reais da imagem,
+                    # cortando a cadeira ou vazando fundo — a piora na preservacao. Agora
+                    # sao fundidas APOS o GF (padrao ja usado pela mascara de oculos), com
+                    # borda bilinear macia como antes da correcao do serrilhado.
+                    ha_chair = heavy_masks["chair"]
+                    ha_handheld = heavy_masks["handheld"]
 
                     if perf_stats_on:
                         stage_timer.lap("4e_yolact_cadeira_coco")
@@ -3025,6 +3035,17 @@ def main():
                 ha_glasses_gf = heavy_assist_worker.results().get("glasses")
                 if ha_glasses_gf is not None:
                     mask_full = np.maximum(mask_full, ha_glasses_gf)
+
+                # Passo 7.2: fusao da cadeira/objetos COCO APOS o guided filter — mesmo
+                # padrao dos oculos. Borda bilinear macia (o cache ja e uma EMA temporal);
+                # o interior solido vem do white clamp logo abaixo, e o black clamp elimina
+                # o halo residual — sem isso a cadeira ficaria translucida no fundo virtual.
+                if ha_chair is not None:
+                    c_full = cv2.resize(ha_chair, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+                    mask_full = np.maximum(mask_full, c_full)
+                if ha_handheld is not None:
+                    h_full = cv2.resize(ha_handheld, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+                    mask_full = np.maximum(mask_full, h_full)
 
                 # Clean Matte Clamping:
                 # 1. White clamp: Ensure body/clothes interior is 100% solid (no virtual background bleeding through).
