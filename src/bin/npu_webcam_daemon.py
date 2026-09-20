@@ -690,6 +690,65 @@ class HeavyAssistWorker:
         self._publish(modnet=cv2.resize(modnet_alpha_cropped, (256, 256), interpolation=cv2.INTER_LINEAR))
 
 
+class CaptureWorker:
+    """
+    Thread dedicada a captura da camera fisica.
+
+    Passo 5: com o processamento abaixo do orcamento de 33ms, o cap.read()
+    bloqueante no loop principal causava o padrao "perde o quadro" (loop natural
+    ~35ms, incluindo o decode MJPG, acima do intervalo de 33,3ms da camera a 30fps
+    -> o loop travava em exatamente 2x o intervalo: 66,6ms / 15fps).
+
+    Aqui o cap.read() (espera pelo quadro + decodificacao MJPG) roda em paralelo
+    ao processamento: o loop consome apenas o quadro mais recente publicado
+    (latest-wins), sem nunca bloquear esperando a camera fisica.
+    """
+
+    def __init__(self, cap):
+        self._cap = cap
+        self._lock = threading.Lock()
+        self._frame = None
+        self._frame_id = -1
+        self._running = True
+        self._thread = threading.Thread(target=self._run, name="npu-capture", daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        t_rate = time.perf_counter()
+        n_rate = 0
+        while self._running:
+            try:
+                ret, frame = self._cap.read()
+            except Exception:
+                ret, frame = False, None
+            if not ret or frame is None:
+                # Camera ainda nao entregou quadro: curta espera e nova tentativa
+                time.sleep(0.005)
+                continue
+            with self._lock:
+                self._frame = frame
+                self._frame_id += 1
+            # PERF-CAP: taxa real de entrega da camera (ground truth — o formato
+            # pode anunciar 30fps mas o stream efetivo pode ser menor, por exemplo
+            # por limitacao de exposicao em auto-exposure).
+            n_rate += 1
+            dt_rate = time.perf_counter() - t_rate
+            if dt_rate >= 10.0:
+                logging.info(f"PERF-CAP | taxa real de entrega da camera: {n_rate / dt_rate:.1f}fps")
+                t_rate = time.perf_counter()
+                n_rate = 0
+
+    def read_latest(self):
+        """Retorna (frame_id, frame) mais recentes; frame=None se nenhum ainda."""
+        with self._lock:
+            return self._frame_id, self._frame
+
+    def stop(self):
+        self._running = False
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+
 class AutoFramer:
     def __init__(self, in_w, in_h, out_w, out_h, smoothness=0.04, deadzone=0.10, framing_mode="single", zoom=50):
         self.in_w = in_w
@@ -2347,6 +2406,8 @@ def main():
         last_active_time = 0.0
         has_active_consumers = False
         in_standby = False
+        capture_worker = None
+        capture_last_id = -1
         voice_tracker = VoiceActivityTracker(hold_time=float(cfg.get("framing_voice_hold", 1.5)))
         perf_stats_on = bool(cfg.get("perf_stats_enabled", True))
         stage_timer = LoopStageTimer(log_every=int(cfg.get("perf_stats_interval", 300)))
@@ -2395,6 +2456,9 @@ def main():
                         # 1. Desativar a camera fisica primeiro (libera dispositivo V4L2 e apaga LED)
                         if cap is not None:
                             logging.info("Modo Standby On-Demand: nenhum aplicativo usando a camera. Desativando sensor fisico (LED OFF)...")
+                            if capture_worker is not None:
+                                capture_worker.stop()
+                                capture_worker = None
                             cap.release()
                             cap = None
                             framer = None
@@ -2458,6 +2522,10 @@ def main():
                             zoom=int(cfg.get("framing_zoom", 50))
                         )
                         logging.info(f"Physical camera /dev/video{idx} connected at {actual_w}x{actual_h} ({target_fps} FPS)!")
+                        # Passo 5: captura em thread dedicada — o loop consome o quadro
+                        # mais recente (latest-wins) e o decode MJPG sai do caminho critico.
+                        capture_worker = CaptureWorker(cap)
+                        capture_last_id = -1
                     else:
                         cap.release()
                         cap = None
@@ -2473,12 +2541,27 @@ def main():
 
             if perf_stats_on:
                 stage_timer.begin()
-            ret, frame = cap.read()
-            if not ret or frame is None:
+            # Passo 5: consome o quadro mais recente da thread de captura. Se o
+            # processamento terminar antes do proximo quadro da camera, espera
+            # pouco (o tempo restante do intervalo) — nunca bloqueia por um
+            # intervalo inteiro alem do necessario. Sem quadro novo em 150ms,
+            # trata como perda de camera e reconecta.
+            frame = None
+            waited_ms = 0.0
+            while frame is None and waited_ms < 150.0:
+                frame_id, frame = capture_worker.read_latest()
+                if frame is None or frame_id == capture_last_id:
+                    frame = None
+                    time.sleep(0.001)
+                    waited_ms += 1.0
+            if frame is None:
                 logging.warning("Failed to read frame from physical camera. Will reconnect...")
+                capture_worker.stop()
+                capture_worker = None
                 cap.release()
                 cap = None
                 continue
+            capture_last_id = frame_id
             if perf_stats_on:
                 stage_timer.lap("1_captura")
 
@@ -2995,6 +3078,9 @@ def main():
 
         if cap is not None:
             logging.info("Encerrando daemon: desativando sensor fisico (LED OFF)...")
+            if capture_worker is not None:
+                capture_worker.stop()
+                capture_worker = None
             cap.release()
             cap = None
         try:
