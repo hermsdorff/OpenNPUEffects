@@ -203,7 +203,8 @@ def load_config():
             "guided_filter_guide_size": [640, 360],
             "guided_filter_radius": 5,
             "guided_filter_eps": 0.001,
-            "guided_filter_color_guide": True
+            "guided_filter_color_guide": True,
+            "guided_filter_full_res": True
         }
     }
     try:
@@ -2091,7 +2092,7 @@ def apply_smart_sharpen(img, strength=35):
                        [0, -amount, 0]], dtype=np.float32)
     return cv2.filter2D(img, -1, kernel)
 
-def fast_guided_filter(guide_small, mask_small, r=5, eps=1e-3, out_shape=(1920, 1080), color_guide=False):
+def fast_guided_filter(guide_small, mask_small, r=5, eps=1e-3, out_shape=(1920, 1080), color_guide=False, guide_full=None):
     """
     Fast Guided Filter (snaps coarse mask to physical edges of hair and fingers).
     guide_small: grayscale (2D) or color (3D BGR) guide image, uint8 or float32
@@ -2100,6 +2101,14 @@ def fast_guided_filter(guide_small, mask_small, r=5, eps=1e-3, out_shape=(1920, 
     eps: regularization parameter
     out_shape: (width, height) to upscale the final refined edge mask (1920, 1080)
     color_guide: boolean, whether to use multi-channel color edge guidance
+    guide_full: quadro completo (full-res) usado para avaliar o modelo linear
+        q = a*I + b em resolucao plena. Os coeficientes (a, b) sao suaves e de
+        baixa frequencia — podem ser computados em guide_small e ampliados com
+        seguranca — e a avaliacao final no quadro 1920x1080 faz a borda da
+        mascara aderir as arestas REAIS da imagem em resolucao plena, eliminando
+        a escadinha de ~3px herdada do upscale 640->1080 do resultado refinado.
+        Se None, mantem o comportamento anterior (avaliar q em guide_small e
+        ampliar o resultado).
     """
     gw, gh = guide_small.shape[1], guide_small.shape[0]
     p = cv2.resize(mask_small, (gw, gh), interpolation=cv2.INTER_LINEAR)
@@ -2136,7 +2145,8 @@ def fast_guided_filter(guide_small, mask_small, r=5, eps=1e-3, out_shape=(1920, 
         ma2 = cv2.boxFilter(a2, -1, ksize)
         mb = cv2.boxFilter(b, -1, ksize)
 
-        q = ma0 * I0 + ma1 * I1 + ma2 * I2 + mb
+        if guide_full is None:
+            q = ma0 * I0 + ma1 * I1 + ma2 * I2 + mb
     else:
         # Grayscale guided filter (classic single-channel)
         if guide_small.ndim == 3:
@@ -2152,7 +2162,47 @@ def fast_guided_filter(guide_small, mask_small, r=5, eps=1e-3, out_shape=(1920, 
         b = mean_p - a * mean_I
         mean_a = cv2.boxFilter(a, -1, ksize)
         mean_b = cv2.boxFilter(b, -1, ksize)
-        q = mean_a * I + mean_b
+        if guide_full is None:
+            q = mean_a * I + mean_b
+
+    if guide_full is not None:
+        # Correcao de borda em resolucao plena (fast guided filter, He et al.):
+        # coeficientes suaves computados em guide_small, ampliados com
+        # interpolacao linear, e o modelo linear avaliado pixel a pixel no
+        # quadro de saida completo.
+        ow, oh = out_shape
+        if color_guide and guide_small.ndim == 3:
+            # Normalizacao dobrada nos coeficientes (resolvecao baixa): evita
+            # uma passada de multiplicacao em full-res sobre o guia.
+            I_f = guide_full if guide_full.dtype != np.uint8 else None
+            if I_f is None:
+                I_f = guide_full.astype(np.float32)
+            s = 1.0 / 255.0 if guide_full.dtype == np.uint8 else 1.0
+            fa0 = cv2.resize(ma0, (ow, oh), interpolation=cv2.INTER_LINEAR) * s
+            fa1 = cv2.resize(ma1, (ow, oh), interpolation=cv2.INTER_LINEAR) * s
+            fa2 = cv2.resize(ma2, (ow, oh), interpolation=cv2.INTER_LINEAR) * s
+            fb = cv2.resize(mb, (ow, oh), interpolation=cv2.INTER_LINEAR)
+            # Acumulacao in-place: 4 temporarios em vez de 7
+            q = fa0 * I_f[:, :, 0]
+            q += fa1 * I_f[:, :, 1]
+            q += fa2 * I_f[:, :, 2]
+            q += fb
+        else:
+            if guide_full.ndim == 3:
+                guide_gray_full = cv2.cvtColor(guide_full, cv2.COLOR_BGR2GRAY)
+            else:
+                guide_gray_full = guide_full
+            if guide_gray_full.dtype == np.uint8:
+                I_f = guide_gray_full.astype(np.float32)
+                s = 1.0 / 255.0
+            else:
+                I_f = guide_gray_full
+                s = 1.0
+            fa = cv2.resize(mean_a, (ow, oh), interpolation=cv2.INTER_LINEAR) * s
+            fb = cv2.resize(mean_b, (ow, oh), interpolation=cv2.INTER_LINEAR)
+            q = fa * I_f
+            q += fb
+        return np.clip(q, 0.0, 1.0)
 
     return cv2.resize(np.clip(q, 0.0, 1.0), out_shape, interpolation=cv2.INTER_LINEAR)
 
@@ -2896,6 +2946,7 @@ def main():
                 gf_r = int(cfg.get("guided_filter_radius", 5))
                 gf_eps = float(cfg.get("guided_filter_eps", 0.001))
                 gf_color = bool(cfg.get("guided_filter_color_guide", True))
+                gf_full = bool(cfg.get("guided_filter_full_res", True))
 
                 if is_bg_replacement:
                     # Tighter radius and smaller eps force guided filter to adhere strictly
@@ -2915,7 +2966,8 @@ def main():
                     guide_small, p_curved,
                     r=gf_r_eff, eps=gf_eps_eff,
                     out_shape=(out_w, out_h),
-                    color_guide=gf_color
+                    color_guide=gf_color,
+                    guide_full=framed if gf_full else None
                 )
                 ha_glasses_gf = heavy_assist_worker.results().get("glasses")
                 if ha_glasses_gf is not None:
