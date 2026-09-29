@@ -73,6 +73,17 @@ try:
     with open('$user_cfg/config.json', 'r', encoding='utf-8') as f:
         user_data = json.load(f)
     merged = merge(default_data, user_data)
+
+    # Se o output_device do usuario apontar para um no inexistente no /dev (ex: /dev/video72 legado),
+    # atualizar automaticamente para o output_device ativo do sistema
+    import os
+    def_out = default_data.get('video', {}).get('output_device') or default_data.get('output_device')
+    usr_out = merged.get('video', {}).get('output_device') or merged.get('output_device')
+    if def_out and (not usr_out or not os.path.exists(usr_out)):
+        if 'video' in merged and isinstance(merged['video'], dict):
+            merged['video']['output_device'] = def_out
+        merged['output_device'] = def_out
+
     with open('$user_cfg/config.json', 'w', encoding='utf-8') as f:
         json.dump(merged, f, indent=2)
 except Exception:

@@ -1,8 +1,8 @@
 {
   "video": {
     "enabled": true,
-    "input_device": "/dev/video48",
-    "output_device": "/dev/video72",
+    "input_device": "auto",
+    "output_device": "/dev/video9",
     "width": 1920,
     "height": 1080,
     "fps": 30,
@@ -66,9 +66,12 @@
     "object_retention_strength": 60,
     "chair_retention_enabled": true,
     "chair_retention_strength": 50,
-    "modnet_assist_enabled": false,
+    "modnet_assist_enabled": true,
     "privacy_fade_enabled": true,
-    "guided_filter_guide_size": [640, 360],
+    "guided_filter_guide_size": [
+      640,
+      360
+    ],
     "guided_filter_radius": 5,
     "guided_filter_eps": 0.001,
     "guided_filter_color_guide": true,
@@ -94,5 +97,6 @@
     "dereverb_strength": 40,
     "auto_standby": true,
     "standby_timeout": 1.0
-  }
+  },
+  "output_device": "/dev/video9"
 }

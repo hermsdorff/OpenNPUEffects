@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
-import ctypes, ctypes.util, logging, os.path, getopt, sys, subprocess, select, time, math, configparser, json, shutil
+import ctypes, ctypes.util, logging, os.path, getopt, sys, subprocess, select, time, math, configparser, json, shutil, struct
+from pathlib import Path
 from fcntl import ioctl
 from threading import Thread
 from errno import EIO
@@ -59,7 +60,7 @@ def get_devices(dirs):
             if 'ipu6' in card_str.lower() or 'ipu6' in driver_str.lower():
                 continue
             is_capture = bool(hasattr(caps, 'device_caps') and (caps.device_caps & V4L2_CAP_VIDEO_CAPTURE))
-            is_npu_vcam = ('video72' in resolved or 'video72' in device or 'Intel NPU' in card_str)
+            is_npu_vcam = ('video9' in resolved or 'video9' in device or 'video72' in resolved or 'video72' in device or 'Intel NPU' in card_str)
             if not is_capture and not is_npu_vcam:
                 continue
             name = f'{card_str} ({resolved})'
@@ -2122,6 +2123,10 @@ def npu_detect_system_language():
     return 'pt'
 
 NPU_TR = {
+    'npu_input_device': {
+        'name': 'Camera Input Source',
+        'tooltip': 'Select the video input source for NPU AI effects (physical cameras, or virtual cameras like Iriun Webcam/OBS).',
+    },
     'npu_language': {
         'name': 'Panel Language',
         'tooltip': 'Select the display language for the Intel NPU Effects control panel (Portuguese or English).',
@@ -2382,6 +2387,69 @@ class IntelNPUCtrl(BaseCtrl):
     def __init__(self, text_id, name, type, tooltip, value=None, default=None, min=None, max=None, step=None, menu=None, menu_dd=False, inactive=False, readonly=False, reopener=False):
         super().__init__(text_id, name, type, value=value, default=default, min=min, max=max, step=step, tooltip=tooltip, menu=menu, menu_dd=menu_dd, inactive=inactive, readonly=readonly, reopener=reopener)
 
+def get_npu_available_cameras(output_device="/dev/video9"):
+    cameras = [
+        ("auto", "Detecção Automática (Auto)")
+    ]
+    seen_nodes = set()
+    out_dev_str = str(output_device)
+
+    # 1. Hardware amigável via /dev/v4l/by-id
+    by_id = Path("/dev/v4l/by-id")
+    if by_id.exists():
+        for link in sorted(by_id.iterdir()):
+            if "video-index0" in link.name:
+                try:
+                    target = link.resolve()
+                    node_str = str(target)
+                    if node_str == out_dev_str:
+                        continue
+                    name = link.name.replace("-video-index0", "").replace("usb-", "").replace("_", " ")
+                    clean_name = f"{name} ({node_str})"
+                    cameras.append((node_str, clean_name))
+                    seen_nodes.add(node_str)
+                except Exception:
+                    pass
+
+    # 2. Varredura completa de nós /sys/class/video4linux (câmeras físicas e virtuais)
+    sysfs_v4l = Path("/sys/class/video4linux")
+    if sysfs_v4l.exists():
+        for p in sorted(sysfs_v4l.glob("video*"), key=lambda x: int(x.name.replace("video", "")) if x.name.replace("video", "").isdigit() else 999):
+            dev_node = f"/dev/{p.name}"
+            if dev_node == out_dev_str or dev_node in seen_nodes:
+                continue
+            name_file = p / "name"
+            card_name = name_file.read_text(encoding="utf-8", errors="ignore").strip() if name_file.exists() else p.name
+
+            # Ignora o dispositivo de saída da NPU
+            if "intel npu" in card_name.lower():
+                continue
+
+            # Verifica permissão de leitura
+            if not os.access(dev_node, os.R_OK):
+                continue
+
+            is_virtual = any(k in card_name.lower() for k in ["loopback", "virtual", "iriun", "obs"])
+            if not is_virtual:
+                # Filtrar nós de metadados checando capacidade V4L2_CAP_VIDEO_CAPTURE
+                try:
+                    fd = os.open(dev_node, os.O_RDWR | os.O_NONBLOCK)
+                    buf = bytearray(104)
+                    ioctl(fd, 0x80685600, buf)
+                    os.close(fd)
+                    caps, dev_caps = struct.unpack_from('<II', buf, 84)
+                    effective_caps = dev_caps if (caps & 0x80000000) else caps
+                    if not (effective_caps & 0x00000001):
+                        continue
+                except Exception:
+                    pass
+
+            tag = " [Virtual]" if is_virtual else ""
+            cameras.append((dev_node, f"{card_name} ({dev_node}){tag}"))
+            seen_nodes.add(dev_node)
+
+    return cameras
+
 class IntelNPUCtrls:
     def __init__(self, device, fd):
         self.device = device
@@ -2393,11 +2461,11 @@ class IntelNPUCtrls:
         dev_str = self.device.path if hasattr(self.device, 'path') else str(self.device)
         dev_real = self.device.real_path if hasattr(self.device, 'real_path') else ""
         dev_name = self.device.name if hasattr(self.device, 'name') else ""
-        if 'video72' in dev_str or 'video72' in dev_real or 'Intel NPU' in dev_name:
+        if 'video9' in dev_str or 'video9' in dev_real or 'video72' in dev_str or 'video72' in dev_real or 'Intel NPU' in dev_name:
             return True
         try:
             cfg = self.load_config()
-            out_dev = cfg.get("video", {}).get("output_device", "/dev/video72")
+            out_dev = cfg.get("video", {}).get("output_device", "/dev/video9")
             if out_dev and (out_dev in dev_str or out_dev in dev_real or out_dev in dev_name):
                 return True
         except Exception:
@@ -2565,7 +2633,27 @@ class IntelNPUCtrls:
 
         lang_val = lang
 
+        out_dev = v_cfg.get("output_device", "/dev/video9")
+        available_cams = get_npu_available_cameras(out_dev)
+        current_in_dev = v_cfg.get("input_device", "auto")
+        if not any(c[0] == current_in_dev for c in available_cams):
+            available_cams.append((current_in_dev, f"{current_in_dev} (Personalizado)"))
+
+        cam_menu = [
+            BaseCtrlMenu(c_dev, c_label, c_dev) for c_dev, c_label in available_cams
+        ]
+
         self.ctrls = [
+            IntelNPUCtrl(
+                'npu_input_device',
+                T('npu_input_device', 'name', 'Câmera de Entrada (Fonte)'),
+                'menu',
+                T('npu_input_device', 'tooltip', 'Selecione a câmera fonte de entrada para os efeitos de IA na NPU (câmeras físicas ou virtuais como Iriun Webcam/OBS).'),
+                value=current_in_dev,
+                default='auto',
+                menu=cam_menu,
+                menu_dd=True,
+            ),
             IntelNPUCtrl(
                 'npu_language',
                 T('npu_language', 'name', 'Idioma do Painel'),
@@ -3132,7 +3220,12 @@ class IntelNPUCtrls:
             if not ctrl:
                 continue
 
-            if k == 'npu_language':
+            if k == 'npu_input_device':
+                ctrl.value = v
+                cfg["video"]["input_device"] = v
+                changed = True
+
+            elif k == 'npu_language':
                 ctrl.value = v
                 cfg["language"] = v
                 changed = True
@@ -4576,6 +4669,12 @@ class CameraCtrls:
         ctrls = self.get_ctrls()
         pages = [
             CtrlPage('Intel NPU', [
+                CtrlCategory('Origem da Câmera & Idioma',
+                    pop_list_by_text_ids(ctrls, [
+                        'npu_input_device',
+                        'npu_language',
+                    ])
+                ),
                 CtrlCategory('Efeitos de Fundo & Profundidade (IA)',
                     pop_list_by_text_ids(ctrls, [
                         'npu_bg_mode',

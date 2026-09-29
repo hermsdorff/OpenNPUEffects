@@ -3,10 +3,11 @@
 Intel NPU Webcam Daemon
 Offloads AI Selfie Segmentation & Auto-Framing to Intel Meteor Lake NPU.
 Features Edge-Preserving Noise Reduction (Skin Smoothing / Denoising) in 1080p.
-Outputs to /dev/video72 (v4l2loopback) for transparent use in any application.
+Outputs to /dev/video9 (v4l2loopback) for transparent use in any application.
 """
 import os
 import sys
+import re
 import time
 import json
 import signal
@@ -141,7 +142,7 @@ def load_config():
         "video": {
             "enabled": True,
             "input_device": "auto",
-            "output_device": "/dev/video72",
+            "output_device": "/dev/video9",
             "width": 1920,
             "height": 1080,
             "fps": 30,
@@ -199,7 +200,7 @@ def load_config():
             "privacy_image": "",
             "preserve_glasses": True,
             "glasses_protection": True,
-            "modnet_assist_enabled": False,
+            "modnet_assist_enabled": True,
             "guided_filter_guide_size": [640, 360],
             "guided_filter_radius": 5,
             "guided_filter_eps": 0.001,
@@ -218,18 +219,54 @@ def load_config():
         logging.warning(f"Error reading config: {e}")
     return default_config["video"]
 
-def resolve_cam_index(device_str="auto"):
+def is_virtual_video_node(target_or_num):
+    try:
+        s = str(target_or_num)
+        num_str = re.sub(r"[^0-9]", "", s)
+        if not num_str:
+            return False
+        num = int(num_str)
+        if num in [7, 8, 9, 70, 71, 72, 50]:
+            return True
+        sysfs_p = Path(f"/sys/class/video4linux/video{num}")
+        if sysfs_p.exists():
+            name_file = sysfs_p / "name"
+            if name_file.exists():
+                cname = name_file.read_text(encoding="utf-8", errors="ignore").lower()
+                if any(k in cname for k in ["loopback", "virtual", "npu", "iriun", "obs"]):
+                    return True
+            if not (sysfs_p / "device").exists():
+                return True
+    except Exception:
+        pass
+    return False
+
+def resolve_cam_index(device_str="auto", out_device="/dev/video9"):
+    out_num = None
+    try:
+        out_num = int(str(out_device).replace("/dev/video", ""))
+    except Exception:
+        pass
+
     if isinstance(device_str, int):
-        return device_str
+        if out_num is not None and device_str == out_num:
+            logging.warning(f"Dispositivo de entrada coincide com saída {out_device}! Recorrendo à detecção automática.")
+        else:
+            return device_str
+
     if device_str and device_str != "auto":
         dev_path = Path(str(device_str))
         if dev_path.exists():
             try:
                 target = dev_path.resolve()
-                if os.access(target, os.R_OK):
-                    return int(target.name.replace("video", ""))
+                num = int(target.name.replace("video", ""))
+                if out_num is not None and num == out_num:
+                    logging.warning(f"Dispositivo de entrada {device_str} coincide com saída {out_device}! Recorrendo à detecção automática.")
+                elif os.access(target, os.R_OK):
+                    return num
             except Exception:
                 pass
+
     # Auto detect: check /dev/v4l/by-id for primary physical video capture stream
     by_id = Path("/dev/v4l/by-id")
     if by_id.exists():
@@ -237,27 +274,30 @@ def resolve_cam_index(device_str="auto"):
             if "video-index0" in link.name:
                 try:
                     target = link.resolve()
-                    if os.access(target, os.R_OK):
-                        return int(target.name.replace("video", ""))
+                    num = int(target.name.replace("video", ""))
+                    if (out_num is None or num != out_num) and not is_virtual_video_node(target.name) and os.access(target, os.R_OK):
+                        return num
                 except Exception:
                     pass
         for link in sorted(by_id.iterdir()):
             try:
                 target = link.resolve()
-                if target.name.startswith("video") and target.name not in ["video70", "video71", "video72", "video50"]:
-                    if os.access(target, os.R_OK):
-                        return int(target.name.replace("video", ""))
+                if target.name.startswith("video"):
+                    num = int(target.name.replace("video", ""))
+                    if (out_num is None or num != out_num) and not is_virtual_video_node(target.name) and os.access(target, os.R_OK):
+                        return num
             except Exception:
                 pass
+
     # Fallback to any readable physical video capture device (skipping virtual loopbacks)
     for p in sorted(Path("/dev").glob("video*")):
         try:
             num = int(p.name.replace("video", ""))
-            if num not in [70, 71, 72, 50] and os.access(p, os.R_OK):
+            if (out_num is None or num != out_num) and not is_virtual_video_node(num) and os.access(p, os.R_OK):
                 return num
         except Exception:
             pass
-    return 48
+    return 0
 
 class VoiceActivityTracker:
     def __init__(self, hold_time=1.5):
@@ -1045,7 +1085,7 @@ class AutoFramer:
         cropped = frame[y1:y2, x1:x2]
         return cv2.resize(cropped, (self.out_w, self.out_h), interpolation=cv2.INTER_LINEAR)
 
-def count_active_consumers(dev_target="/dev/video72", self_pid=None):
+def count_active_consumers(dev_target="/dev/video9", self_pid=None):
     if self_pid is None:
         self_pid = os.getpid()
     target_pattern = os.path.basename(dev_target)
@@ -1109,7 +1149,7 @@ def execute_standby_hooks(cfg, phys_dev):
     custom_cmd = cfg.get("standby_command", "").strip()
     if custom_cmd:
         try:
-            formatted_cmd = custom_cmd.replace("{device}", str(phys_dev)).replace("{virtual_device}", str(cfg.get("output_device", "/dev/video72")))
+            formatted_cmd = custom_cmd.replace("{device}", str(phys_dev)).replace("{virtual_device}", str(cfg.get("output_device", "/dev/video9")))
             subprocess.Popen(formatted_cmd, shell=True)
             logging.info(f"Comando customizado de standby executado: {formatted_cmd}")
         except Exception as e:
@@ -1186,7 +1226,7 @@ def execute_wakeup_hooks(cfg, phys_dev):
     custom_cmd = cfg.get("wakeup_command", "").strip()
     if custom_cmd:
         try:
-            formatted_cmd = custom_cmd.replace("{device}", str(phys_dev)).replace("{virtual_device}", str(cfg.get("output_device", "/dev/video72")))
+            formatted_cmd = custom_cmd.replace("{device}", str(phys_dev)).replace("{virtual_device}", str(cfg.get("output_device", "/dev/video9")))
             subprocess.Popen(formatted_cmd, shell=True)
             logging.info(f"Comando customizado de wakeup executado: {formatted_cmd}")
         except Exception as e:
@@ -2214,7 +2254,7 @@ def main():
 
     cfg = load_config()
     in_device = cfg.get("input_device", "/dev/video0")
-    out_device = cfg.get("output_device", "/dev/video72")
+    out_device = cfg.get("output_device", "/dev/video9")
     out_w = int(cfg.get("width", 1920))
     out_h = int(cfg.get("height", 1080))
     target_fps = int(cfg.get("fps", 30))
@@ -2476,6 +2516,7 @@ def main():
         in_standby = False
         capture_worker = None
         capture_last_id = -1
+        current_input_dev = cfg.get("input_device", "auto")
         voice_tracker = VoiceActivityTracker(hold_time=float(cfg.get("framing_voice_hold", 1.5)))
         perf_stats_on = bool(cfg.get("perf_stats_enabled", True))
         stage_timer = LoopStageTimer(log_every=int(cfg.get("perf_stats_interval", 300)))
@@ -2492,13 +2533,25 @@ def main():
                         if mtime != last_config_mtime:
                             last_config_mtime = mtime
                             cfg = load_config()
+                            new_in_dev = cfg.get("input_device", "auto")
+                            if new_in_dev != current_input_dev:
+                                logging.info(f"Troca dinâmica de câmera de entrada: {current_input_dev} -> {new_in_dev}")
+                                current_input_dev = new_in_dev
+                                if capture_worker is not None:
+                                    capture_worker.stop()
+                                    capture_worker = None
+                                if cap is not None:
+                                    cap.release()
+                                    cap = None
+                                framer = None
+                                prev_mask = None
                             if framer:
                                 framer.smoothness = float(cfg.get("framing_smoothness", 0.04))
                                 framer.deadzone = float(cfg.get("framing_deadzone", 0.10))
                     except Exception:
                         pass
 
-            # On-Demand Auto-Standby: Check if any application is reading from /dev/video72
+            # On-Demand Auto-Standby: Check if any application is reading from /dev/video9
             auto_standby = cfg.get("auto_standby", True)
             standby_timeout = float(cfg.get("standby_timeout", 1.0))
 
@@ -2532,7 +2585,7 @@ def main():
                             framer = None
                             prev_mask = None
                         else:
-                            logging.info("Modo Standby On-Demand ativo: sensor fisico ja desligado (LED OFF). Aguardando aplicativo em /dev/video72...")
+                            logging.info(f"Modo Standby On-Demand ativo: sensor fisico ja desligado (LED OFF). Aguardando aplicativo em {out_device}...")
 
                         # 2. Aguardar 1 segundo com a camera desativada antes do parking
                         park_delay = float(cfg.get("standby_park_delay", 1.0))
@@ -2540,7 +2593,7 @@ def main():
                             time.sleep(park_delay)
 
                         # 3. Executar o parking da camera (PTZ tilt/pan para recolher)
-                        phys_dev = f"/dev/video{resolve_cam_index(cfg.get('input_device', 'auto'))}"
+                        phys_dev = f"/dev/video{resolve_cam_index(cfg.get('input_device', 'auto'), out_device)}"
                         execute_standby_hooks(cfg, phys_dev)
                     vcam.send(placeholder_frame)
                     time.sleep(0.3)
@@ -2548,14 +2601,14 @@ def main():
 
                 if in_standby:
                     in_standby = False
-                    logging.info("Modo Standby On-Demand: aplicativo detectado em /dev/video72! Ligando sensor fisico...")
-                    phys_dev = f"/dev/video{resolve_cam_index(cfg.get('input_device', 'auto'))}"
+                    logging.info(f"Modo Standby On-Demand: aplicativo detectado em {out_device}! Ligando sensor fisico...")
+                    phys_dev = f"/dev/video{resolve_cam_index(cfg.get('input_device', 'auto'), out_device)}"
                     execute_wakeup_hooks(cfg, phys_dev)
 
             # Check camera connection
             if cap is None or not cap.isOpened():
                 in_dev_cfg = cfg.get("input_device", "auto")
-                idx = resolve_cam_index(in_dev_cfg)
+                idx = resolve_cam_index(in_dev_cfg, out_device)
                 cap = cv2.VideoCapture(idx)
                 if cap.isOpened():
                     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
@@ -2942,7 +2995,27 @@ def main():
                     # estritamente aditiva preservada).
                     heavy_masks = heavy_assist_worker.results()
                     if heavy_masks["modnet"] is not None:
-                        p_person = np.maximum(p_person, heavy_masks["modnet"])
+                        # Passo 7.3: fusao REGIONAL do MODNet — apenas na regiao da
+                        # cabeca (caixa facial expandida para orelhas + topo), onde
+                        # vivem fones de ouvido e acessorios que o multiclass
+                        # classifica como fundo (arco do fone era quase todo cortado,
+                        # conchas erodidas). Fora dessa regiao o MODNet gera falsos
+                        # positivos (fantasmas na cortina/fundo) — o motivo pelo qual
+                        # o assist ficava desativado. Validado no video real com fone:
+                        # arco e conchas preservados, zero fantasmas.
+                        modnet_a = heavy_masks["modnet"]
+                        if face_info.get("has_face"):
+                            fx_h, fy_h, fw_h, fh_h = face_info["box"]
+                            mx1 = max(0, int((fx_h - fw_h * 0.8) * 256 / out_w))
+                            mx2 = min(256, int((fx_h + fw_h * 1.8) * 256 / out_w))
+                            my1 = max(0, int((fy_h - fh_h * 0.9) * 256 / out_h))
+                            my2 = min(256, int((fy_h + fh_h * 1.2) * 256 / out_h))
+                            if mx2 > mx1 and my2 > my1:
+                                p_person[my1:my2, mx1:mx2] = np.maximum(
+                                    p_person[my1:my2, mx1:mx2],
+                                    modnet_a[my1:my2, mx1:mx2] * 0.9,
+                                )
+                        # sem face detectada: nao funde (conservador — multiclass puro)
                 else:
                     # Legacy 144x256 model fallback
                     small = cv2.resize(framed, (256, 144))
@@ -3213,7 +3286,7 @@ def main():
             park_delay = float(cfg.get("standby_park_delay", 1.0))
             if park_delay > 0:
                 time.sleep(park_delay)
-            phys_dev = f"/dev/video{resolve_cam_index(cfg.get('input_device', 'auto'))}"
+            phys_dev = f"/dev/video{resolve_cam_index(cfg.get('input_device', 'auto'), out_device)}"
             execute_standby_hooks(cfg, phys_dev)
         except Exception:
             pass

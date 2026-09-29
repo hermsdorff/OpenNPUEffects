@@ -70,17 +70,40 @@ else
     sudo dpkg --configure -a 2>/dev/null || true
 fi
 
-# 4. Configurar parâmetros do v4l2loopback (/etc/modprobe.d/v4l2loopback.conf)
-echo -e "${YELLOW}--> Configurando /etc/modprobe.d/v4l2loopback.conf (preservando câmeras virtuais existentes)...${NC}"
-sudo python3 - << 'PYEOF'
+# 4. Configurar parâmetros do v4l2loopback com detecção dinâmica (/etc/modprobe.d/v4l2loopback.conf)
+echo -e "${YELLOW}--> Configurando /etc/modprobe.d/v4l2loopback.conf com alocação automática de porta livre...${NC}"
+sudo python3 - "$BASE_DIR" << 'PYEOF'
+import sys
 import re
+import json
 from pathlib import Path
 
-conf_path = Path("/etc/modprobe.d/v4l2loopback.conf")
+base_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/opt/npu-effects")
+modprobe_dir = Path("/etc/modprobe.d")
+conf_path = modprobe_dir / "v4l2loopback.conf"
 target_label = "Intel NPU Enhanced Webcam"
-target_nr = 72
 
+# 1. Identificar dispositivos fisicos em /sys/class/video4linux
+physical_nums = set()
+sysfs_v4l = Path("/sys/class/video4linux")
+if sysfs_v4l.exists():
+    for p in sysfs_v4l.glob("video*"):
+        try:
+            num = int(p.name.replace("video", ""))
+            name_file = p / "name"
+            card_name = name_file.read_text(encoding="utf-8", errors="ignore").strip() if name_file.exists() else ""
+            is_virtual = any(k in card_name.lower() for k in ["loopback", "virtual", "npu", "iriun", "obs"])
+            if not is_virtual and (p / "device").exists():
+                physical_nums.add(num)
+        except Exception:
+            pass
+
+# 2. Ler configuracoes existentes em /etc/modprobe.d/
+all_labels = []
+all_nrs = []
+caps = []
 lines = []
+
 if conf_path.exists():
     try:
         lines = conf_path.read_text(encoding="utf-8").splitlines()
@@ -89,56 +112,145 @@ if conf_path.exists():
 
 opt_idx = -1
 for idx, line in enumerate(lines):
-    if line.strip().startswith("options v4l2loopback"):
+    s = line.strip()
+    if s.startswith("options v4l2loopback") and not s.startswith("#"):
         opt_idx = idx
+        m_card = re.search(r"card_label=(.*?)(?=\s+[a-z_]+|\s*$)", s)
+        if m_card:
+            all_labels = [l.strip(" \"'\t") for l in m_card.group(1).split(",") if l.strip(" \"'\t")]
+        m_nr = re.search(r"video_nr=([0-9,]+)", s)
+        if m_nr:
+            all_nrs = [int(n) for n in m_nr.group(1).split(",") if n]
+        m_caps = re.search(r"exclusive_caps=([0-9,]+)", s)
+        if m_caps:
+            caps = [c for c in m_caps.group(1).split(",") if c]
         break
 
+# Ler outros arquivos modprobe (ex: iriunwebcam-options.conf) se labels ainda nao estiverem em all_labels
+for other_conf in modprobe_dir.glob("*.conf"):
+    if other_conf.name == "v4l2loopback.conf":
+        continue
+    try:
+        for l in other_conf.read_text(encoding="utf-8").splitlines():
+            s = l.strip()
+            if s.startswith("options v4l2loopback") and not s.startswith("#"):
+                m_card = re.search(r"card_label=(.*?)(?=\s+[a-z_]+|\s*$)", s)
+                if m_card:
+                    lbls = [x.strip(" \"'\t") for x in m_card.group(1).split(",") if x.strip(" \"'\t")]
+                    m_devs = re.search(r"devices=(\d+)", s)
+                    if m_devs:
+                        lbls = lbls[:int(m_devs.group(1))]
+                    for lbl in lbls:
+                        if lbl and lbl not in all_labels:
+                            all_labels.append(lbl)
+    except Exception:
+        pass
+
+if target_label not in all_labels:
+    all_labels.append(target_label)
+
+# 3. Alocacao dinamica inteligente
+assigned = {}
+used_numbers = set(physical_nums)
+
+# Reservar dispositivos ja alocados que sejam validos (sem colisao fisica)
+for i, lbl in enumerate(all_labels):
+    if i < len(all_nrs):
+        nr = all_nrs[i]
+        # Iriun precisa obrigatoriamente de numero <= 9 (single-digit)
+        if "iriun" in lbl.lower() and nr > 9:
+            continue
+        # Se colidir com hardware fisico real, descartar para re-alocar
+        if nr in physical_nums:
+            continue
+        # Se for range legado (70, 71, 72) e faixa 7..9 estiver livre, migrar para faixa segura
+        if nr in [70, 71, 72] and not (set(range(7, 10)) & physical_nums):
+            continue
+        assigned[lbl] = nr
+        used_numbers.add(nr)
+
+# Alocar para Iriun se necessario (garantir <= 9)
+for lbl in all_labels:
+    if "iriun" in lbl.lower() and lbl not in assigned:
+        cand_pool = [7, 8, 6, 9, 5, 4, 3, 2]
+        chosen = None
+        for c in cand_pool:
+            if c not in used_numbers:
+                chosen = c
+                break
+        if chosen is None:
+            for c in range(10):
+                if c not in used_numbers:
+                    chosen = c
+                    break
+        if chosen is not None:
+            assigned[lbl] = chosen
+            used_numbers.add(chosen)
+
+# Alocar para as demais labels (incluindo Intel NPU Enhanced Webcam)
+for lbl in all_labels:
+    if lbl not in assigned:
+        if "npu" in lbl.lower():
+            if 9 not in used_numbers:
+                chosen = 9
+            else:
+                cand = max(7, max(physical_nums, default=0) + 1)
+                while cand in used_numbers:
+                    cand += 1
+                chosen = cand
+        else:
+            cand = max(7, max(physical_nums, default=0) + 1)
+            while cand in used_numbers:
+                cand += 1
+            chosen = cand
+        assigned[lbl] = chosen
+        used_numbers.add(chosen)
+
+final_nrs = [assigned[lbl] for lbl in all_labels]
+while len(caps) < len(all_labels):
+    caps.append("1")
+
+dev_count = len(all_labels)
+conf_line = (
+    f'options v4l2loopback devices={dev_count} '
+    f'video_nr={",".join(map(str, final_nrs))} '
+    f'card_label="{",".join(all_labels)}" '
+    f'exclusive_caps={",".join(caps)} '
+    f'max_buffers=2'
+)
+
 if opt_idx == -1:
-    lines.append(f'options v4l2loopback devices=1 video_nr={target_nr} card_label="{target_label}" exclusive_caps=1 max_buffers=2')
+    lines.append(conf_line)
 else:
-    opt_line = lines[opt_idx]
-    m_card = re.search(r"card_label=(.*?)(?=\s+[a-z_]+|\s*$)", opt_line)
-    existing_labels = []
-    if m_card:
-        existing_labels = [l.strip(" \"'\t") for l in m_card.group(1).split(",") if l.strip(" \"'\t")]
-    
-    m_nr = re.search(r"video_nr=([0-9,]+)", opt_line)
-    existing_nrs = [int(n) for n in m_nr.group(1).split(",") if n] if m_nr else []
-    
-    m_caps = re.search(r"exclusive_caps=([0-9,]+)", opt_line)
-    existing_caps = [c for c in m_caps.group(1).split(",") if c] if m_caps else []
-
-    m_buf = re.search(r"max_buffers=(\d+)", opt_line)
-    # Latencia: max_buffers=2 (padrao do v4l2loopback) limita a profundidade da fila do
-    # dispositivo virtual. O consumidor (Zoom/Meet/Chrome) sempre recebe o quadro mais
-    # ANTIGO da fila - com 6 buffers, um consumidor lento acumula ate ~200ms de atraso.
-    max_buf = 2
-
-    if target_label not in existing_labels:
-        existing_labels.append(target_label)
-        if target_nr in existing_nrs:
-            target_nr = max(existing_nrs) + 1 if existing_nrs else target_nr
-        existing_nrs.append(target_nr)
-        while len(existing_caps) < len(existing_labels):
-            existing_caps.append("1")
-    else:
-        if not existing_nrs:
-            existing_nrs = [target_nr]
-        while len(existing_caps) < len(existing_labels):
-            existing_caps.append("1")
-
-    dev_count = len(existing_labels)
-    lines[opt_idx] = (
-        f'options v4l2loopback devices={dev_count} '
-        f'video_nr={",".join(map(str, existing_nrs))} '
-        f'card_label="{",".join(existing_labels)}" '
-        f'exclusive_caps={",".join(existing_caps)} '
-        f'max_buffers={max_buf}'
-    )
+    lines[opt_idx] = conf_line
 
 conf_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-print("    ✓ /etc/modprobe.d/v4l2loopback.conf configurado preservando dispositivos existentes.")
+print(f"    ✓ /etc/modprobe.d/v4l2loopback.conf configurado: {list(zip(all_labels, final_nrs))}")
+
+# 4. Propagar output_device para configs do projeto
+npu_nr = assigned.get(target_label, 9)
+cfg_files = [
+    base_dir / "src/config/config.json",
+    Path("/opt/npu-effects/config/config.json")
+]
+
+for cfg_p in cfg_files:
+    if cfg_p.exists():
+        try:
+            data = json.loads(cfg_p.read_text(encoding="utf-8"))
+            if "video" in data and isinstance(data["video"], dict):
+                data["video"]["output_device"] = f"/dev/video{npu_nr}"
+            data["output_device"] = f"/dev/video{npu_nr}"
+            cfg_p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            print(f"    ✓ Sincronizado {cfg_p}: output_device = /dev/video{npu_nr}")
+        except Exception as e:
+            print(f"    Aviso: Falha ao atualizar {cfg_p}: {e}")
+
+Path("/tmp/npu_vcam_nr").write_text(str(npu_nr), encoding="utf-8")
 PYEOF
+
+NPU_NR=$(cat /tmp/npu_vcam_nr 2>/dev/null || echo "9")
+sudo rm -f /tmp/npu_vcam_nr
 
 # 5. Configurar inicialização automática no boot (/etc/modules-load.d/v4l2loopback.conf)
 echo -e "${YELLOW}--> Garantindo carregamento automático do módulo no boot...${NC}"
@@ -147,9 +259,9 @@ echo "v4l2loopback" | sudo tee /etc/modules-load.d/v4l2loopback.conf > /dev/null
 # 6. Carregar ou recarregar o módulo
 echo -e "${YELLOW}--> Aplicando configurações no módulo de kernel v4l2loopback...${NC}"
 if lsmod | grep -q v4l2loopback; then
-    echo -e "${CYAN}Módulo v4l2loopback já carregado. Verificando /dev/video72...${NC}"
-    if [ ! -e "/dev/video72" ]; then
-        echo -e "${YELLOW}Recarregando v4l2loopback para registrar /dev/video72...${NC}"
+    echo -e "${CYAN}Módulo v4l2loopback já carregado. Verificando /dev/video$NPU_NR...${NC}"
+    if [ ! -e "/dev/video$NPU_NR" ]; then
+        echo -e "${YELLOW}Recarregando v4l2loopback para registrar /dev/video$NPU_NR...${NC}"
         sudo modprobe -r v4l2loopback 2>/dev/null || echo -e "${YELLOW}(Módulo em uso por outra aplicação, mantendo atual)${NC}"
         sudo modprobe v4l2loopback || true
     fi
@@ -157,12 +269,12 @@ else
     sudo modprobe v4l2loopback
 fi
 
-# 7. Validar existência do dispositivo /dev/video72
-if [ -e "/dev/video72" ]; then
-    echo -e "${GREEN}✓ Sucesso! Câmera virtual criada em /dev/video72:${NC}"
-    v4l2-ctl --device=/dev/video72 --info 2>/dev/null | head -n 8 || true
+# 7. Validar existência do dispositivo /dev/video$NPU_NR
+if [ -e "/dev/video$NPU_NR" ]; then
+    echo -e "${GREEN}✓ Sucesso! Câmera virtual criada em /dev/video$NPU_NR:${NC}"
+    v4l2-ctl --device="/dev/video$NPU_NR" --info 2>/dev/null | head -n 8 || true
 else
-    echo -e "${RED}Aviso: /dev/video72 não encontrado imediatamente. Se o módulo foi atualizado agora, pode ser necessário reiniciar o sistema.${NC}"
+    echo -e "${RED}Aviso: /dev/video$NPU_NR não encontrado imediatamente. Se o módulo foi atualizado agora, pode ser necessário reiniciar o sistema.${NC}"
 fi
 
 echo -e "${GREEN}✓ Etapa 2 concluída com sucesso!${NC}\n"
