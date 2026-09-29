@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import ctypes, ctypes.util, logging, os.path, getopt, sys, subprocess, select, time, math, configparser, json, shutil, struct
+import ctypes, ctypes.util, logging, os.path, getopt, sys, subprocess, select, time, math, configparser, json, shutil, struct, re
 from pathlib import Path
 from fcntl import ioctl
 from threading import Thread
@@ -2339,25 +2339,53 @@ NPU_TR = {
         'name': 'PTZ Parking Delay (s)',
         'tooltip': 'Wait time (in seconds) after disabling the camera sensor before triggering the retraction motors.',
     },
+    'npu_audio_input_device': {
+        'name': 'Microphone Input Source',
+        'tooltip': 'Select the physical or virtual microphone source for NPU ClearVoice AI processing.',
+    },
     'npu_audio_denoise': {
         'name': 'Microphone Noise Cancellation (AI)',
         'tooltip': 'Real-time ambient noise and echo reduction via the NPU (PipeWire ClearVoice).',
     },
     'npu_audio_studio': {
-        'name': 'Studio / Broadcast Audio Package',
-        'tooltip': 'Complete vocal studio treatment: 80Hz Low-Cut, Equalization, Compressor, and De-Esser.',
+        'name': 'Studio Voice Suite (Master)',
+        'tooltip': 'Master toggle for studio vocal enhancement suite (Low-Cut, EQ, Compressor, De-Esser).',
+    },
+    'npu_audio_lowcut': {
+        'name': 'High-Pass Filter (Low-Cut 80Hz)',
+        'tooltip': 'Eliminates desk vibrations, keyboard typing rumble, and wind noise below 80Hz.',
+    },
+    'npu_audio_studio_eq': {
+        'name': 'Studio Vocal EQ (Warmth & Presence)',
+        'tooltip': 'Subtle broadcast enhancement: warmth at 250Hz (+1.5dB) and speech presence/clarity at 3.5kHz (+2.5dB).',
+    },
+    'npu_audio_deesser': {
+        'name': 'De-Esser (Sibilance Control)',
+        'tooltip': 'Automatically attenuates harsh, piercing sibilant frequencies ("S" and "CH" sounds).',
+    },
+    'npu_audio_compressor': {
+        'name': 'Vocal Compressor & Auto-Gain (AGC)',
+        'tooltip': 'Smoothly balances speaking volume and prevents clipping distortion when speaking loudly.',
+    },
+    'npu_audio_comp_target': {
+        'name': 'Compressor Target Volume (dBFS)',
+        'tooltip': 'Target output loudness level for the vocal compressor (default -18 dBFS).',
     },
     'npu_audio_gate': {
         'name': 'Smart Noise Gate (VAD)',
-        'tooltip': 'Absolute silence during speech pauses (eliminates breathing and residual room noise).',
+        'tooltip': 'Mutes audio during natural speech pauses. Turn off if you experience soft syllable cutoff.',
+    },
+    'npu_audio_gate_thresh': {
+        'name': 'Noise Gate Threshold (dB)',
+        'tooltip': 'Audio level below which the gate engages silence (default -45 dB).',
     },
     'npu_audio_dereverb': {
         'name': 'Room De-Reverberation (De-Reverb)',
-        'tooltip': 'Reduces the metallic echo of empty rooms and cold floors, bringing the voice closer to an acoustic studio.',
+        'tooltip': 'Reduces the hollow room echo of hard surfaces. Turn off if your voice sounds dry or clamped.',
     },
-    'npu_standby_timeout': {
-        'name': 'Video Standby Timeout (s)',
-        'tooltip': 'Time with no app using the virtual camera before turning off the physical sensor.',
+    'npu_audio_dereverb_strength': {
+        'name': 'De-Reverb Strength (%)',
+        'tooltip': 'Percentage intensity of room echo attenuation (default 40%).',
     },
     'npu_audio_standby': {
         'name': 'Automatic Audio Standby (On-Demand)',
@@ -2449,6 +2477,30 @@ def get_npu_available_cameras(output_device="/dev/video9"):
             seen_nodes.add(dev_node)
 
     return cameras
+
+def get_npu_available_microphones():
+    mics = [
+        ("auto", "Detecção Automática (Auto)")
+    ]
+    try:
+        out = subprocess.check_output(["pactl", "list", "sources"], text=True, timeout=2)
+        sources = re.split(r'\n(?=Fonte #|Source #)', out)
+        for s in sources:
+            name_m = re.search(r'Nome:\s*(.+)|Name:\s*(.+)', s)
+            desc_m = re.search(r'Descrição:\s*(.+)|Description:\s*(.+)', s)
+            if name_m:
+                node_name = (name_m.group(1) or name_m.group(2)).strip()
+                lower = node_name.lower()
+                if lower.startswith("npu") or "clearvoice" in lower or "monitor" in lower or "null" in lower:
+                    continue
+                desc = (desc_m.group(1) or desc_m.group(2)).strip() if desc_m else node_name
+                is_virt = "iriun" in lower or "virtual" in lower or "loopback" in lower
+                virt_tag = " [Virtual]" if is_virt else ""
+                label = f"{desc} ({node_name}){virt_tag}" if desc != node_name else f"{node_name}{virt_tag}"
+                mics.append((node_name, label))
+    except Exception:
+        pass
+    return mics
 
 class IntelNPUCtrls:
     def __init__(self, device, fd):
@@ -2641,6 +2693,15 @@ class IntelNPUCtrls:
 
         cam_menu = [
             BaseCtrlMenu(c_dev, c_label, c_dev) for c_dev, c_label in available_cams
+        ]
+
+        available_mics = get_npu_available_microphones()
+        current_mic_dev = a_cfg.get("input_device", "auto")
+        if not any(m[0] == current_mic_dev for m in available_mics):
+            available_mics.append((current_mic_dev, f"{current_mic_dev} (Personalizado)"))
+
+        mic_menu = [
+            BaseCtrlMenu(m_dev, m_label, m_dev) for m_dev, m_label in available_mics
         ]
 
         self.ctrls = [
@@ -3147,42 +3208,28 @@ class IntelNPUCtrls:
                 step=1
             ),
             IntelNPUCtrl(
+                'npu_audio_input_device',
+                T('npu_audio_input_device', 'name', 'Microfone de Entrada (Fonte)'),
+                'menu',
+                T('npu_audio_input_device', 'tooltip', 'Selecione o microfone fonte de entrada para o processamento de IA na NPU.'),
+                value=current_mic_dev,
+                default='auto',
+                menu=mic_menu,
+                menu_dd=True,
+            ),
+            IntelNPUCtrl(
                 'npu_audio_denoise',
                 T('npu_audio_denoise', 'name', 'Cancelamento de Ruído do Microfone (IA)'),
                 'boolean',
-                T('npu_audio_denoise', 'tooltip', 'Redução de ruído ambiente e eco em tempo real pela NPU (PipeWire ClearVoice).'),
+                T('npu_audio_denoise', 'tooltip', 'Redução profunda de ruído ambiente e eco em tempo real pela NPU (PipeWire ClearVoice).'),
                 value=bool(a_cfg.get("noise_suppression", True)),
-                default=True
-            ),
-            IntelNPUCtrl(
-                'npu_audio_studio',
-                T('npu_audio_studio', 'name', 'Pacote de Áudio Estúdio / Broadcast'),
-                'boolean',
-                T('npu_audio_studio', 'tooltip', 'Tratamento completo de estúdio vocal: Low-Cut 80Hz, Equalização, Compressor e De-Esser.'),
-                value=bool(a_cfg.get("studio_mic_enabled", True)),
-                default=True
-            ),
-            IntelNPUCtrl(
-                'npu_audio_gate',
-                T('npu_audio_gate', 'name', 'Portão de Ruído Inteligente (VAD)'),
-                'boolean',
-                T('npu_audio_gate', 'tooltip', 'Silêncio absoluto durante pausas na fala (elimina respiração e ruídos de sala residuais).'),
-                value=bool(a_cfg.get("gate_enabled", True)),
-                default=True
-            ),
-            IntelNPUCtrl(
-                'npu_audio_dereverb',
-                T('npu_audio_dereverb', 'name', 'Desreverberação de Sala (De-Reverb)'),
-                'boolean',
-                T('npu_audio_dereverb', 'tooltip', 'Atenua o eco metálico de salas vazias e piso frio, aproximando a voz de estúdio acústico.'),
-                value=bool(a_cfg.get("dereverb_enabled", True)),
                 default=True
             ),
             IntelNPUCtrl(
                 'npu_audio_standby',
                 T('npu_audio_standby', 'name', 'Standby Automático de Áudio (On-Demand)'),
                 'boolean',
-                T('npu_audio_standby', 'tooltip', 'Libera o microfone físico quando nenhum aplicativo estiver consumindo o microfone virtual da NPU.'),
+                T('npu_audio_standby', 'tooltip', 'Libera o microfone físico (LED apagado) quando nenhum aplicativo estiver usando o microfone virtual.'),
                 value=bool(a_cfg.get("auto_standby", True)),
                 default=True
             ),
@@ -3196,6 +3243,95 @@ class IntelNPUCtrls:
                 min=1,
                 max=30,
                 step=1
+            ),
+            IntelNPUCtrl(
+                'npu_audio_studio',
+                T('npu_audio_studio', 'name', 'Pacote de Áudio Estúdio / Broadcast'),
+                'boolean',
+                T('npu_audio_studio', 'tooltip', 'Ativa o conjunto completo de aprimoramento vocal: Low-Cut 80Hz, Equalização, Compressor e De-Esser.'),
+                value=bool(a_cfg.get("studio_mic_enabled", True)),
+                default=True
+            ),
+            IntelNPUCtrl(
+                'npu_audio_lowcut',
+                T('npu_audio_lowcut', 'name', 'Filtro Passa-Alta (Low-Cut 80Hz)'),
+                'boolean',
+                T('npu_audio_lowcut', 'tooltip', 'Elimina vibrações da mesa, toques no teclado e ruído de vento abaixo de 80Hz.'),
+                value=bool(a_cfg.get("lowcut_enabled", True)),
+                default=True
+            ),
+            IntelNPUCtrl(
+                'npu_audio_studio_eq',
+                T('npu_audio_studio_eq', 'name', 'Equalização Vocal (Calor & Presença)'),
+                'boolean',
+                T('npu_audio_studio_eq', 'tooltip', 'Realce broadcast: calor em 250Hz (+1.5dB) e presença/articulação em 3.5kHz (+2.5dB).'),
+                value=bool(a_cfg.get("studio_eq_enabled", True)),
+                default=True
+            ),
+            IntelNPUCtrl(
+                'npu_audio_deesser',
+                T('npu_audio_deesser', 'name', 'De-Esser (Controle de Sibilâncias)'),
+                'boolean',
+                T('npu_audio_deesser', 'tooltip', 'Atenua automaticamente sibilâncias agudas e estridentes (sons de "S" e "CH").'),
+                value=bool(a_cfg.get("deesser_enabled", True)),
+                default=True
+            ),
+            IntelNPUCtrl(
+                'npu_audio_compressor',
+                T('npu_audio_compressor', 'name', 'Compressor Vocal & Nivelador (AGC)'),
+                'boolean',
+                T('npu_audio_compressor', 'tooltip', 'Nivela automaticamente variações de volume e evita distorções ou estouros de áudio.'),
+                value=bool(a_cfg.get("compressor_enabled", True)),
+                default=True
+            ),
+            IntelNPUCtrl(
+                'npu_audio_comp_target',
+                T('npu_audio_comp_target', 'name', 'Volume Alvo do Compressor (dBFS)'),
+                'integer',
+                T('npu_audio_comp_target', 'tooltip', 'Nível de volume de referência para o compressor broadcast (padrão -18 dBFS).'),
+                value=int(round(float(a_cfg.get("comp_target_db", -18.0)))),
+                default=-18,
+                min=-30,
+                max=-6,
+                step=1
+            ),
+            IntelNPUCtrl(
+                'npu_audio_gate',
+                T('npu_audio_gate', 'name', 'Portão de Ruído Inteligente (VAD)'),
+                'boolean',
+                T('npu_audio_gate', 'tooltip', 'Silêncio absoluto durante pausas na fala. Desative para evitar picotamento suave de sílabas.'),
+                value=bool(a_cfg.get("gate_enabled", False)),
+                default=False
+            ),
+            IntelNPUCtrl(
+                'npu_audio_gate_thresh',
+                T('npu_audio_gate_thresh', 'name', 'Limiar do Portão de Ruído (dB)'),
+                'integer',
+                T('npu_audio_gate_thresh', 'tooltip', 'Sensibilidade de corte do silêncio (padrão -45 dB; valores menores fecham menos).'),
+                value=int(round(float(a_cfg.get("gate_threshold_db", -45.0)))),
+                default=-45,
+                min=-60,
+                max=-20,
+                step=1
+            ),
+            IntelNPUCtrl(
+                'npu_audio_dereverb',
+                T('npu_audio_dereverb', 'name', 'Desreverberação de Sala (De-Reverb)'),
+                'boolean',
+                T('npu_audio_dereverb', 'tooltip', 'Atenua o eco metálico de salas vazias e piso frio. Desative para manter o corpo natural da voz.'),
+                value=bool(a_cfg.get("dereverb_enabled", False)),
+                default=False
+            ),
+            IntelNPUCtrl(
+                'npu_audio_dereverb_strength',
+                T('npu_audio_dereverb_strength', 'name', 'Intensidade da Desreverberação (%)'),
+                'integer',
+                T('npu_audio_dereverb_strength', 'tooltip', 'Força da atenuação do eco de sala (padrão 40%).'),
+                value=int(round(float(a_cfg.get("dereverb_strength", 40)))),
+                default=40,
+                min=0,
+                max=100,
+                step=5
             ),
         ])
 
@@ -3538,24 +3674,14 @@ class IntelNPUCtrls:
                 cfg["video"]["standby_park_delay"] = float(v)
                 changed = True
 
+            elif k == 'npu_audio_input_device':
+                ctrl.value = v
+                cfg["audio"]["input_device"] = v
+                changed = True
+
             elif k == 'npu_audio_denoise':
                 ctrl.value = bool(v)
                 cfg["audio"]["noise_suppression"] = bool(v)
-                changed = True
-
-            elif k == 'npu_audio_studio':
-                ctrl.value = bool(v)
-                cfg["audio"]["studio_mic_enabled"] = bool(v)
-                changed = True
-
-            elif k == 'npu_audio_gate':
-                ctrl.value = bool(v)
-                cfg["audio"]["gate_enabled"] = bool(v)
-                changed = True
-
-            elif k == 'npu_audio_dereverb':
-                ctrl.value = bool(v)
-                cfg["audio"]["dereverb_enabled"] = bool(v)
                 changed = True
 
             elif k == 'npu_audio_standby':
@@ -3566,6 +3692,56 @@ class IntelNPUCtrls:
             elif k == 'npu_audio_standby_timeout':
                 ctrl.value = int(v)
                 cfg["audio"]["standby_timeout"] = float(v)
+                changed = True
+
+            elif k == 'npu_audio_studio':
+                ctrl.value = bool(v)
+                cfg["audio"]["studio_mic_enabled"] = bool(v)
+                changed = True
+
+            elif k == 'npu_audio_lowcut':
+                ctrl.value = bool(v)
+                cfg["audio"]["lowcut_enabled"] = bool(v)
+                changed = True
+
+            elif k == 'npu_audio_studio_eq':
+                ctrl.value = bool(v)
+                cfg["audio"]["studio_eq_enabled"] = bool(v)
+                changed = True
+
+            elif k == 'npu_audio_deesser':
+                ctrl.value = bool(v)
+                cfg["audio"]["deesser_enabled"] = bool(v)
+                changed = True
+
+            elif k == 'npu_audio_compressor':
+                ctrl.value = bool(v)
+                cfg["audio"]["compressor_enabled"] = bool(v)
+                changed = True
+
+            elif k == 'npu_audio_comp_target':
+                ctrl.value = int(v)
+                cfg["audio"]["comp_target_db"] = float(v)
+                changed = True
+
+            elif k == 'npu_audio_gate':
+                ctrl.value = bool(v)
+                cfg["audio"]["gate_enabled"] = bool(v)
+                changed = True
+
+            elif k == 'npu_audio_gate_thresh':
+                ctrl.value = int(v)
+                cfg["audio"]["gate_threshold_db"] = float(v)
+                changed = True
+
+            elif k == 'npu_audio_dereverb':
+                ctrl.value = bool(v)
+                cfg["audio"]["dereverb_enabled"] = bool(v)
+                changed = True
+
+            elif k == 'npu_audio_dereverb_strength':
+                ctrl.value = int(v)
+                cfg["audio"]["dereverb_strength"] = int(v)
                 changed = True
 
         if changed:
@@ -4746,12 +4922,26 @@ class CameraCtrls:
                         'npu_ptz_park_delay',
                     ])
                 ),
-                CtrlCategory('Áudio de Estúdio & Voz',
+                CtrlCategory('Microfone & Cancelamento de Ruído (IA)',
                     pop_list_by_text_ids(ctrls, [
+                        'npu_audio_input_device',
                         'npu_audio_denoise',
+                        'npu_audio_standby',
+                        'npu_audio_standby_timeout',
+                    ])
+                ),
+                CtrlCategory('Processamento Vocal de Estúdio (Broadcast DSP)',
+                    pop_list_by_text_ids(ctrls, [
                         'npu_audio_studio',
+                        'npu_audio_lowcut',
+                        'npu_audio_studio_eq',
+                        'npu_audio_deesser',
+                        'npu_audio_compressor',
+                        'npu_audio_comp_target',
                         'npu_audio_gate',
+                        'npu_audio_gate_thresh',
                         'npu_audio_dereverb',
+                        'npu_audio_dereverb_strength',
                     ])
                 ),
             ]),
