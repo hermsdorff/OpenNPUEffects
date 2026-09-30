@@ -1712,6 +1712,62 @@ def get_gesture_emoji(gesture_name):
                 return im
     return None
 
+class GestureTrigger:
+    """Temporal confirmation from fresh masks; one event per held gesture."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.samples = []
+        self.last_sample_id = None
+        self.last_fresh = None
+        self.absent_since = None
+        self.latched_type = None
+        self.cooldown_until = 0.0
+
+    def update(self, gesture, pos, now, sample_id):
+        # A reused inference is not another vote, nor evidence of hand removal.
+        if sample_id == self.last_sample_id:
+            if self.last_fresh is not None and now - self.last_fresh > 0.35:
+                self.samples.clear()
+                self.absent_since = None
+            return None
+        if self.last_fresh is not None and now - self.last_fresh > 0.35:
+            self.samples.clear()
+            self.absent_since = None
+        self.last_sample_id = sample_id
+        self.last_fresh = now
+
+        if gesture is None:
+            if self.absent_since is None:
+                self.absent_since = now
+            if now - self.absent_since >= 0.35:
+                self.latched_type = None
+                self.samples.clear()
+        else:
+            self.absent_since = None
+
+        self.samples.append((now, gesture))
+        self.samples = [(t, g) for t, g in self.samples if now - t <= 0.55]
+        if gesture is None or gesture == self.latched_type:
+            return None
+        hits = [t for t, g in self.samples if g == gesture]
+        # Allow isolated misses, but reject short bursts and alternating classes.
+        if len(hits) < 3 or hits[-1] - hits[0] < 0.30:
+            return None
+        if len(hits) / len(self.samples) < 0.70:
+            return None
+        if max(b - a for a, b in zip(hits, hits[1:])) > 0.18:
+            return None
+        if now < self.cooldown_until:
+            return None
+        self.latched_type = gesture
+        self.cooldown_until = now + 0.9
+        self.samples.clear()
+        return gesture, pos
+
+
 def detect_hand_gesture(hand_skin, out_w=1920, out_h=1080):
     hand_bin = (hand_skin > 0.22).astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -2480,14 +2536,11 @@ def main():
         privacy_screen = None
         last_privacy_path = None
         privacy_fade_alpha = 0.0
-        candidate_gesture = None
-        candidate_gesture_time = 0.0
-        gesture_match_count = 0
-        no_hand_count = 0
+        gesture_trigger = GestureTrigger()
+        gesture_sync_sample = 0
+        gesture_debug_last = "unset"
         gesture_animation = None
         last_gesture_mute_time = 0.0
-        gesture_latched = False
-        gesture_cooldown_until = 0.0
         prev_mask = None
         # Heavy Assist Worker: as inferencias pesadas (cadeira/objetos YOLACT,
         # oculos BiSeNet, MODNet) rodam agora em uma thread dedicada com rotacao
@@ -2862,6 +2915,7 @@ def main():
                             hand_skin = primary_async_state["hand_skin"]
                             has_hands = primary_async_state["has_hands"]
                             bg_prob = primary_async_state["bg_prob"]
+                            gesture_sample_id = ("async", primary_async_state["seq"])
                         primary_async_log_ctr += 1
                         if primary_async_log_ctr >= 100:
                             primary_async_log_ctr = 0
@@ -2886,6 +2940,8 @@ def main():
                         p_person, hand_skin, has_hands, bg_prob = postprocess_multiclass_mask(
                             raw, face_info, out_w, out_h
                         )
+                        gesture_sync_sample += 1
+                        gesture_sample_id = ("sync", gesture_sync_sample)
                         if primary_queue is not None:
                             # Publica para o proximo quadro entrar no caminho async
                             with primary_async_lock:
@@ -2944,48 +3000,32 @@ def main():
                         if has_hands:
                             g_type, g_pos = detect_hand_gesture(hand_skin, out_w, out_h)
 
-                        if g_type is not None:
-                            no_hand_count = 0
-                            if g_type == candidate_gesture:
-                                gesture_match_count += 1
-                            else:
-                                candidate_gesture = g_type
-                                gesture_match_count = 1
-                                candidate_gesture_time = now
-
-                            # Only consider gesture after strictly 0.5 seconds of uninterrupted detection of the exact same gesture
-                            time_held = now - candidate_gesture_time
-                            if time_held >= 0.50:
-                                if not gesture_latched and (now >= gesture_cooldown_until):
-                                    if g_act in ["reaction", "all"]:
-                                        gesture_animation = {
-                                            "type": g_type,
-                                            "pos": g_pos,
-                                            "start_time": now,
-                                            "duration": 1.8
-                                        }
-                                    if g_type == "open_palm" and g_act in ["mute_toggle", "all"]:
-                                        if (now - last_gesture_mute_time) > 1.8:
-                                            is_currently_muted = check_audio_muted()
-                                            set_audio_mute(not is_currently_muted)
-                                            last_gesture_mute_time = now
-
-                                    gesture_latched = True
-                                    gesture_cooldown_until = now + 0.9
-                        else:
-                            # Hand absent or gesture broken: reset candidate and streak immediately
-                            candidate_gesture = None
-                            candidate_gesture_time = 0.0
-                            gesture_match_count = 0
-                            no_hand_count += 1
-                            if no_hand_count >= 2:
-                                gesture_latched = False
+                        if (cfg.get("gesture_debug", False)
+                                and gesture_sample_id != gesture_trigger.last_sample_id
+                                and g_type != gesture_debug_last):
+                            logging.info("GESTURE | raw=%s | sample=%s", g_type, gesture_sample_id)
+                            gesture_debug_last = g_type
+                        gesture_event = gesture_trigger.update(
+                            g_type, g_pos, time.monotonic(), gesture_sample_id
+                        )
+                        if gesture_event is not None:
+                            g_type, g_pos = gesture_event
+                            logging.info("GESTURE | confirmed=%s | sample=%s", g_type, gesture_sample_id)
+                            if g_act in ["reaction", "all"]:
+                                gesture_animation = {
+                                    "type": g_type,
+                                    "pos": g_pos,
+                                    "start_time": now,
+                                    "duration": 1.8
+                                }
+                            if g_type == "open_palm" and g_act in ["mute_toggle", "all"]:
+                                if (now - last_gesture_mute_time) > 1.8:
+                                    is_currently_muted = check_audio_muted()
+                                    set_audio_mute(not is_currently_muted)
+                                    last_gesture_mute_time = now
                     else:
-                        candidate_gesture = None
-                        candidate_gesture_time = 0.0
-                        gesture_match_count = 0
-                        no_hand_count = 0
-                        gesture_latched = False
+                        gesture_trigger.reset()
+                        gesture_debug_last = "unset"
 
                     if perf_stats_on:
                         stage_timer.lap("4f_gestos")
