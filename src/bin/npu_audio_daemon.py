@@ -17,6 +17,18 @@ import numpy as np
 import openvino as ov
 import sounddevice as sd
 from scipy import signal as dsp_signal
+import copy
+import uuid
+from npu_pipeline.telemetry import (
+    BoundedTelemetry,
+    NullTelemetry,
+    ObservationOrigin,
+    SCHEMA_VERSION,
+    duration_ms,
+    event_json,
+    provenance_fields,
+)
+from npu_pipeline.telemetry_runtime import TelemetryRuntime, validate_m0_config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -421,12 +433,51 @@ def main():
     last_config_mtime = 0
     last_loopback_check = time.time()
 
+    audio_session_id = str(uuid.uuid4())
+    audio_gen_id = f"audio-gen-{uuid.uuid4().hex[:8]}"
+    audio_block_id = 0
+    first_sample_index = 0
+    config_version = 1
+    last_applied_cfg = copy.deepcopy(cfg)
+
+    # Authoritative owner counters
+    read_attempt_total = 0
+    received_bytes_total = 0
+    full_input_blocks_total = 0
+    short_read_total = 0
+    input_samples_observed_total = 0
+    submitted_model_samples_total = 0
+    normal_output_samples_accepted_total = 0
+    silence_output_samples_accepted_total = 0
+    write_attempt_total = 0
+    write_or_flush_failure_total = 0
+    capture_reconnect_total = 0
+    playback_reconnect_total = 0
+    model_state_reset_total = 0
+
+    m0_runtime = TelemetryRuntime("audio", session_id=audio_session_id, config=cfg.get("audio", cfg))
+    m0_runtime.register_owner_counter("read_attempt_total", lambda: read_attempt_total)
+    m0_runtime.register_owner_counter("received_bytes_total", lambda: received_bytes_total)
+    m0_runtime.register_owner_counter("full_input_blocks_total", lambda: full_input_blocks_total)
+    m0_runtime.register_owner_counter("short_read_total", lambda: short_read_total)
+    m0_runtime.register_owner_counter("input_samples_observed_total", lambda: input_samples_observed_total)
+    m0_runtime.register_owner_counter("submitted_model_samples_total", lambda: submitted_model_samples_total)
+    m0_runtime.register_owner_counter("normal_output_samples_accepted_total", lambda: normal_output_samples_accepted_total)
+    m0_runtime.register_owner_counter("silence_output_samples_accepted_total", lambda: silence_output_samples_accepted_total)
+    m0_runtime.register_owner_counter("write_attempt_total", lambda: write_attempt_total)
+    m0_runtime.register_owner_counter("write_or_flush_failure_total", lambda: write_or_flush_failure_total)
+    m0_runtime.register_owner_counter("capture_reconnect_total", lambda: capture_reconnect_total)
+    m0_runtime.register_owner_counter("playback_reconnect_total", lambda: playback_reconnect_total)
+    m0_runtime.register_owner_counter("model_state_reset_total", lambda: model_state_reset_total)
+
     logging.info(f"Starting real-time audio filter stream via PipeWire (chunk={chunk_size}, rate={rate}Hz)...")
     play_node_name = f"npu_mic_feed_{os.getpid()}"
     rec_node_name = f"npu_mic_capture_{os.getpid()}"
     out_cmd = ["pw-play", "--target", "0", "-P", f"node.name={play_node_name}", "--format", "f32", "--rate", str(rate), "--channels", "1", "-"]
 
     def spawn_out_proc():
+        nonlocal playback_reconnect_total
+        playback_reconnect_total += 1
         p = subprocess.Popen(out_cmd, stdin=subprocess.PIPE, bufsize=chunk_size * 4)
         time.sleep(0.15)
         run_cmd(f"pw-link {play_node_name}:output_MONO {source_name}:input_FL 2>/dev/null || true")
@@ -434,8 +485,12 @@ def main():
         return p
 
     def spawn_in_proc(target_mic):
+        nonlocal capture_reconnect_total, audio_gen_id, first_sample_index
         if not target_mic:
             return None
+        capture_reconnect_total += 1
+        audio_gen_id = f"audio-gen-{uuid.uuid4().hex[:8]}"
+        first_sample_index = 0
         cmd = [
             "pw-record",
             "--target", target_mic,
@@ -471,6 +526,10 @@ def main():
                         if mtime != last_config_mtime:
                             last_config_mtime = mtime
                             cfg = load_config()
+                            if cfg != last_applied_cfg:
+                                last_applied_cfg = copy.deepcopy(cfg)
+                                config_version += 1
+                                m0_runtime.update_config(cfg.get("audio", cfg))
                     except Exception:
                         pass
 
@@ -484,6 +543,7 @@ def main():
                         in_proc = spawn_in_proc(hw_mic)
                     else:
                         in_proc = None
+                    model_state_reset_total += 1
                     states = {n: np.zeros(inp_shapes[n], dtype=np.float32) for n in state_names}
 
                 # Maintain virtual microphone as default source (re-assert if stolen by hotplug)
@@ -511,6 +571,7 @@ def main():
                 last_active_time = now
                 if in_proc is None and hw_mic:
                     in_proc = spawn_in_proc(hw_mic)
+                    model_state_reset_total += 1
                     states = {n: np.zeros(inp_shapes[n], dtype=np.float32) for n in state_names}
 
             if cfg.get("auto_standby", True) and not voice_zoom_requested:
@@ -525,6 +586,7 @@ def main():
                             in_standby = False
                             if in_proc is None and hw_mic:
                                 in_proc = spawn_in_proc(hw_mic)
+                                model_state_reset_total += 1
                                 states = {n: np.zeros(inp_shapes[n], dtype=np.float32) for n in state_names}
 
                     standby_timeout = float(cfg.get("standby_timeout", 1.0))
@@ -537,10 +599,21 @@ def main():
                 if in_standby:
                     # Mantem o stream vivo com silencio limpo, sem tocar no microfone fisico
                     time.sleep(frame_duration)
+                    write_attempt_total += 1
+                    t_write_s = time.monotonic_ns()
                     try:
                         out_proc.stdin.write(silence_chunk)
+                        t_write_e = time.monotonic_ns()
                         out_proc.stdin.flush()
-                    except (BrokenPipeError, OSError):
+                        t_flush_e = time.monotonic_ns()
+                        silence_output_samples_accepted_total += chunk_size
+                        if m0_runtime.enabled:
+                            m0_runtime.telemetry.sample("audio.write_call_ms", (t_write_e - t_write_s) / 1_000_000)
+                            m0_runtime.telemetry.sample("audio.flush_call_ms", (t_flush_e - t_write_e) / 1_000_000)
+                    except (BrokenPipeError, OSError) as e:
+                        write_or_flush_failure_total += 1
+                        if m0_runtime.enabled:
+                            m0_runtime.telemetry.emit("audio_sink_error", error=str(e))
                         stop_process(out_proc)
                         out_proc = spawn_out_proc()
                     continue
@@ -560,65 +633,153 @@ def main():
                 if new_mic:
                     hw_mic = new_mic
                     in_proc = spawn_in_proc(hw_mic)
+                    model_state_reset_total += 1
                     states = {n: np.zeros(inp_shapes[n], dtype=np.float32) for n in state_names}
                 else:
                     # Stream clean silence so Teams / apps keep receiving a smooth, alive stream
                     time.sleep(frame_duration)
+                    write_attempt_total += 1
+                    t_write_s = time.monotonic_ns()
                     try:
                         out_proc.stdin.write(silence_chunk)
+                        t_write_e = time.monotonic_ns()
                         out_proc.stdin.flush()
-                    except (BrokenPipeError, OSError):
+                        t_flush_e = time.monotonic_ns()
+                        silence_output_samples_accepted_total += chunk_size
+                        if m0_runtime.enabled:
+                            m0_runtime.telemetry.sample("audio.write_call_ms", (t_write_e - t_write_s) / 1_000_000)
+                            m0_runtime.telemetry.sample("audio.flush_call_ms", (t_flush_e - t_write_e) / 1_000_000)
+                    except (BrokenPipeError, OSError) as e:
+                        write_or_flush_failure_total += 1
+                        if m0_runtime.enabled:
+                            m0_runtime.telemetry.emit("audio_sink_error", error=str(e))
                         stop_process(out_proc)
                         out_proc = spawn_out_proc()
                     continue
 
             # Read audio chunk from physical microphone
+            read_attempt_total += 1
+            t_read_start = time.monotonic_ns()
             raw = in_proc.stdout.read(chunk_size * 4)
+            t_read_end = time.monotonic_ns()
+            received_bytes = len(raw) if raw else 0
+            received_bytes_total += received_bytes
+            if m0_runtime.enabled:
+                m0_runtime.telemetry.sample("audio.read_call_ms", (t_read_end - t_read_start) / 1_000_000)
             if not running:
                 break
 
             # Handle physical microphone disconnect (read returns empty or short)
             if not raw or len(raw) < chunk_size * 4:
+                short_read_total += 1
+                short_samples = (len(raw) // 4) if raw else 0
+                if m0_runtime.enabled:
+                    m0_runtime.telemetry.emit(
+                        "audio_short_read",
+                        requested_samples=chunk_size,
+                        actual_samples=short_samples,
+                        actual_bytes=len(raw) if raw else 0,
+                    )
                 logging.warning(f"Physical microphone '{hw_mic}' disconnected or stream ended. Waiting for reconnection...")
                 stop_process(in_proc)
                 in_proc = None
                 continue
 
+            full_input_blocks_total += 1
+            input_samples_observed_total += chunk_size
+            audio_block_id += 1
+            arrival_mono_ns = t_read_end
+
             data = np.frombuffer(raw, dtype=np.float32)
 
             if cfg.get("noise_suppression", True):
                 # Feed chunk to NPU
+                t_prep_start = time.monotonic_ns()
                 chunk = data[None, :]  # shape (1, 2048)
                 feed = {"input": chunk}
                 feed.update(states)
+                t_prep_end = time.monotonic_ns()
+                if m0_runtime.enabled:
+                    m0_runtime.telemetry.sample("audio.feed_prepare_ms", (t_prep_end - t_prep_start) / 1_000_000)
 
+                t_infer_start = time.monotonic_ns()
                 infer_request.infer(feed)
+                t_infer_end = time.monotonic_ns()
+                submitted_model_samples_total += chunk_size
+                if m0_runtime.enabled:
+                    m0_runtime.telemetry.sample("audio.infer_call_ms", (t_infer_end - t_infer_start) / 1_000_000)
+
+                t_fetch_start = time.monotonic_ns()
                 cleaned = infer_request.get_tensor("output").data  # shape (1, 2048)
 
                 # Update state tensors for seamless next iteration
                 for n in state_names:
                     out_name = n.replace("inp", "out")
                     states[n] = infer_request.get_tensor(out_name).data
+                t_fetch_end = time.monotonic_ns()
+                if m0_runtime.enabled:
+                    m0_runtime.telemetry.sample("audio.output_and_state_fetch_ms", (t_fetch_end - t_fetch_start) / 1_000_000)
 
                 audio_for_dsp = cleaned[0]
             else:
                 audio_for_dsp = data
 
             # Apply studio DSP chain (Low-cut, De-reverb, Studio EQ, De-esser, Gate/VAD, Compressor/AGC)
+            t_dsp_start = time.monotonic_ns()
             processed = effects_chain.process(audio_for_dsp, cfg)
+            t_dsp_end = time.monotonic_ns()
+            if m0_runtime.enabled:
+                m0_runtime.telemetry.sample("audio.dsp_ms", (t_dsp_end - t_dsp_start) / 1_000_000)
+
+            t_ser_start = time.monotonic_ns()
+            out_bytes = processed.tobytes()
+            t_ser_end = time.monotonic_ns()
+            if m0_runtime.enabled:
+                m0_runtime.telemetry.sample("audio.serialization_ms", (t_ser_end - t_ser_start) / 1_000_000)
+
+            write_attempt_total += 1
+            t_write_start = time.monotonic_ns()
             try:
-                out_proc.stdin.write(processed.tobytes())
+                out_proc.stdin.write(out_bytes)
+                t_write_end = time.monotonic_ns()
                 out_proc.stdin.flush()
-            except (BrokenPipeError, OSError):
+                t_flush_end = time.monotonic_ns()
+                normal_output_samples_accepted_total += chunk_size
+                if m0_runtime.enabled:
+                    m0_runtime.telemetry.sample("audio.write_call_ms", (t_write_end - t_write_start) / 1_000_000)
+                    m0_runtime.telemetry.sample("audio.flush_call_ms", (t_flush_end - t_write_end) / 1_000_000)
+                    m0_runtime.telemetry.sample("audio.arrival_to_flush_return_ms", (t_flush_end - arrival_mono_ns) / 1_000_000)
+            except (BrokenPipeError, OSError) as e:
+                write_or_flush_failure_total += 1
+                if m0_runtime.enabled:
+                    m0_runtime.telemetry.emit("audio_sink_error", error=str(e))
                 if not running:
                     break
                 logging.warning("PipeWire playback process pipe closed, restarting...")
                 stop_process(out_proc)
                 out_proc = spawn_out_proc()
 
+            if m0_runtime.should_trace(audio_block_id):
+                m0_runtime.telemetry.emit(
+                    "audio_block",
+                    generation_id=audio_gen_id,
+                    block_id=audio_block_id,
+                    first_observed_sample_index=first_sample_index,
+                    sample_count=chunk_size,
+                    rate=rate,
+                    signal_duration_ms=128.0,
+                    timestamp_quality="ARRIVAL_ESTIMATE",
+                    sink_presentation_latency_ms=None,
+                )
+            first_sample_index += chunk_size
+
     except Exception as e:
         logging.error(f"Error in audio streaming loop: {e}")
     finally:
+        try:
+            m0_runtime.stop()
+        except Exception as e:
+            logging.debug(f"Telemetry shutdown ignored error: {e}")
         stop_process(in_proc)
         stop_process(out_proc)
         cleanup()

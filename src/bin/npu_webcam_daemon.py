@@ -14,6 +14,7 @@ import signal
 import subprocess
 import struct
 import threading
+import atexit
 import logging
 from pathlib import Path
 import numpy as np
@@ -24,6 +25,18 @@ try:
 except ImportError:  # OpenVINO mais novo expoe AsyncInferQueue no namespace raiz
     AsyncInferQueue = ov.AsyncInferQueue
 import pyvirtualcam
+import uuid
+import copy
+from npu_pipeline.telemetry import (
+    BoundedTelemetry,
+    NullTelemetry,
+    ObservationOrigin,
+    SCHEMA_VERSION,
+    duration_ms,
+    event_json,
+    provenance_fields,
+)
+from npu_pipeline.telemetry_runtime import TelemetryRuntime, validate_m0_config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -573,11 +586,15 @@ class HeavyAssistWorker:
     def __init__(self, chair_infer_req=None, chair_inp_name=None, chair_inp_w=550, chair_inp_h=550,
                  glasses_infer_req=None, glasses_inp_name=None, glasses_out_name=None,
                  glasses_inp_w=512, glasses_inp_h=512,
-                 modnet_infer_req=None, modnet_inp_name=None, modnet_out_name=None):
+                 modnet_infer_req=None, modnet_inp_name=None, modnet_out_name=None,
+                 telemetry=None):
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._job = None
+        self._telemetry = telemetry or NullTelemetry()
         self._results = {"chair": None, "handheld": None, "glasses": None, "modnet": None}
+        self._result_origins = {"chair": None, "handheld": None, "glasses": None, "modnet": None}
+        self._result_classifications = {"chair": "UNKNOWN", "handheld": "UNKNOWN", "glasses": "UNKNOWN", "modnet": "UNKNOWN"}
         self._phase = 0
         self._iters = 0
         self._iter_ms_ema = None
@@ -595,6 +612,10 @@ class HeavyAssistWorker:
         self._modnet_out_name = modnet_out_name
         self._thread = None
 
+    def set_telemetry(self, telemetry):
+        with self._lock:
+            self._telemetry = telemetry or NullTelemetry()
+
     def start(self):
         if self._thread is None or not self._thread.is_alive():
             self._thread = threading.Thread(target=self._run, name="npu-heavy-assist", daemon=True)
@@ -605,9 +626,11 @@ class HeavyAssistWorker:
         with self._lock:
             self._job = None
             self._results = {"chair": None, "handheld": None, "glasses": None, "modnet": None}
+            self._result_origins = {"chair": None, "handheld": None, "glasses": None, "modnet": None}
+            self._result_classifications = {"chair": "UNKNOWN", "handheld": "UNKNOWN", "glasses": "UNKNOWN", "modnet": "UNKNOWN"}
             self._phase = 0
 
-    def submit(self, framed, p_person, hand_skin, face_info, cfg):
+    def submit(self, framed, p_person, hand_skin, face_info, cfg, origin=None, primary_origin=None):
         """Publica o contexto do quadro atual (latest-wins, nao bloqueante)."""
         job = {
             "framed": framed.copy(),
@@ -615,6 +638,9 @@ class HeavyAssistWorker:
             "hand_skin": hand_skin.copy() if hand_skin is not None else None,
             "face_info": dict(face_info) if face_info else {"has_face": False},
             "cfg": cfg,
+            "origin": origin,
+            "primary_origin": primary_origin,
+            "submit_ns": time.monotonic_ns() if (self._telemetry and self._telemetry.enabled) else 0,
         }
         with self._lock:
             self._job = job
@@ -624,9 +650,20 @@ class HeavyAssistWorker:
         with self._lock:
             return dict(self._results)
 
-    def _publish(self, **masks):
+    def results_snapshot(self):
+        with self._lock:
+            return dict(self._results), dict(self._result_origins), dict(self._result_classifications)
+
+    def results_observed(self):
+        return self.results_snapshot()
+
+    def _publish(self, origins=None, classifications=None, **masks):
         with self._lock:
             self._results.update(masks)
+            if origins:
+                self._result_origins.update(origins)
+            if classifications:
+                self._result_classifications.update(classifications)
 
     def _run(self):
         while True:
@@ -649,34 +686,58 @@ class HeavyAssistWorker:
                 logging.info(f"PERF-ASSIST | iteracoes: {self._iters} | fase (ema): {self._iter_ms_ema:.1f}ms")
 
     def _process(self, job):
+        with self._lock:
+            telemetry = self._telemetry
         framed = job["framed"]
         p_person = job["p_person"]
         hand_skin = job["hand_skin"]
         face_info = job["face_info"]
         cfg = job["cfg"]
+        origin = job.get("origin")
+        submit_ns = job.get("submit_ns", 0)
 
         phase = self._phase
         self._phase = (phase + 1) % 3
 
-        if phase == 0:
-            self._phase_chair(framed, p_person, hand_skin, cfg)
-        elif phase == 1:
-            self._phase_glasses(framed, face_info, cfg)
-        else:
-            self._phase_modnet(framed, cfg)
+        t_stage_s = time.monotonic_ns() if (telemetry and telemetry.enabled) else 0
+        if telemetry and telemetry.enabled and submit_ns > 0 and t_stage_s >= submit_ns:
+            telemetry.sample("assist.job_wait_ms", (t_stage_s - submit_ns) / 1_000_000)
 
-    def _phase_chair(self, framed, p_person, hand_skin, cfg):
+        if phase == 0:
+            self._phase_chair(framed, p_person, hand_skin, cfg, origin=origin)
+            if telemetry and telemetry.enabled:
+                telemetry.sample("assist.chair_ms", (time.monotonic_ns() - t_stage_s) / 1_000_000)
+        elif phase == 1:
+            self._phase_glasses(framed, face_info, cfg, origin=origin)
+            if telemetry and telemetry.enabled:
+                telemetry.sample("assist.glasses_ms", (time.monotonic_ns() - t_stage_s) / 1_000_000)
+        else:
+            self._phase_modnet(framed, cfg, origin=origin)
+            if telemetry and telemetry.enabled:
+                telemetry.sample("assist.modnet_ms", (time.monotonic_ns() - t_stage_s) / 1_000_000)
+
+    def _phase_chair(self, framed, p_person, hand_skin, cfg, origin=None):
         retain_chair_cfg = cfg.get("chair_retention_enabled", True)
         has_hands = hand_skin is not None and bool(np.max(hand_skin) > 0.20)
         retain_handheld_cfg = cfg.get("object_retention_enabled", True) and has_hands
         if (not (retain_chair_cfg or retain_handheld_cfg)) or self._chair_req is None:
             # Recursos desativados: publica zeros validos para manter o contrato
-            self._publish(chair=np.zeros_like(p_person), handheld=np.zeros_like(p_person))
+            self._publish(
+                origins={"chair": origin, "handheld": origin},
+                classifications={"chair": "ZERO_RESULT", "handheld": "ZERO_RESULT"},
+                chair=np.zeros_like(p_person),
+                handheld=np.zeros_like(p_person),
+            )
             return
         chair_str = int(cfg.get("chair_retention_strength", 50))
         handheld_str = int(cfg.get("handheld_object_strength", 60))
         handheld_names = cfg.get("handheld_object_classes", ["cell phone", "cup", "book"])
         handheld_indices = [COCO_CLASS_NAME_TO_INDEX[n] for n in handheld_names if n in COCO_CLASS_NAME_TO_INDEX] if retain_handheld_cfg else []
+
+        obs_state = {}
+        def chair_observer(kind, info):
+            obs_state[kind] = info
+
         # Leitura direta (sem lock) so para continuidade da EMA temporal — corrida
         # benigna: no pior caso usa a penultima mascara publicada.
         _, chair_mask, handheld_mask = apply_neural_chair_retention(
@@ -689,14 +750,36 @@ class HeavyAssistWorker:
             retain_chair=retain_chair_cfg,
             hand_mask=hand_skin, handheld_class_indices=handheld_indices,
             handheld_strength=handheld_str, cached_handheld_mask=self._results.get("handheld"),
+            observer=chair_observer if (self._telemetry and self._telemetry.enabled) else None,
         )
-        self._publish(chair=chair_mask, handheld=handheld_mask)
 
-    def _phase_glasses(self, framed, face_info, cfg):
+        chair_cls = obs_state.get("chair", {}).get("classification", "NEW_CONTRIBUTION" if chair_mask is not None else "UNKNOWN")
+        handheld_cls = obs_state.get("handheld", {}).get("classification", "NEW_CONTRIBUTION" if handheld_mask is not None else "UNKNOWN")
+
+        chair_orig = origin if chair_cls in ("NEW_CONTRIBUTION", "MIXED_HISTORY") else self._result_origins.get("chair")
+        handheld_orig = origin if handheld_cls in ("NEW_CONTRIBUTION", "MIXED_HISTORY") else self._result_origins.get("handheld")
+
+        self._publish(
+            origins={"chair": chair_orig, "handheld": handheld_orig},
+            classifications={"chair": chair_cls, "handheld": handheld_cls},
+            chair=chair_mask,
+            handheld=handheld_mask,
+        )
+
+    def _phase_glasses(self, framed, face_info, cfg, origin=None):
         preserve_glasses = cfg.get("preserve_glasses", cfg.get("glasses_protection", True))
         if (not preserve_glasses) or (not face_info.get("has_face")) or self._glasses_req is None:
-            self._publish(glasses=None)
+            self._publish(
+                origins={"glasses": None},
+                classifications={"glasses": "NONE_RESULT"},
+                glasses=None,
+            )
             return
+
+        obs_state = {}
+        def glasses_observer(kind, info):
+            obs_state[kind] = info
+
         glasses_mask = apply_neural_glasses_retention(
             framed, face_info,
             glasses_infer_req=self._glasses_req,
@@ -704,11 +787,20 @@ class HeavyAssistWorker:
             glasses_out_name=self._glasses_out_name,
             cached_glasses_mask=self._results.get("glasses"),
             run_inference=True,
-            inp_w=self._glasses_inp_w, inp_h=self._glasses_inp_h
+            inp_w=self._glasses_inp_w, inp_h=self._glasses_inp_h,
+            observer=glasses_observer if (self._telemetry and self._telemetry.enabled) else None,
         )
-        self._publish(glasses=glasses_mask)
 
-    def _phase_modnet(self, framed, cfg):
+        glasses_cls = obs_state.get("glasses", {}).get("classification", "NEW_CONTRIBUTION" if glasses_mask is not None else "UNKNOWN")
+        glasses_orig = origin if glasses_cls == "NEW_CONTRIBUTION" else self._result_origins.get("glasses")
+
+        self._publish(
+            origins={"glasses": glasses_orig},
+            classifications={"glasses": glasses_cls},
+            glasses=glasses_mask,
+        )
+
+    def _phase_modnet(self, framed, cfg, origin=None):
         is_modnet_active = (
             cfg.get("video", {}).get("modnet_assist_enabled", False)
             or cfg.get("modnet_assist_enabled", False)
@@ -716,7 +808,11 @@ class HeavyAssistWorker:
             or cfg.get("segmentation_model", "multiclass") == "modnet"
         )
         if self._modnet_req is None or not is_modnet_active:
-            self._publish(modnet=None)
+            self._publish(
+                origins={"modnet": None},
+                classifications={"modnet": "NONE_RESULT"},
+                modnet=None,
+            )
             return
         fh, fw = framed.shape[:2]
         lb_scale = min(512.0 / fw, 512.0 / fh)
@@ -730,7 +826,11 @@ class HeavyAssistWorker:
         self._modnet_req.infer({self._modnet_inp_name: modnet_blob})
         modnet_alpha = self._modnet_req.get_tensor(self._modnet_out_name).data[0, 0]
         modnet_alpha_cropped = modnet_alpha[lb_pad_y:lb_pad_y + lb_h, lb_pad_x:lb_pad_x + lb_w]
-        self._publish(modnet=cv2.resize(modnet_alpha_cropped, (256, 256), interpolation=cv2.INTER_LINEAR))
+        self._publish(
+            origins={"modnet": origin},
+            classifications={"modnet": "NEW_CONTRIBUTION"},
+            modnet=cv2.resize(modnet_alpha_cropped, (256, 256), interpolation=cv2.INTER_LINEAR),
+        )
 
 
 class CaptureWorker:
@@ -747,30 +847,71 @@ class CaptureWorker:
     (latest-wins), sem nunca bloquear esperando a camera fisica.
     """
 
-    def __init__(self, cap):
+    def __init__(self, cap, telemetry=None, generation_id="g0", config_version=1, clock_ns=time.monotonic_ns):
         self._cap = cap
+        self._telemetry = telemetry or NullTelemetry()
+        self._generation_id = generation_id
+        self._config_version = config_version
+        self._clock_ns = clock_ns
         self._lock = threading.Lock()
         self._frame = None
         self._frame_id = -1
+        self._origin = None
         self._running = True
+
+        # Authoritative owner counters
+        self.capture_attempt_total = 0
+        self.capture_success_total = 0
+        self.capture_failure_total = 0
+
         self._thread = threading.Thread(target=self._run, name="npu-capture", daemon=True)
         self._thread.start()
+
+    def set_generation(self, generation_id):
+        with self._lock:
+            self._generation_id = generation_id
+
+    def set_config_version(self, version):
+        with self._lock:
+            self._config_version = version
+
+    def set_telemetry(self, telemetry):
+        with self._lock:
+            self._telemetry = telemetry or NullTelemetry()
 
     def _run(self):
         t_rate = time.perf_counter()
         n_rate = 0
         while self._running:
+            self.capture_attempt_total += 1
+            t_start = self._clock_ns() if self._telemetry.enabled else 0
             try:
                 ret, frame = self._cap.read()
             except Exception:
                 ret, frame = False, None
+            t_end = self._clock_ns() if self._telemetry.enabled else 0
+
             if not ret or frame is None:
+                self.capture_failure_total += 1
                 # Camera ainda nao entregou quadro: curta espera e nova tentativa
                 time.sleep(0.005)
                 continue
+
+            self.capture_success_total += 1
+            if self._telemetry.enabled:
+                self._telemetry.sample("capture.read_ms", (t_end - t_start) / 1_000_000)
+
             with self._lock:
                 self._frame = frame
                 self._frame_id += 1
+                if self._telemetry.enabled:
+                    self._origin = ObservationOrigin(
+                        generation_id=self._generation_id,
+                        frame_id=self._frame_id,
+                        arrival_mono_ns=t_end,
+                        config_version=self._config_version,
+                        timestamp_quality="ARRIVAL_ESTIMATE"
+                    )
             # PERF-CAP: taxa real de entrega da camera (ground truth — o formato
             # pode anunciar 30fps mas o stream efetivo pode ser menor, por exemplo
             # por limitacao de exposicao em auto-exposure).
@@ -785,6 +926,11 @@ class CaptureWorker:
         """Retorna (frame_id, frame) mais recentes; frame=None se nenhum ainda."""
         with self._lock:
             return self._frame_id, self._frame
+
+    def read_latest_observed(self):
+        """Retorna (frame_id, frame, origin) mais recentes para observacao M0."""
+        with self._lock:
+            return self._frame_id, self._frame, self._origin
 
     def stop(self):
         self._running = False
@@ -1312,7 +1458,7 @@ def check_audio_muted():
 def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_inp_name=None, strength=50,
                                   cached_chair_mask=None, run_inference=True, inp_w=550, inp_h=550,
                                   retain_chair=True, hand_mask=None, handheld_class_indices=None,
-                                  handheld_strength=60, cached_handheld_mask=None):
+                                  handheld_strength=60, cached_handheld_mask=None, observer=None):
     """
     Retencao Neural Exata de Cadeira & Encosto com Segmentacao de Instancias (YOLACT - MIT License) na NPU:
     Detecta os contornos e bordas anatomicas reais da cadeira (encosto, apoio de cabeca, abas e bracos),
@@ -1330,10 +1476,16 @@ def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_i
     """
     try:
         if chair_infer_req is None or chair_inp_name is None:
+            if observer:
+                observer("chair", {"classification": "NONE_RESULT"})
+                observer("handheld", {"classification": "NONE_RESULT"})
             return p_person, cached_chair_mask, cached_handheld_mask
 
         # Reutiliza mascaras estaveis no frame intermediario para manter 30+ FPS solidos
         if not run_inference:
+            if observer:
+                observer("chair", {"classification": "UNCHANGED_CACHE"})
+                observer("handheld", {"classification": "UNCHANGED_CACHE"})
             merged = p_person
             if cached_chair_mask is not None:
                 merged = np.maximum(merged, cached_chair_mask)
@@ -1367,6 +1519,8 @@ def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_i
 
         updated_chair_cache = None
         updated_handheld_cache = cached_handheld_mask
+        has_chair_det = False
+        has_handheld_det = False
 
         if is_yolact:
             conf = np.squeeze(out_dict["conf"], axis=0)          # (19248, 81)
@@ -1455,6 +1609,8 @@ def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_i
                         if np.any(comp & (person_anchor > 0)):
                             valid_chair = np.maximum(valid_chair, np.where(comp, chair_mask, 0.0))
 
+                    if np.any(valid_chair > 0.05):
+                        has_chair_det = True
                     if cached_chair_mask is not None:
                         updated_chair_cache = cached_chair_mask * 0.70 + valid_chair * 0.30
                     else:
@@ -1479,6 +1635,8 @@ def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_i
                         if np.any(comp & (hand_anchor > 0)):
                             valid_obj = np.maximum(valid_obj, np.where(comp, obj_mask, 0.0))
 
+                    if np.any(valid_obj > 0.05):
+                        has_handheld_det = True
                     if cached_handheld_mask is not None:
                         updated_handheld_cache = cached_handheld_mask * 0.60 + valid_obj * 0.40
                     else:
@@ -1562,6 +1720,8 @@ def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_i
                         if np.any(comp & (person_anchor > 0)):
                             valid_chair = np.maximum(valid_chair, np.where(comp, chair_mask, 0.0))
 
+                    if np.any(valid_chair > 0.05):
+                        has_chair_det = True
                     if cached_chair_mask is not None:
                         updated_chair_cache = cached_chair_mask * 0.70 + valid_chair * 0.30
                     else:
@@ -1583,8 +1743,37 @@ def apply_neural_chair_retention(p_person, framed, chair_infer_req=None, chair_i
         if updated_handheld_cache is not None:
             merged = np.maximum(merged, updated_handheld_cache)
 
+        if observer:
+            if has_chair_det:
+                if cached_chair_mask is not None and np.any(cached_chair_mask > 0.05):
+                    chair_cls = "MIXED_HISTORY"
+                else:
+                    chair_cls = "NEW_CONTRIBUTION"
+            else:
+                if cached_chair_mask is not None and np.any(cached_chair_mask > 0.05):
+                    chair_cls = "UNCHANGED_CACHE"
+                else:
+                    chair_cls = "ZERO_RESULT"
+
+            if has_handheld_det:
+                if cached_handheld_mask is not None and np.any(cached_handheld_mask > 0.05):
+                    handheld_cls = "MIXED_HISTORY"
+                else:
+                    handheld_cls = "NEW_CONTRIBUTION"
+            else:
+                if cached_handheld_mask is not None and np.any(cached_handheld_mask > 0.05):
+                    handheld_cls = "UNCHANGED_CACHE"
+                else:
+                    handheld_cls = "ZERO_RESULT"
+
+            observer("chair", {"classification": chair_cls})
+            observer("handheld", {"classification": handheld_cls})
+
         return merged, updated_chair_cache, updated_handheld_cache
     except Exception as e:
+        if observer:
+            observer("chair", {"classification": "ERROR_FALLBACK"})
+            observer("handheld", {"classification": "ERROR_FALLBACK"})
         return p_person, cached_chair_mask, cached_handheld_mask
 
 def apply_neural_glasses_retention(
@@ -1596,7 +1785,8 @@ def apply_neural_glasses_retention(
     cached_glasses_mask=None,
     run_inference=True,
     inp_w=512,
-    inp_h=512
+    inp_h=512,
+    observer=None,
 ):
     """
     Retencao Neural de Armacao e Hastes de Oculos (BiSeNet Face Parsing - MIT License) na NPU:
@@ -1609,19 +1799,27 @@ def apply_neural_glasses_retention(
     """
     try:
         if glasses_infer_req is None or glasses_inp_name is None:
+            if observer:
+                observer("glasses", {"classification": "NONE_RESULT"})
             return cached_glasses_mask
 
         if not face_info or not face_info.get("has_face"):
+            if observer:
+                observer("glasses", {"classification": "NONE_RESULT"})
             return None
 
         # Reutiliza mascara estavel no frame intermediario para economizar ciclos na NPU
         if not run_inference and cached_glasses_mask is not None:
+            if observer:
+                observer("glasses", {"classification": "UNCHANGED_CACHE"})
             return cached_glasses_mask
 
         h_orig, w_orig = framed.shape[:2]
         fx, fy, fw, fh = face_info["box"]
 
         if fw < 16 or fh < 16:
+            if observer:
+                observer("glasses", {"classification": "UNCHANGED_CACHE"})
             return cached_glasses_mask
 
         # Margens expandidas para cobrir as hastes dos oculos ate a regiao das orelhas (~38% nas laterais, ~30% superior, ~15% inferior)
@@ -1637,6 +1835,8 @@ def apply_neural_glasses_retention(
         cw = x2 - x1
         ch = y2 - y1
         if cw < 16 or ch < 16:
+            if observer:
+                observer("glasses", {"classification": "UNCHANGED_CACHE"})
             return cached_glasses_mask
 
         crop = framed[y1:y2, x1:x2]
@@ -1661,11 +1861,15 @@ def apply_neural_glasses_retention(
             if cached_glasses_mask is not None:
                 decayed = cached_glasses_mask * 0.4
                 if np.max(decayed) > 0.08:
+                    if observer:
+                        observer("glasses", {"classification": "UNCHANGED_CACHE"})
                     return decayed
             # Correcao do bug de rotacao: inferencia rodou e nao ha oculos na cena.
             # Retorna mascara vazia VALIDA (zeros) — None significaria "nunca rodou"
             # no call site (should_infer_glasses) e forcaria re-inferencia do BiSeNet
             # em TODOS os quadros quando o usuario nao usa oculos.
+            if observer:
+                observer("glasses", {"classification": "ZERO_RESULT"})
             return np.zeros((h_orig, w_orig), dtype=np.float32)
 
         # Redimensiona mascara de volta para as dimensoes do crop no frame
@@ -1685,8 +1889,12 @@ def apply_neural_glasses_retention(
         glasses_full = np.zeros((h_orig, w_orig), dtype=np.float32)
         glasses_full[y1:y2, x1:x2] = feathered
 
+        if observer:
+            observer("glasses", {"classification": "NEW_CONTRIBUTION"})
         return glasses_full
     except Exception as e:
+        if observer:
+            observer("glasses", {"classification": "ERROR_FALLBACK"})
         return cached_glasses_mask
 
 GESTURE_EMOJI_CACHE = {}
@@ -2370,10 +2578,66 @@ def main():
     # NPU (~15-20ms) + pos-processamento (~10-15ms) ≈ 32ms medidos; 25ms iniciais
     # estouravam em quase todo quadro. A espera usa threading.Event: o loop dorme de
     # verdade (zero polling de CPU) e o callback o acorda ao publicar o resultado.
+    video_session_id = str(uuid.uuid4())
+    video_gen_id = f"video-gen-{uuid.uuid4().hex[:8]}"
+    video_frame_id = 0
+    config_version = 1
+    last_applied_cfg = copy.deepcopy(cfg)
+
+    # Authoritative owner counters
+    selected_source_gap_total = 0
+    primary_async_submitted_total = 0
+    primary_async_reused_total = 0
+    primary_async_timeouts_total = 0
+    primary_sync_warmup_total = 0
+    primary_sync_config_total = 0
+    heavy_assist_submitted_total = 0
+    heavy_assist_observed_total = 0
+    processed_frame_total = 0
+    send_call_total = 0
+    send_success_total = 0
+    source_frame_new_send_total = 0
+    vcam_not_ready_total = 0
+    callback_not_published_total = 0
+
+    capture_attempt_accumulated = 0
+    capture_success_accumulated = 0
+    capture_failure_accumulated = 0
+    capture_worker = None
+
+    def stop_and_accumulate_capture():
+        nonlocal capture_worker, capture_attempt_accumulated, capture_success_accumulated, capture_failure_accumulated
+        if capture_worker is not None:
+            capture_worker.stop()
+            capture_attempt_accumulated += capture_worker.capture_attempt_total
+            capture_success_accumulated += capture_worker.capture_success_total
+            capture_failure_accumulated += capture_worker.capture_failure_total
+            capture_worker = None
+
+    m0_runtime = TelemetryRuntime("video", session_id=video_session_id, config=cfg.get("video", cfg))
+    atexit.register(m0_runtime.stop)
+    m0_runtime.register_owner_counter("selected_source_gap_total", lambda: selected_source_gap_total)
+    m0_runtime.register_owner_counter("primary_async_submitted_total", lambda: primary_async_submitted_total)
+    m0_runtime.register_owner_counter("primary_async_reused_total", lambda: primary_async_reused_total)
+    m0_runtime.register_owner_counter("primary_async_timeouts_total", lambda: primary_async_timeouts_total)
+    m0_runtime.register_owner_counter("primary_sync_warmup_total", lambda: primary_sync_warmup_total)
+    m0_runtime.register_owner_counter("primary_sync_config_total", lambda: primary_sync_config_total)
+    m0_runtime.register_owner_counter("heavy_assist_submitted_total", lambda: heavy_assist_submitted_total)
+    m0_runtime.register_owner_counter("heavy_assist_observed_total", lambda: heavy_assist_observed_total)
+    m0_runtime.register_owner_counter("processed_frame_total", lambda: processed_frame_total)
+    m0_runtime.register_owner_counter("send_call_total", lambda: send_call_total)
+    m0_runtime.register_owner_counter("send_success_total", lambda: send_success_total)
+    m0_runtime.register_owner_counter("source_frame_new_send_total", lambda: source_frame_new_send_total)
+    m0_runtime.register_owner_counter("vcam_not_ready_total", lambda: vcam_not_ready_total)
+    m0_runtime.register_owner_counter("callback_not_published_total", lambda: callback_not_published_total)
+    m0_runtime.register_owner_counter("capture_attempt_total", lambda: capture_attempt_accumulated + (capture_worker.capture_attempt_total if capture_worker else 0))
+    m0_runtime.register_owner_counter("capture_success_total", lambda: capture_success_accumulated + (capture_worker.capture_success_total if capture_worker else 0))
+    m0_runtime.register_owner_counter("capture_failure_total", lambda: capture_failure_accumulated + (capture_worker.capture_failure_total if capture_worker else 0))
+
     primary_async_wait_timeout = float(cfg.get("primary_async_same_frame_timeout_ms", 40.0)) / 1000.0
     primary_async_event = threading.Event()
     primary_async_wait_timeouts = 0
-    primary_async_state = {"p_person": None, "hand_skin": None, "has_hands": False, "bg_prob": None, "seq": -1, "cb_ema": None, "wait_ema": None}
+    primary_async_state = {"p_person": None, "hand_skin": None, "has_hands": False, "bg_prob": None, "seq": -1, "origin": None, "cb_ema": None, "wait_ema": None}
     primary_async_lock = threading.Lock()
     primary_submit_seq = 0
     primary_async_log_ctr = 0
@@ -2382,11 +2646,22 @@ def main():
     primary_queue = None
 
     def on_primary_async_result(request, userdata):
-        t0 = time.perf_counter()
-        fi_cb, seq_cb, w_cb, h_cb = userdata
+        nonlocal callback_not_published_total
+        t_cb_start_perf = time.perf_counter()
+        t_cb_start = time.monotonic_ns() if m0_runtime.enabled else 0
+        if len(userdata) == 5:
+            fi_cb, seq_cb, w_cb, h_cb, diag_env = userdata
+        else:
+            fi_cb, seq_cb, w_cb, h_cb = userdata
+            diag_env = None
         raw = request.get_tensor(seg_out_name).data[0].copy()  # copia: o buffer e reutilizado
         p_person_cb, hand_skin_cb, has_hands_cb, bg_prob_cb = postprocess_multiclass_mask(raw, fi_cb, w_cb, h_cb)
-        dt_ms = (time.perf_counter() - t0) * 1000.0
+        dt_ms = (time.perf_counter() - t_cb_start_perf) * 1000.0
+        if m0_runtime.enabled:
+            m0_runtime.telemetry.sample("primary.async_callback_postprocess_ms", dt_ms)
+            if diag_env and "start_ns" in diag_env:
+                m0_runtime.telemetry.sample("primary.submit_to_callback_ms", (t_cb_start - diag_env["start_ns"]) / 1_000_000)
+
         with primary_async_lock:
             # Politica latest-wins por sequencia: descarta resultado fora de ordem
             if seq_cb > primary_async_state["seq"]:
@@ -2395,6 +2670,15 @@ def main():
                 primary_async_state["has_hands"] = has_hands_cb
                 primary_async_state["bg_prob"] = bg_prob_cb
                 primary_async_state["seq"] = seq_cb
+                primary_async_state["origin"] = diag_env.get("origin") if diag_env else None
+            else:
+                callback_not_published_total += 1
+                if m0_runtime.enabled:
+                    m0_runtime.telemetry.emit(
+                        "callback_dropped_out_of_order",
+                        submitted_seq=seq_cb,
+                        current_seq=primary_async_state["seq"],
+                    )
             ema = primary_async_state["cb_ema"]
             primary_async_state["cb_ema"] = dt_ms if ema is None else ema * 0.9 + dt_ms * 0.1
         # Passo 7.1: acorda o loop que aguarda o resultado do proprio quadro (same-frame).
@@ -2528,7 +2812,28 @@ def main():
         placeholder_frame = np.zeros((out_h, out_w, 3), dtype=np.uint8)
         cv2.putText(placeholder_frame, "Intel NPU 1080p Webcam - Conectando...", (150, out_h // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (220, 220, 220), 2)
+        send_call_total += 1
+        t_snd_start = time.monotonic_ns()
         vcam.send(placeholder_frame)
+        t_snd_end = time.monotonic_ns()
+        send_success_total += 1
+        if m0_runtime.enabled:
+            m0_runtime.telemetry.sample("video.send_call_ms", (t_snd_end - t_snd_start) / 1_000_000)
+            m0_runtime.telemetry.emit(
+                "video_output_frame",
+                generation_id=video_gen_id,
+                output_frame_id=video_frame_id,
+                output_type="PLACEHOLDER",
+                dropped=False,
+                drop_reason=None,
+                vcam_delay_ms=0.0,
+                selected_source_gap=0,
+                source_frame_id=None,
+                source_generation_id=None,
+                arrival_to_send_ms=None,
+                presentation_timestamp_ns=None,
+            )
+        video_frame_id += 1
 
         cap = None
         framer = None
@@ -2554,6 +2859,7 @@ def main():
                 glasses_infer_req=glasses_infer_req, glasses_inp_name=glasses_inp_name,
                 glasses_out_name=glasses_out_name, glasses_inp_w=glasses_inp_w, glasses_inp_h=glasses_inp_h,
                 modnet_infer_req=modnet_infer_req, modnet_inp_name=modnet_inp_name, modnet_out_name=modnet_out_name,
+                telemetry=m0_runtime.telemetry,
             )
         heavy_assist_worker.reset()
         heavy_assist_worker.start()
@@ -2586,13 +2892,20 @@ def main():
                         if mtime != last_config_mtime:
                             last_config_mtime = mtime
                             cfg = load_config()
+                            if cfg != last_applied_cfg:
+                                last_applied_cfg = copy.deepcopy(cfg)
+                                config_version += 1
+                                m0_runtime.update_config(cfg.get("video", cfg))
+                                if heavy_assist_worker is not None:
+                                    heavy_assist_worker.set_telemetry(m0_runtime.telemetry)
+                                if capture_worker is not None:
+                                    capture_worker.set_config_version(config_version)
+                                    capture_worker.set_telemetry(m0_runtime.telemetry)
                             new_in_dev = cfg.get("input_device", "auto")
                             if new_in_dev != current_input_dev:
                                 logging.info(f"Troca dinâmica de câmera de entrada: {current_input_dev} -> {new_in_dev}")
                                 current_input_dev = new_in_dev
-                                if capture_worker is not None:
-                                    capture_worker.stop()
-                                    capture_worker = None
+                                stop_and_accumulate_capture()
                                 if cap is not None:
                                     cap.release()
                                     cap = None
@@ -2630,9 +2943,7 @@ def main():
                         # 1. Desativar a camera fisica primeiro (libera dispositivo V4L2 e apaga LED)
                         if cap is not None:
                             logging.info("Modo Standby On-Demand: nenhum aplicativo usando a camera. Desativando sensor fisico (LED OFF)...")
-                            if capture_worker is not None:
-                                capture_worker.stop()
-                                capture_worker = None
+                            stop_and_accumulate_capture()
                             cap.release()
                             cap = None
                             framer = None
@@ -2648,7 +2959,29 @@ def main():
                         # 3. Executar o parking da camera (PTZ tilt/pan para recolher)
                         phys_dev = f"/dev/video{resolve_cam_index(cfg.get('input_device', 'auto'), out_device)}"
                         execute_standby_hooks(cfg, phys_dev)
+                    send_call_total += 1
+                    t_snd_start = time.monotonic_ns()
                     vcam.send(placeholder_frame)
+                    t_snd_end = time.monotonic_ns()
+                    send_success_total += 1
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("video.send_call_ms", (t_snd_end - t_snd_start) / 1_000_000)
+                        if m0_runtime.should_trace(video_frame_id):
+                            m0_runtime.telemetry.emit(
+                                "video_output_frame",
+                                generation_id=video_gen_id,
+                                output_frame_id=video_frame_id,
+                                output_type="STANDBY",
+                                dropped=False,
+                                drop_reason=None,
+                                vcam_delay_ms=None,
+                                selected_source_gap=0,
+                                source_frame_id=None,
+                                source_generation_id=None,
+                                arrival_to_send_ms=None,
+                                presentation_timestamp_ns=None,
+                            )
+                    video_frame_id += 1
                     time.sleep(0.3)
                     continue
 
@@ -2688,6 +3021,7 @@ def main():
                                 primary_async_state["has_hands"] = False
                                 primary_async_state["bg_prob"] = None
                                 primary_async_state["seq"] = -1
+                                primary_async_state["origin"] = None
                         framer = AutoFramer(
                             actual_w, actual_h, out_w, out_h,
                             smoothness=float(cfg.get("framing_smoothness", 0.04)),
@@ -2698,7 +3032,8 @@ def main():
                         logging.info(f"Physical camera /dev/video{idx} connected at {actual_w}x{actual_h} ({target_fps} FPS)!")
                         # Passo 5: captura em thread dedicada — o loop consome o quadro
                         # mais recente (latest-wins) e o decode MJPG sai do caminho critico.
-                        capture_worker = CaptureWorker(cap)
+                        video_gen_id = f"video-gen-{uuid.uuid4().hex[:8]}"
+                        capture_worker = CaptureWorker(cap, telemetry=m0_runtime.telemetry, generation_id=video_gen_id, config_version=config_version)
                         capture_last_id = -1
                     else:
                         cap.release()
@@ -2708,8 +3043,34 @@ def main():
                     cap = None
                 
                 if cap is None:
+                    send_call_total += 1
+                    t_snd_start = time.monotonic_ns()
                     vcam.send(placeholder_frame)
+                    t_snd_end = time.monotonic_ns()
+                    send_success_total += 1
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("video.send_call_ms", (t_snd_end - t_snd_start) / 1_000_000)
+                        if m0_runtime.should_trace(video_frame_id):
+                            m0_runtime.telemetry.emit(
+                                "video_output_frame",
+                                generation_id=video_gen_id,
+                                output_frame_id=video_frame_id,
+                                output_type="PLACEHOLDER",
+                                dropped=False,
+                                drop_reason=None,
+                                vcam_delay_ms=None,
+                                selected_source_gap=0,
+                                source_frame_id=None,
+                                source_generation_id=None,
+                                arrival_to_send_ms=None,
+                                presentation_timestamp_ns=None,
+                            )
+                    video_frame_id += 1
+                    t_pace_start = time.monotonic_ns()
                     vcam.sleep_until_next_frame()
+                    t_pace_end = time.monotonic_ns()
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("video.pacing_wait_ms", (t_pace_end - t_pace_start) / 1_000_000)
                     time.sleep(0.5)
                     continue
 
@@ -2721,20 +3082,35 @@ def main():
             # intervalo inteiro alem do necessario. Sem quadro novo em 150ms,
             # trata como perda de camera e reconecta.
             frame = None
+            origin = None
             waited_ms = 0.0
+            t_sel_wait_start = time.monotonic_ns()
             while frame is None and waited_ms < 150.0:
-                frame_id, frame = capture_worker.read_latest()
+                if m0_runtime.enabled:
+                    frame_id, frame, origin = capture_worker.read_latest_observed()
+                else:
+                    frame_id, frame = capture_worker.read_latest()
                 if frame is None or frame_id == capture_last_id:
                     frame = None
                     time.sleep(0.001)
                     waited_ms += 1.0
+            t_sel_wait_end = time.monotonic_ns()
+            if m0_runtime.enabled:
+                m0_runtime.telemetry.sample("video.select_wait_ms", (t_sel_wait_end - t_sel_wait_start) / 1_000_000)
+                if origin:
+                    m0_runtime.telemetry.sample("video.capture_to_select_ms", (t_sel_wait_end - origin.arrival_mono_ns) / 1_000_000)
             if frame is None:
                 logging.warning("Failed to read frame from physical camera. Will reconnect...")
-                capture_worker.stop()
-                capture_worker = None
+                stop_and_accumulate_capture()
                 cap.release()
                 cap = None
                 continue
+            observed_gap = 0
+            if capture_last_id != -1 and frame_id > capture_last_id:
+                gap = (frame_id - capture_last_id) - 1
+                if gap > 0:
+                    selected_source_gap_total += gap
+                    observed_gap = gap
             capture_last_id = frame_id
             if perf_stats_on:
                 stage_timer.lap("1_captura")
@@ -2760,6 +3136,7 @@ def main():
                 if voice_tracker.fallback_stream:
                     voice_tracker.stop_fallback()
 
+            t_frame_start = time.monotonic_ns()
             framed = framer.update(
                 frame,
                 enabled=auto_framing_enabled,
@@ -2768,6 +3145,9 @@ def main():
                 smoothness=framing_smoothness,
                 deadzone=framing_deadzone
             ) if framer else cv2.resize(frame, (out_w, out_h))
+            t_frame_end = time.monotonic_ns()
+            if m0_runtime.enabled:
+                m0_runtime.telemetry.sample("video.framing_ms", (t_frame_end - t_frame_start) / 1_000_000)
             if perf_stats_on:
                 stage_timer.lap("2_enquadramento")
 
@@ -2796,13 +3176,39 @@ def main():
                 if not privacy_muted and cfg.get("privacy_mute_mic", True):
                     set_audio_mute(True)
                     privacy_muted = True
+                send_call_total += 1
+                t_snd_start = time.monotonic_ns()
                 vcam.send(privacy_screen)
+                t_snd_end = time.monotonic_ns()
+                send_success_total += 1
+                if m0_runtime.enabled:
+                    m0_runtime.telemetry.sample("video.send_call_ms", (t_snd_end - t_snd_start) / 1_000_000)
+                    m0_runtime.telemetry.emit(
+                        "video_output_frame",
+                        generation_id=video_gen_id,
+                        output_frame_id=video_frame_id,
+                        output_type="PRIVACY",
+                        dropped=False,
+                        drop_reason=None,
+                        vcam_delay_ms=0.0,
+                        selected_source_gap=0,
+                        source_frame_id=None,
+                        source_generation_id=None,
+                        arrival_to_send_ms=None,
+                        presentation_timestamp_ns=None,
+                    )
+                video_frame_id += 1
+                t_pace_start = time.monotonic_ns()
                 vcam.sleep_until_next_frame()
+                t_pace_end = time.monotonic_ns()
+                if m0_runtime.enabled:
+                    m0_runtime.telemetry.sample("video.pacing_wait_ms", (t_pace_end - t_pace_start) / 1_000_000)
                 continue
             elif privacy_fade_alpha < 0.2 and privacy_muted:
                 set_audio_mute(False)
                 privacy_muted = False
 
+            t_filt_start = time.monotonic_ns()
             face_info = framer.get_framed_face_info() if framer else {"has_face": False}
 
             # 3. Adaptive Low-Light Booster
@@ -2838,6 +3244,9 @@ def main():
             if cfg.get("sharpen_enabled", False):
                 sh_strength = int(cfg.get("sharpen_strength", 35))
                 processed_fg = apply_smart_sharpen(processed_fg, strength=sh_strength)
+            t_filt_end = time.monotonic_ns()
+            if m0_runtime.enabled:
+                m0_runtime.telemetry.sample("video.filters_ms", (t_filt_end - t_filt_start) / 1_000_000)
 
             if perf_stats_on:
                 stage_timer.lap("3_filtros")
@@ -2853,9 +3262,13 @@ def main():
                 ha_handheld = None
                 if is_multiclass:
                     # High quality 256x256 RGB input for NPU multiclass model
+                    t_prep_start = time.monotonic_ns()
                     small = cv2.resize(framed, (256, 256))
                     rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
                     blob = np.expand_dims(rgb, axis=0)
+                    t_prep_end = time.monotonic_ns()
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("primary.preprocess_ms", (t_prep_end - t_prep_start) / 1_000_000)
 
                     # Passo 4: inferencia primaria assincrona (AsyncInferQueue).
                     # A NPU sai do caminho critico: o loop submete o quadro atual
@@ -2864,6 +3277,8 @@ def main():
                     # has_hands e bg_prob pos-processados (softmax, torso boost,
                     # fechamento morfologico, cavidades e isolamento de maos rodam
                     # na thread do callback, em paralelo com o loop).
+                    primary_origin = None
+                    is_exact_primary = False
                     if primary_queue is not None and primary_async_state["p_person"] is not None:
                         submitted_this_frame = False
                         if primary_queue.is_ready():
@@ -2873,16 +3288,21 @@ def main():
                             }
                             my_seq = primary_submit_seq
                             primary_async_event.clear()
+                            diag_env = {"origin": origin, "start_ns": time.monotonic_ns(), "frame_id": frame_id, "seq": my_seq}
                             primary_queue.start_async(
-                                {seg_inp_name: blob}, (fi_cb, my_seq, out_w, out_h)
+                                {seg_inp_name: blob}, (fi_cb, my_seq, out_w, out_h, diag_env)
                             )
                             primary_submit_seq += 1
                             primary_async_submitted += 1
+                            primary_async_submitted_total += 1
                             submitted_this_frame = True
                         else:
                             # NPU ocupada com o quadro anterior e/ou com a thread
                             # heavy-assist: reutiliza a ultima mascara publicada.
                             primary_async_reused += 1
+                            primary_async_reused_total += 1
+
+                        is_timeout = False
                         if submitted_this_frame and primary_async_same_frame:
                             # Passo 7.1 (same-frame): aguarda o resultado do PROPRIO quadro
                             # via Event — o loop dorme sem gastar CPU (o polling de 0,5ms do
@@ -2890,22 +3310,26 @@ def main():
                             # Timeout de 40ms (config primary_async_same_frame_timeout_ms):
                             # se a NPU atrasar (contencao com a thread heavy-assist), cai
                             # para a mascara mais recente e conta o timeout na telemetria.
-                            _t_wait0 = time.perf_counter()
-                            _wait_deadline = _t_wait0 + primary_async_wait_timeout
+                            _t_wait0 = time.monotonic_ns()
+                            _wait_deadline = _t_wait0 + int(primary_async_wait_timeout * 1_000_000_000)
                             while True:
-                                _remaining = _wait_deadline - time.perf_counter()
-                                if _remaining <= 0:
+                                _remaining_ns = _wait_deadline - time.monotonic_ns()
+                                if _remaining_ns <= 0:
                                     break
-                                if not primary_async_event.wait(_remaining):
+                                if not primary_async_event.wait(_remaining_ns / 1_000_000_000.0):
                                     break
                                 with primary_async_lock:
                                     if primary_async_state["seq"] >= my_seq:
                                         break
                                 # Event de callback antigo/fora de ordem: volta a dormir.
-                            _wait_ms = (time.perf_counter() - _t_wait0) * 1000.0
+                            _wait_ms = (time.monotonic_ns() - _t_wait0) / 1_000_000
+                            if m0_runtime.enabled:
+                                m0_runtime.telemetry.sample("primary.same_frame_wait_ms", _wait_ms)
                             with primary_async_lock:
                                 if primary_async_state["seq"] < my_seq:
                                     primary_async_wait_timeouts += 1
+                                    primary_async_timeouts_total += 1
+                                    is_timeout = True
                                 _w_ema = primary_async_state["wait_ema"]
                                 primary_async_state["wait_ema"] = (
                                     _wait_ms if _w_ema is None else _w_ema * 0.9 + _wait_ms * 0.1
@@ -2915,7 +3339,14 @@ def main():
                             hand_skin = primary_async_state["hand_skin"]
                             has_hands = primary_async_state["has_hands"]
                             bg_prob = primary_async_state["bg_prob"]
+                            primary_origin = primary_async_state["origin"]
                             gesture_sample_id = ("async", primary_async_state["seq"])
+
+                        if submitted_this_frame:
+                            reason = "TIMEOUT_FALLBACK" if is_timeout else "ASYNC_SELECTED"
+                        else:
+                            reason = "QUEUE_NOT_READY_REUSE"
+
                         primary_async_log_ctr += 1
                         if primary_async_log_ctr >= 100:
                             primary_async_log_ctr = 0
@@ -2935,13 +3366,27 @@ def main():
                         # Caminho sincrono: aquecimento do primeiro quadro (antes do
                         # primeiro resultado do callback) ou async_primary_enabled=False.
                         # Mesma matematica do callback, via postprocess_multiclass_mask().
+                        if m0_runtime.enabled:
+                            t_sync_inf_s = time.monotonic_ns()
                         infer_request.infer({seg_inp_name: blob})
+                        if m0_runtime.enabled:
+                            m0_runtime.telemetry.sample("primary.sync_infer_ms", (time.monotonic_ns() - t_sync_inf_s) / 1_000_000)
+                            t_sync_post_s = time.monotonic_ns()
                         raw = infer_request.get_tensor(seg_out_name).data[0]  # (256, 256, 6)
                         p_person, hand_skin, has_hands, bg_prob = postprocess_multiclass_mask(
                             raw, face_info, out_w, out_h
                         )
+                        if m0_runtime.enabled:
+                            m0_runtime.telemetry.sample("primary.sync_postprocess_ms", (time.monotonic_ns() - t_sync_post_s) / 1_000_000)
                         gesture_sync_sample += 1
                         gesture_sample_id = ("sync", gesture_sync_sample)
+                        primary_origin = origin
+                        if primary_queue is None:
+                            primary_sync_config_total += 1
+                            reason = "SYNC_CONFIG_DISABLED"
+                        else:
+                            primary_sync_warmup_total += 1
+                            reason = "SYNC_WARMUP"
                         if primary_queue is not None:
                             # Publica para o proximo quadro entrar no caminho async
                             with primary_async_lock:
@@ -2949,6 +3394,16 @@ def main():
                                 primary_async_state["hand_skin"] = hand_skin.copy()
                                 primary_async_state["has_hands"] = has_hands
                                 primary_async_state["bg_prob"] = bg_prob.copy()
+                                primary_async_state["origin"] = origin
+
+                    if m0_runtime.enabled:
+                        now_ns = time.monotonic_ns()
+                        prov = provenance_fields(origin, primary_origin, now_ns)
+                        m0_runtime.telemetry.emit(
+                            "primary_selected",
+                            reason=reason,
+                            **prov,
+                        )
 
                     if perf_stats_on:
                         stage_timer.lap("4a_inferencia_primaria")
@@ -2978,8 +3433,14 @@ def main():
                     # (Executado na thread heavy-assist: o loop publica o contexto do quadro
                     # atual — latest-wins, sem bloquear — e apenas funde as mascaras mais
                     # recentes publicadas por ela.)
-                    heavy_assist_worker.submit(framed, p_person, hand_skin, face_info, cfg)
-                    heavy_masks = heavy_assist_worker.results()
+                    heavy_assist_submitted_total += 1
+                    heavy_assist_worker.submit(framed, p_person, hand_skin, face_info, cfg, origin=origin, primary_origin=primary_origin)
+                    if m0_runtime.enabled:
+                        heavy_masks_chair, chair_origins, chair_classifications = heavy_assist_worker.results_snapshot()
+                    else:
+                        heavy_masks_chair = heavy_assist_worker.results()
+                        chair_origins, chair_classifications = {}, {}
+                    heavy_assist_observed_total += 1
                     # Passo 7.2: cadeira/objetos COCO NAO entram mais na mascara que passa
                     # pelo guided filter. O cache da cadeira e uma EMA 70/30 de uma mascara
                     # limitada a 550x550 — sempre alguns quadros atrasada por projeto.
@@ -2988,8 +3449,8 @@ def main():
                     # cortando a cadeira ou vazando fundo — a piora na preservacao. Agora
                     # sao fundidas APOS o GF (padrao ja usado pela mascara de oculos), com
                     # borda bilinear macia como antes da correcao do serrilhado.
-                    ha_chair = heavy_masks["chair"]
-                    ha_handheld = heavy_masks["handheld"]
+                    ha_chair = heavy_masks_chair.get("chair")
+                    ha_handheld = heavy_masks_chair.get("handheld")
 
                     if perf_stats_on:
                         stage_timer.lap("4e_yolact_cadeira_coco")
@@ -3033,8 +3494,17 @@ def main():
                     # agora executado na thread heavy-assist — o loop apenas funde a
                     # mascara mais recente publicada (max pixel a pixel, combinacao
                     # estritamente aditiva preservada).
-                    heavy_masks = heavy_assist_worker.results()
-                    if heavy_masks["modnet"] is not None:
+                    # Optional MODNet Assist Pass (hybrid mode, Apache 2.0):
+                    # agora executado na thread heavy-assist — o loop apenas funde a
+                    # mascara mais recente publicada (max pixel a pixel, combinacao
+                    # estritamente aditiva preservada).
+                    if m0_runtime.enabled:
+                        heavy_masks_modnet, modnet_origins, modnet_classifications = heavy_assist_worker.results_snapshot()
+                    else:
+                        heavy_masks_modnet = heavy_assist_worker.results()
+                        modnet_origins, modnet_classifications = {}, {}
+                    heavy_assist_observed_total += 1
+                    if heavy_masks_modnet.get("modnet") is not None:
                         # Passo 7.3: fusao REGIONAL do MODNet — apenas na regiao da
                         # cabeca (caixa facial expandida para orelhas + topo), onde
                         # vivem fones de ouvido e acessorios que o multiclass
@@ -3043,7 +3513,7 @@ def main():
                         # positivos (fantasmas na cortina/fundo) — o motivo pelo qual
                         # o assist ficava desativado. Validado no video real com fone:
                         # arco e conchas preservados, zero fantasmas.
-                        modnet_a = heavy_masks["modnet"]
+                        modnet_a = heavy_masks_modnet["modnet"]
                         if face_info.get("has_face"):
                             fx_h, fy_h, fw_h, fh_h = face_info["box"]
                             mx1 = max(0, int((fx_h - fw_h * 0.8) * 256 / out_w))
@@ -3055,27 +3525,85 @@ def main():
                                     p_person[my1:my2, mx1:mx2],
                                     modnet_a[my1:my2, mx1:mx2] * 0.9,
                                 )
+                                if m0_runtime.enabled:
+                                    orig = modnet_origins.get("modnet")
+                                    now_ns = time.monotonic_ns()
+                                    cur_cap_id = origin.frame_id if origin else None
+                                    cur_gen_id = origin.generation_id if origin else None
+                                    same_gen = bool(orig and origin and orig.generation_id == origin.generation_id)
+                                    age_ms = ((now_ns - orig.arrival_mono_ns) / 1_000_000) if (same_gen and now_ns >= orig.arrival_mono_ns) else None
+                                    m0_runtime.telemetry.emit(
+                                        "assist_applied",
+                                        layer="modnet",
+                                        stage="head_region_pre_gf",
+                                        current_frame_id=cur_cap_id,
+                                        current_generation_id=cur_gen_id,
+                                        output_frame_id=video_frame_id,
+                                        current_config_version=config_version,
+                                        source_frame_id=orig.frame_id if orig else None,
+                                        source_generation_id=orig.generation_id if orig else None,
+                                        latest_contribution_arrival_age_ms=age_ms,
+                                        origin_kind=modnet_classifications.get("modnet", "UNKNOWN"),
+                                        history_present=False,
+                                        history_age_unknown=False,
+                                    )
                         # sem face detectada: nao funde (conservador — multiclass puro)
                 else:
                     # Legacy 144x256 model fallback
                     small = cv2.resize(framed, (256, 144))
                     blob = np.expand_dims(np.transpose(small.astype(np.float32) / 255.0, (2, 0, 1)), axis=0)
+                    if m0_runtime.enabled:
+                        t_sync_inf_s = time.monotonic_ns()
                     infer_request.infer({seg_inp_name: blob})
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("primary.sync_infer_ms", (time.monotonic_ns() - t_sync_inf_s) / 1_000_000)
                     p_person = infer_request.get_tensor(seg_out_name).data[0, 0]
                     # Publica o contexto para a thread heavy-assist tambem no modo
                     # legacy (apenas oculos sao aplicaveis neste formato).
-                    heavy_assist_worker.submit(framed, p_person, None, face_info, cfg)
+                    heavy_assist_submitted_total += 1
+                    heavy_assist_worker.submit(framed, p_person, None, face_info, cfg, origin=origin)
 
                 # 2.2 Neural Eyeglasses & Frame Retention (BiSeNet Face Parsing na NPU - MIT License)
                 # Executado na thread heavy-assist: o loop apenas funde a mascara
                 # mais recente publicada.
-                ha_glasses = heavy_assist_worker.results().get("glasses")
+                if m0_runtime.enabled:
+                    heavy_masks_glasses_pre, g_origins_pre, g_class_pre = heavy_assist_worker.results_snapshot()
+                else:
+                    heavy_masks_glasses_pre = heavy_assist_worker.results()
+                    g_origins_pre, g_class_pre = {}, {}
+                heavy_assist_observed_total += 1
+                ha_glasses = heavy_masks_glasses_pre.get("glasses")
                 if ha_glasses is not None:
                     g_low = cv2.resize(ha_glasses, (p_person.shape[1], p_person.shape[0]), interpolation=cv2.INTER_LINEAR)
                     p_person = np.maximum(p_person, g_low)
+                    if m0_runtime.enabled:
+                        orig = g_origins_pre.get("glasses")
+                        cls_kind = g_class_pre.get("glasses", "UNKNOWN")
+                        now_ns = time.monotonic_ns()
+                        cur_cap_id = origin.frame_id if origin else None
+                        cur_gen_id = origin.generation_id if origin else None
+                        same_gen = bool(orig and origin and orig.generation_id == origin.generation_id)
+                        age_ms = ((now_ns - orig.arrival_mono_ns) / 1_000_000) if (same_gen and now_ns >= orig.arrival_mono_ns) else None
+                        m0_runtime.telemetry.emit(
+                            "assist_applied",
+                            layer="glasses",
+                            stage="lowres_pre_gf",
+                            current_frame_id=cur_cap_id,
+                            current_generation_id=cur_gen_id,
+                            output_frame_id=video_frame_id,
+                            current_config_version=config_version,
+                            source_frame_id=orig.frame_id if orig else None,
+                            source_generation_id=orig.generation_id if orig else None,
+                            latest_contribution_arrival_age_ms=age_ms,
+                            origin_kind=cls_kind,
+                            history_present=bool(cls_kind in ("MIXED_HISTORY", "UNCHANGED_CACHE")),
+                            history_age_unknown=bool(cls_kind in ("MIXED_HISTORY", "UNCHANGED_CACHE")),
+                        )
 
                 # Motion-Adaptive Temporal Filtering:
                 # Kills pixel jitter on static areas, but responds promptly to arm/hand motion
+                if m0_runtime.enabled:
+                    t_temp_s = time.monotonic_ns()
                 if prev_mask is None:
                     mask_256 = p_person
                 else:
@@ -3083,6 +3611,8 @@ def main():
                     adaptive_alpha = np.clip(0.35 + motion_delta * 1.2, 0.35, 0.85)
                     mask_256 = prev_mask * (1.0 - adaptive_alpha) + p_person * adaptive_alpha
                 prev_mask = mask_256
+                if m0_runtime.enabled:
+                    m0_runtime.telemetry.sample("composition.temporal_filter_ms", (time.monotonic_ns() - t_temp_s) / 1_000_000)
 
                 is_bg_replacement = bool(bg_path and os.path.exists(bg_path))
 
@@ -3138,6 +3668,7 @@ def main():
                 else:
                     guide_small = cv2.resize(cv2.cvtColor(framed, cv2.COLOR_BGR2GRAY), (gw, gh))
 
+                t_gf_start = time.monotonic_ns()
                 mask_full = fast_guided_filter(
                     guide_small, p_curved,
                     r=gf_r_eff, eps=gf_eps_eff,
@@ -3145,9 +3676,42 @@ def main():
                     color_guide=gf_color,
                     guide_full=framed if gf_full else None
                 )
-                ha_glasses_gf = heavy_assist_worker.results().get("glasses")
+                t_gf_end = time.monotonic_ns()
+                if m0_runtime.enabled:
+                    m0_runtime.telemetry.sample("composition.guided_filter_ms", (t_gf_end - t_gf_start) / 1_000_000)
+
+                if m0_runtime.enabled:
+                    heavy_masks_glasses_post, g_origins_post, g_class_post = heavy_assist_worker.results_snapshot()
+                else:
+                    heavy_masks_glasses_post = heavy_assist_worker.results()
+                    g_origins_post, g_class_post = {}, {}
+                heavy_assist_observed_total += 1
+                ha_glasses_gf = heavy_masks_glasses_post.get("glasses")
                 if ha_glasses_gf is not None:
                     mask_full = np.maximum(mask_full, ha_glasses_gf)
+                    if m0_runtime.enabled:
+                        orig = g_origins_post.get("glasses")
+                        cls_kind = g_class_post.get("glasses", "UNKNOWN")
+                        now_ns = time.monotonic_ns()
+                        cur_cap_id = origin.frame_id if origin else None
+                        cur_gen_id = origin.generation_id if origin else None
+                        same_gen = bool(orig and origin and orig.generation_id == origin.generation_id)
+                        age_ms = ((now_ns - orig.arrival_mono_ns) / 1_000_000) if (same_gen and now_ns >= orig.arrival_mono_ns) else None
+                        m0_runtime.telemetry.emit(
+                            "assist_applied",
+                            layer="glasses",
+                            stage="fullres_post_gf",
+                            current_frame_id=cur_cap_id,
+                            current_generation_id=cur_gen_id,
+                            output_frame_id=video_frame_id,
+                            current_config_version=config_version,
+                            source_frame_id=orig.frame_id if orig else None,
+                            source_generation_id=orig.generation_id if orig else None,
+                            latest_contribution_arrival_age_ms=age_ms,
+                            origin_kind=cls_kind,
+                            history_present=bool(cls_kind in ("MIXED_HISTORY", "UNCHANGED_CACHE")),
+                            history_age_unknown=bool(cls_kind in ("MIXED_HISTORY", "UNCHANGED_CACHE")),
+                        )
 
                 # Passo 7.2: fusao da cadeira/objetos COCO APOS o guided filter — mesmo
                 # padrao dos oculos. Borda bilinear macia (o cache ja e uma EMA temporal);
@@ -3156,9 +3720,55 @@ def main():
                 if ha_chair is not None:
                     c_full = cv2.resize(ha_chair, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
                     mask_full = np.maximum(mask_full, c_full)
+                    if m0_runtime.enabled:
+                        orig = chair_origins.get("chair")
+                        cls_kind = chair_classifications.get("chair", "UNKNOWN")
+                        now_ns = time.monotonic_ns()
+                        cur_cap_id = origin.frame_id if origin else None
+                        cur_gen_id = origin.generation_id if origin else None
+                        same_gen = bool(orig and origin and orig.generation_id == origin.generation_id)
+                        age_ms = ((now_ns - orig.arrival_mono_ns) / 1_000_000) if (same_gen and now_ns >= orig.arrival_mono_ns) else None
+                        m0_runtime.telemetry.emit(
+                            "assist_applied",
+                            layer="chair",
+                            stage="fullres_post_gf",
+                            current_frame_id=cur_cap_id,
+                            current_generation_id=cur_gen_id,
+                            output_frame_id=video_frame_id,
+                            current_config_version=config_version,
+                            source_frame_id=orig.frame_id if orig else None,
+                            source_generation_id=orig.generation_id if orig else None,
+                            latest_contribution_arrival_age_ms=age_ms,
+                            origin_kind=cls_kind,
+                            history_present=bool(cls_kind in ("MIXED_HISTORY", "UNCHANGED_CACHE")),
+                            history_age_unknown=bool(cls_kind in ("MIXED_HISTORY", "UNCHANGED_CACHE")),
+                        )
                 if ha_handheld is not None:
                     h_full = cv2.resize(ha_handheld, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
                     mask_full = np.maximum(mask_full, h_full)
+                    if m0_runtime.enabled:
+                        orig = chair_origins.get("handheld")
+                        cls_kind = chair_classifications.get("handheld", "UNKNOWN")
+                        now_ns = time.monotonic_ns()
+                        cur_cap_id = origin.frame_id if origin else None
+                        cur_gen_id = origin.generation_id if origin else None
+                        same_gen = bool(orig and origin and orig.generation_id == origin.generation_id)
+                        age_ms = ((now_ns - orig.arrival_mono_ns) / 1_000_000) if (same_gen and now_ns >= orig.arrival_mono_ns) else None
+                        m0_runtime.telemetry.emit(
+                            "assist_applied",
+                            layer="handheld",
+                            stage="fullres_post_gf",
+                            current_frame_id=cur_cap_id,
+                            current_generation_id=cur_gen_id,
+                            output_frame_id=video_frame_id,
+                            current_config_version=config_version,
+                            source_frame_id=orig.frame_id if orig else None,
+                            source_generation_id=orig.generation_id if orig else None,
+                            latest_contribution_arrival_age_ms=age_ms,
+                            origin_kind=cls_kind,
+                            history_present=bool(cls_kind in ("MIXED_HISTORY", "UNCHANGED_CACHE")),
+                            history_age_unknown=bool(cls_kind in ("MIXED_HISTORY", "UNCHANGED_CACHE")),
+                        )
 
                 # Clean Matte Clamping:
                 # 1. White clamp: Ensure body/clothes interior is 100% solid (no virtual background bleeding through).
@@ -3263,7 +3873,11 @@ def main():
                 # 3 canais + 4 operacoes de resolucao cheia). Medido em 1280x720:
                 # 19.1ms -> 2.0ms; diferenca maxima vs numpy: 1 LSB (arredondamento
                 # ao inves de truncamento — visualmente identico).
+                t_bld_start = time.monotonic_ns()
                 output_frame = cv2.blendLinear(processed_fg, bg, mask_full, 1.0 - mask_full)
+                t_bld_end = time.monotonic_ns()
+                if m0_runtime.enabled:
+                    m0_runtime.telemetry.sample("composition.blend_ms", (t_bld_end - t_bld_start) / 1_000_000)
 
                 # 8. Post-Processing: Cinematic Color Grading
                 color_f = cfg.get("color_filter", "none")
@@ -3309,32 +3923,64 @@ def main():
 
             # Send 1080p frame to virtual camera
             _t_out = time.perf_counter() if perf_stats_on else 0.0
+            send_call_total += 1
+            t_snd_start = time.monotonic_ns()
             vcam.send(output_frame)
+            t_snd_end = time.monotonic_ns()
+            send_success_total += 1
+            source_frame_new_send_total += 1
+            processed_frame_total += 1
+            if m0_runtime.enabled:
+                m0_runtime.telemetry.sample("video.send_call_ms", (t_snd_end - t_snd_start) / 1_000_000)
+                if m0_runtime.should_trace(video_frame_id):
+                    m0_runtime.telemetry.emit(
+                        "video_output_frame",
+                        generation_id=video_gen_id,
+                        output_frame_id=video_frame_id,
+                        output_type="LIVE",
+                        dropped=False,
+                        drop_reason=None,
+                        vcam_delay_ms=None,
+                        selected_source_gap=observed_gap,
+                        source_frame_id=origin.frame_id if origin else None,
+                        source_generation_id=origin.generation_id if origin else None,
+                        arrival_to_send_ms=((t_snd_end - origin.arrival_mono_ns) / 1_000_000) if origin else None,
+                        presentation_timestamp_ns=None,
+                    )
+            video_frame_id += 1
+            t_pace_start = time.monotonic_ns()
             vcam.sleep_until_next_frame()
+            t_pace_end = time.monotonic_ns()
+            if m0_runtime.enabled:
+                m0_runtime.telemetry.sample("video.pacing_wait_ms", (t_pace_end - t_pace_start) / 1_000_000)
             if perf_stats_on:
                 stage_timer.add("5_saida_espera", time.perf_counter() - _t_out)
                 stage_timer.tick()
 
-        if cap is not None:
-            logging.info("Encerrando daemon: desativando sensor fisico (LED OFF)...")
-            if capture_worker is not None:
-                capture_worker.stop()
-                capture_worker = None
-            cap.release()
-            cap = None
         try:
-            park_delay = float(cfg.get("standby_park_delay", 1.0))
-            if park_delay > 0:
-                time.sleep(park_delay)
-            phys_dev = f"/dev/video{resolve_cam_index(cfg.get('input_device', 'auto'), out_device)}"
-            execute_standby_hooks(cfg, phys_dev)
-        except Exception:
-            pass
+            if cap is not None:
+                logging.info("Encerrando daemon: desativando sensor fisico (LED OFF)...")
+                stop_and_accumulate_capture()
+                cap.release()
+                cap = None
+            try:
+                park_delay = float(cfg.get("standby_park_delay", 1.0))
+                if park_delay > 0:
+                    time.sleep(park_delay)
+                phys_dev = f"/dev/video{resolve_cam_index(cfg.get('input_device', 'auto'), out_device)}"
+                execute_standby_hooks(cfg, phys_dev)
+            except Exception:
+                pass
 
-        try:
-            voice_tracker.stop_fallback()
-        except Exception:
-            pass
+            try:
+                voice_tracker.stop_fallback()
+            except Exception:
+                pass
+        finally:
+            try:
+                m0_runtime.stop()
+            except Exception as e:
+                logging.debug(f"Telemetry shutdown ignored error: {e}")
 
     logging.info("Webcam daemon stopped.")
 
