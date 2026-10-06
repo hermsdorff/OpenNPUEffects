@@ -37,6 +37,17 @@ from npu_pipeline.telemetry import (
     provenance_fields,
 )
 from npu_pipeline.telemetry_runtime import TelemetryRuntime, validate_m0_config
+from npu_pipeline.contracts import (
+    FrameIdentity,
+    StageResultStatus,
+    StageResultValidity,
+    StageResult,
+    FrameContext,
+    OutputFrame,
+    M1Config,
+)
+from npu_pipeline.lifecycle import LifecycleManager
+from npu_pipeline.primary import CoherentPrimaryCoordinator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -592,6 +603,8 @@ class HeavyAssistWorker:
         self._wake = threading.Event()
         self._job = None
         self._telemetry = telemetry or NullTelemetry()
+        self._epoch = 0
+        self._generation_id = "g0"
         self._results = {"chair": None, "handheld": None, "glasses": None, "modnet": None}
         self._result_origins = {"chair": None, "handheld": None, "glasses": None, "modnet": None}
         self._result_classifications = {"chair": "UNKNOWN", "handheld": "UNKNOWN", "glasses": "UNKNOWN", "modnet": "UNKNOWN"}
@@ -621,17 +634,23 @@ class HeavyAssistWorker:
             self._thread = threading.Thread(target=self._run, name="npu-heavy-assist", daemon=True)
             self._thread.start()
 
-    def reset(self):
-        """Limpa mascaras publicadas e trabalho pendente (reconexao de camera)."""
+    def reset(self, generation_id=None):
+        """Limpa mascaras publicadas e trabalho pendente (reconexao de camera / transicao)."""
         with self._lock:
+            self._epoch += 1
+            if generation_id is not None:
+                self._generation_id = str(generation_id)
             self._job = None
             self._results = {"chair": None, "handheld": None, "glasses": None, "modnet": None}
             self._result_origins = {"chair": None, "handheld": None, "glasses": None, "modnet": None}
             self._result_classifications = {"chair": "UNKNOWN", "handheld": "UNKNOWN", "glasses": "UNKNOWN", "modnet": "UNKNOWN"}
             self._phase = 0
 
-    def submit(self, framed, p_person, hand_skin, face_info, cfg, origin=None, primary_origin=None):
+    def submit(self, framed, p_person, hand_skin, face_info, cfg, origin=None, primary_origin=None, epoch=None, generation_id=None):
         """Publica o contexto do quadro atual (latest-wins, nao bloqueante)."""
+        with self._lock:
+            cur_epoch = self._epoch if epoch is None else epoch
+            cur_gen = self._generation_id if generation_id is None else str(generation_id)
         job = {
             "framed": framed.copy(),
             "p_person": p_person.copy(),
@@ -640,6 +659,8 @@ class HeavyAssistWorker:
             "cfg": cfg,
             "origin": origin,
             "primary_origin": primary_origin,
+            "epoch": cur_epoch,
+            "generation_id": cur_gen,
             "submit_ns": time.monotonic_ns() if (self._telemetry and self._telemetry.enabled) else 0,
         }
         with self._lock:
@@ -657,8 +678,12 @@ class HeavyAssistWorker:
     def results_observed(self):
         return self.results_snapshot()
 
-    def _publish(self, origins=None, classifications=None, **masks):
+    def _publish(self, job_epoch=None, job_generation_id=None, origins=None, classifications=None, **masks):
         with self._lock:
+            if job_epoch is not None and job_epoch != self._epoch:
+                return
+            if job_generation_id is not None and job_generation_id != self._generation_id:
+                return
             self._results.update(masks)
             if origins:
                 self._result_origins.update(origins)
@@ -688,6 +713,11 @@ class HeavyAssistWorker:
     def _process(self, job):
         with self._lock:
             telemetry = self._telemetry
+            if job.get("epoch") is not None and job.get("epoch") != self._epoch:
+                return
+            if job.get("generation_id") is not None and job.get("generation_id") != self._generation_id:
+                return
+
         framed = job["framed"]
         p_person = job["p_person"]
         hand_skin = job["hand_skin"]
@@ -704,25 +734,30 @@ class HeavyAssistWorker:
             telemetry.sample("assist.job_wait_ms", (t_stage_s - submit_ns) / 1_000_000)
 
         if phase == 0:
-            self._phase_chair(framed, p_person, hand_skin, cfg, origin=origin)
+            self._phase_chair(framed, p_person, hand_skin, cfg, origin=origin, job=job)
             if telemetry and telemetry.enabled:
                 telemetry.sample("assist.chair_ms", (time.monotonic_ns() - t_stage_s) / 1_000_000)
         elif phase == 1:
-            self._phase_glasses(framed, face_info, cfg, origin=origin)
+            self._phase_glasses(framed, face_info, cfg, origin=origin, job=job)
             if telemetry and telemetry.enabled:
                 telemetry.sample("assist.glasses_ms", (time.monotonic_ns() - t_stage_s) / 1_000_000)
         else:
-            self._phase_modnet(framed, cfg, origin=origin)
+            self._phase_modnet(framed, cfg, origin=origin, job=job)
             if telemetry and telemetry.enabled:
                 telemetry.sample("assist.modnet_ms", (time.monotonic_ns() - t_stage_s) / 1_000_000)
 
-    def _phase_chair(self, framed, p_person, hand_skin, cfg, origin=None):
+    def _phase_chair(self, framed, p_person, hand_skin, cfg, origin=None, job=None):
         retain_chair_cfg = cfg.get("chair_retention_enabled", True)
         has_hands = hand_skin is not None and bool(np.max(hand_skin) > 0.20)
         retain_handheld_cfg = cfg.get("object_retention_enabled", True) and has_hands
+        j_epoch = job.get("epoch") if job else None
+        j_gen = job.get("generation_id") if job else None
+
         if (not (retain_chair_cfg or retain_handheld_cfg)) or self._chair_req is None:
             # Recursos desativados: publica zeros validos para manter o contrato
             self._publish(
+                job_epoch=j_epoch,
+                job_generation_id=j_gen,
                 origins={"chair": origin, "handheld": origin},
                 classifications={"chair": "ZERO_RESULT", "handheld": "ZERO_RESULT"},
                 chair=np.zeros_like(p_person),
@@ -738,18 +773,24 @@ class HeavyAssistWorker:
         def chair_observer(kind, info):
             obs_state[kind] = info
 
-        # Leitura direta (sem lock) so para continuidade da EMA temporal — corrida
-        # benigna: no pior caso usa a penultima mascara publicada.
+        with self._lock:
+            if j_epoch is not None and j_epoch != self._epoch:
+                return
+            if j_gen is not None and j_gen != self._generation_id:
+                return
+            cached_chair = self._results.get("chair")
+            cached_handheld = self._results.get("handheld")
+
         _, chair_mask, handheld_mask = apply_neural_chair_retention(
             p_person.copy(), framed,
             chair_infer_req=self._chair_req,
             chair_inp_name=self._chair_inp_name,
-            strength=chair_str, cached_chair_mask=self._results.get("chair"),
+            strength=chair_str, cached_chair_mask=cached_chair,
             run_inference=True,
             inp_w=self._chair_inp_w, inp_h=self._chair_inp_h,
             retain_chair=retain_chair_cfg,
             hand_mask=hand_skin, handheld_class_indices=handheld_indices,
-            handheld_strength=handheld_str, cached_handheld_mask=self._results.get("handheld"),
+            handheld_strength=handheld_str, cached_handheld_mask=cached_handheld,
             observer=chair_observer if (self._telemetry and self._telemetry.enabled) else None,
         )
 
@@ -760,16 +801,23 @@ class HeavyAssistWorker:
         handheld_orig = origin if handheld_cls in ("NEW_CONTRIBUTION", "MIXED_HISTORY") else self._result_origins.get("handheld")
 
         self._publish(
+            job_epoch=j_epoch,
+            job_generation_id=j_gen,
             origins={"chair": chair_orig, "handheld": handheld_orig},
             classifications={"chair": chair_cls, "handheld": handheld_cls},
             chair=chair_mask,
             handheld=handheld_mask,
         )
 
-    def _phase_glasses(self, framed, face_info, cfg, origin=None):
+    def _phase_glasses(self, framed, face_info, cfg, origin=None, job=None):
         preserve_glasses = cfg.get("preserve_glasses", cfg.get("glasses_protection", True))
+        j_epoch = job.get("epoch") if job else None
+        j_gen = job.get("generation_id") if job else None
+
         if (not preserve_glasses) or (not face_info.get("has_face")) or self._glasses_req is None:
             self._publish(
+                job_epoch=j_epoch,
+                job_generation_id=j_gen,
                 origins={"glasses": None},
                 classifications={"glasses": "NONE_RESULT"},
                 glasses=None,
@@ -780,12 +828,19 @@ class HeavyAssistWorker:
         def glasses_observer(kind, info):
             obs_state[kind] = info
 
+        with self._lock:
+            if j_epoch is not None and j_epoch != self._epoch:
+                return
+            if j_gen is not None and j_gen != self._generation_id:
+                return
+            cached_glasses = self._results.get("glasses")
+
         glasses_mask = apply_neural_glasses_retention(
             framed, face_info,
             glasses_infer_req=self._glasses_req,
             glasses_inp_name=self._glasses_inp_name,
             glasses_out_name=self._glasses_out_name,
-            cached_glasses_mask=self._results.get("glasses"),
+            cached_glasses_mask=cached_glasses,
             run_inference=True,
             inp_w=self._glasses_inp_w, inp_h=self._glasses_inp_h,
             observer=glasses_observer if (self._telemetry and self._telemetry.enabled) else None,
@@ -795,25 +850,39 @@ class HeavyAssistWorker:
         glasses_orig = origin if glasses_cls == "NEW_CONTRIBUTION" else self._result_origins.get("glasses")
 
         self._publish(
+            job_epoch=j_epoch,
+            job_generation_id=j_gen,
             origins={"glasses": glasses_orig},
             classifications={"glasses": glasses_cls},
             glasses=glasses_mask,
         )
 
-    def _phase_modnet(self, framed, cfg, origin=None):
+    def _phase_modnet(self, framed, cfg, origin=None, job=None):
         is_modnet_active = (
             cfg.get("video", {}).get("modnet_assist_enabled", False)
             or cfg.get("modnet_assist_enabled", False)
             or cfg.get("video", {}).get("segmentation_model", "multiclass") == "modnet"
             or cfg.get("segmentation_model", "multiclass") == "modnet"
         )
+        j_epoch = job.get("epoch") if job else None
+        j_gen = job.get("generation_id") if job else None
+
         if self._modnet_req is None or not is_modnet_active:
             self._publish(
+                job_epoch=j_epoch,
+                job_generation_id=j_gen,
                 origins={"modnet": None},
                 classifications={"modnet": "NONE_RESULT"},
                 modnet=None,
             )
             return
+
+        with self._lock:
+            if j_epoch is not None and j_epoch != self._epoch:
+                return
+            if j_gen is not None and j_gen != self._generation_id:
+                return
+
         fh, fw = framed.shape[:2]
         lb_scale = min(512.0 / fw, 512.0 / fh)
         lb_w, lb_h = max(1, int(round(fw * lb_scale))), max(1, int(round(fh * lb_scale)))
@@ -827,6 +896,8 @@ class HeavyAssistWorker:
         modnet_alpha = self._modnet_req.get_tensor(self._modnet_out_name).data[0, 0]
         modnet_alpha_cropped = modnet_alpha[lb_pad_y:lb_pad_y + lb_h, lb_pad_x:lb_pad_x + lb_w]
         self._publish(
+            job_epoch=j_epoch,
+            job_generation_id=j_gen,
             origins={"modnet": origin},
             classifications={"modnet": "NEW_CONTRIBUTION"},
             modnet=cv2.resize(modnet_alpha_cropped, (256, 256), interpolation=cv2.INTER_LINEAR),
@@ -884,12 +955,12 @@ class CaptureWorker:
         n_rate = 0
         while self._running:
             self.capture_attempt_total += 1
-            t_start = self._clock_ns() if self._telemetry.enabled else 0
+            t_start = self._clock_ns()
             try:
                 ret, frame = self._cap.read()
             except Exception:
                 ret, frame = False, None
-            t_end = self._clock_ns() if self._telemetry.enabled else 0
+            t_end = self._clock_ns()
 
             if not ret or frame is None:
                 self.capture_failure_total += 1
@@ -904,14 +975,13 @@ class CaptureWorker:
             with self._lock:
                 self._frame = frame
                 self._frame_id += 1
-                if self._telemetry.enabled:
-                    self._origin = ObservationOrigin(
-                        generation_id=self._generation_id,
-                        frame_id=self._frame_id,
-                        arrival_mono_ns=t_end,
-                        config_version=self._config_version,
-                        timestamp_quality="ARRIVAL_ESTIMATE"
-                    )
+                self._origin = ObservationOrigin(
+                    generation_id=self._generation_id,
+                    frame_id=self._frame_id,
+                    arrival_mono_ns=t_end,
+                    config_version=self._config_version,
+                    timestamp_quality="ARRIVAL_ESTIMATE"
+                )
             # PERF-CAP: taxa real de entrega da camera (ground truth — o formato
             # pode anunciar 30fps mas o stream efetivo pode ser menor, por exemplo
             # por limitacao de exposicao em auto-exposure).
@@ -2584,6 +2654,13 @@ def main():
     config_version = 1
     last_applied_cfg = copy.deepcopy(cfg)
 
+    # Initialize M1 Lifecycle Manager
+    lifecycle_manager = LifecycleManager(
+        session_id=video_session_id,
+        initial_cfg=cfg.get("video", cfg),
+    )
+    lifecycle_manager.generation_id = video_gen_id
+
     # Authoritative owner counters
     selected_source_gap_total = 0
     primary_async_submitted_total = 0
@@ -2633,6 +2710,37 @@ def main():
     m0_runtime.register_owner_counter("capture_attempt_total", lambda: capture_attempt_accumulated + (capture_worker.capture_attempt_total if capture_worker else 0))
     m0_runtime.register_owner_counter("capture_success_total", lambda: capture_success_accumulated + (capture_worker.capture_success_total if capture_worker else 0))
     m0_runtime.register_owner_counter("capture_failure_total", lambda: capture_failure_accumulated + (capture_worker.capture_failure_total if capture_worker else 0))
+
+    # M1 Authoritative counters (AV-M1-06)
+    m0_runtime.register_owner_counter("primary_exact_accepted_total", lambda: lifecycle_manager.primary_exact_accepted_total)
+    m0_runtime.register_owner_counter("primary_frame_dropped_total", lambda: lifecycle_manager.primary_frame_dropped_total)
+    m0_runtime.register_owner_counter("primary_late_callback_total", lambda: lifecycle_manager.primary_late_callback_total)
+    m0_runtime.register_owner_counter("primary_identity_rejected_total", lambda: lifecycle_manager.primary_identity_rejected_total)
+    m0_runtime.register_owner_counter("generation_rejected_total", lambda: lifecycle_manager.generation_rejected_total)
+    m0_runtime.register_owner_counter("aux_omitted_pending_m3_total", lambda: lifecycle_manager.aux_omitted_pending_m3_total)
+    m0_runtime.register_owner_counter("compose_deadline_miss_total", lambda: lifecycle_manager.compose_deadline_miss_total)
+    m0_runtime.register_owner_counter("new_output_frame_total", lambda: lifecycle_manager.new_output_frame_total)
+    m0_runtime.register_owner_counter("output_repeat_total", lambda: lifecycle_manager.output_repeat_total)
+    m0_runtime.register_owner_counter("safe_output_total", lambda: lifecycle_manager.safe_output_total)
+    m0_runtime.register_owner_counter("privacy_barrier_total", lambda: lifecycle_manager.privacy_barrier_total)
+
+    primary_coordinator = CoherentPrimaryCoordinator(
+        lifecycle=lifecycle_manager,
+        max_in_flight=2,
+        postprocess_fn=postprocess_multiclass_mask,
+        telemetry=m0_runtime.telemetry,
+        seg_inp_name=seg_inp_name,
+        seg_out_name=seg_out_name,
+    )
+
+    if lifecycle_manager.pipeline_mode == "coherent":
+        logging.info(
+            f"[M1-INIT] Pipeline Mode: COHERENT | implemented_milestone=M1 | av_sync_active=False | "
+            f"Budget: deadline={lifecycle_manager.m1_config.frame_deadline_ms}ms, "
+            f"reserve={lifecycle_manager.m1_config.compose_reserve_ms}ms, "
+            f"margin={lifecycle_manager.m1_config.safety_margin_ms}ms | "
+            f"Auxiliaries Omitted: [MODNet, BiSeNet glasses, YOLACT chair, COCO handheld] (reason: AUX_PENDING_M3)"
+        )
 
     primary_async_wait_timeout = float(cfg.get("primary_async_same_frame_timeout_ms", 40.0)) / 1000.0
     primary_async_event = threading.Event()
@@ -2686,10 +2794,16 @@ def main():
         # continua dormindo — sem lost wakeup.
         primary_async_event.set()
 
+    def on_infer_callback(request, userdata):
+        if isinstance(userdata, tuple) and len(userdata) >= 5 and isinstance(userdata[0], FrameIdentity):
+            primary_coordinator.handle_async_completion(request, userdata)
+        else:
+            on_primary_async_result(request, userdata)
+
     if async_primary_enabled and is_multiclass:
         try:
             primary_queue = AsyncInferQueue(compiled_model, jobs=2)
-            primary_queue.set_callback(on_primary_async_result)
+            primary_queue.set_callback(on_infer_callback)
             logging.info("Inferencia primaria assincrona habilitada (AsyncInferQueue, jobs=2).")
         except Exception as e_async:
             primary_queue = None
@@ -2896,9 +3010,29 @@ def main():
                                 last_applied_cfg = copy.deepcopy(cfg)
                                 config_version += 1
                                 m0_runtime.update_config(cfg.get("video", cfg))
+                                prev_mode = lifecycle_manager.pipeline_mode
+                                prev_epoch = lifecycle_manager.epoch
+                                lifecycle_manager.update_config(cfg.get("video", cfg))
+                                if lifecycle_manager.epoch != prev_epoch or lifecycle_manager.pipeline_mode != prev_mode:
+                                    video_gen_id = lifecycle_manager.generation_id
+                                    primary_coordinator.reset()
+                                    if heavy_assist_worker is not None:
+                                        heavy_assist_worker.reset(video_gen_id)
+                                    prev_mask = None
+                                    if lifecycle_manager.pipeline_mode == "coherent":
+                                        logging.info(
+                                            f"[M1-CONFIG] Switched to COHERENT mode | implemented_milestone=M1 | av_sync_active=False | "
+                                            f"Budget: deadline={lifecycle_manager.m1_config.frame_deadline_ms}ms, "
+                                            f"reserve={lifecycle_manager.m1_config.compose_reserve_ms}ms, "
+                                            f"margin={lifecycle_manager.m1_config.safety_margin_ms}ms | "
+                                            f"Auxiliaries Omitted: [MODNet, BiSeNet glasses, YOLACT chair, COCO handheld] (reason: AUX_PENDING_M3)"
+                                        )
+                                    elif prev_mode == "coherent":
+                                        logging.info("[M1-CONFIG] Switched from COHERENT to LEGACY mode.")
                                 if heavy_assist_worker is not None:
                                     heavy_assist_worker.set_telemetry(m0_runtime.telemetry)
                                 if capture_worker is not None:
+                                    capture_worker.set_generation(video_gen_id)
                                     capture_worker.set_config_version(config_version)
                                     capture_worker.set_telemetry(m0_runtime.telemetry)
                             new_in_dev = cfg.get("input_device", "auto")
@@ -2911,6 +3045,11 @@ def main():
                                     cap = None
                                 framer = None
                                 prev_mask = None
+                                lifecycle_manager.invalidate("INPUT_SWITCH")
+                                video_gen_id = lifecycle_manager.generation_id
+                                primary_coordinator.reset()
+                                if heavy_assist_worker is not None:
+                                    heavy_assist_worker.reset(video_gen_id)
                             if framer:
                                 framer.smoothness = float(cfg.get("framing_smoothness", 0.04))
                                 framer.deadzone = float(cfg.get("framing_deadzone", 0.10))
@@ -2936,6 +3075,12 @@ def main():
                 if not has_active_consumers:
                     if not in_standby:
                         in_standby = True
+                        lifecycle_manager.invalidate("STANDBY")
+                        video_gen_id = lifecycle_manager.generation_id
+                        primary_coordinator.reset()
+                        if heavy_assist_worker is not None:
+                            heavy_assist_worker.reset(video_gen_id)
+                        prev_mask = None
                         if privacy_muted:
                             set_audio_mute(False)
                             privacy_muted = False
@@ -3033,6 +3178,11 @@ def main():
                         # Passo 5: captura em thread dedicada — o loop consome o quadro
                         # mais recente (latest-wins) e o decode MJPG sai do caminho critico.
                         video_gen_id = f"video-gen-{uuid.uuid4().hex[:8]}"
+                        lifecycle_manager.generation_id = video_gen_id
+                        lifecycle_manager.invalidate("CAMERA_RECONNECT")
+                        primary_coordinator.reset()
+                        if heavy_assist_worker is not None:
+                            heavy_assist_worker.reset(video_gen_id)
                         capture_worker = CaptureWorker(cap, telemetry=m0_runtime.telemetry, generation_id=video_gen_id, config_version=config_version)
                         capture_last_id = -1
                     else:
@@ -3043,6 +3193,8 @@ def main():
                     cap = None
                 
                 if cap is None:
+                    if lifecycle_manager.pipeline_mode == "coherent":
+                        lifecycle_manager.record_safe_output()
                     send_call_total += 1
                     t_snd_start = time.monotonic_ns()
                     vcam.send(placeholder_frame)
@@ -3074,6 +3226,43 @@ def main():
                     time.sleep(0.5)
                     continue
 
+            # M1 Coherent Pipeline - Safe Mode
+            if lifecycle_manager.pipeline_mode == "safe":
+                primary_coordinator.reset()
+                if heavy_assist_worker is not None:
+                    heavy_assist_worker.reset(video_gen_id)
+                safe_frame = LifecycleManager.create_safe_screen(out_w, out_h)
+                lifecycle_manager.record_safe_output()
+                send_call_total += 1
+                t_snd_start = time.monotonic_ns()
+                vcam.send(safe_frame)
+                t_snd_end = time.monotonic_ns()
+                send_success_total += 1
+                if m0_runtime.enabled:
+                    m0_runtime.telemetry.sample("video.send_call_ms", (t_snd_end - t_snd_start) / 1_000_000)
+                    if m0_runtime.should_trace(video_frame_id):
+                        m0_runtime.telemetry.emit(
+                            "video_output_frame",
+                            generation_id=video_gen_id,
+                            output_frame_id=video_frame_id,
+                            output_type="SAFE",
+                            dropped=True,
+                            drop_reason="SAFE_MODE",
+                            vcam_delay_ms=None,
+                            selected_source_gap=0,
+                            source_frame_id=None,
+                            source_generation_id=None,
+                            arrival_to_send_ms=None,
+                            presentation_timestamp_ns=None,
+                        )
+                video_frame_id += 1
+                t_pace_start = time.monotonic_ns()
+                vcam.sleep_until_next_frame()
+                t_pace_end = time.monotonic_ns()
+                if m0_runtime.enabled:
+                    m0_runtime.telemetry.sample("video.pacing_wait_ms", (t_pace_end - t_pace_start) / 1_000_000)
+                continue
+
             if perf_stats_on:
                 stage_timer.begin()
             # Passo 5: consome o quadro mais recente da thread de captura. Se o
@@ -3086,14 +3275,17 @@ def main():
             waited_ms = 0.0
             t_sel_wait_start = time.monotonic_ns()
             while frame is None and waited_ms < 150.0:
-                if m0_runtime.enabled:
-                    frame_id, frame, origin = capture_worker.read_latest_observed()
-                else:
-                    frame_id, frame = capture_worker.read_latest()
-                if frame is None or frame_id == capture_last_id:
+                frame_id, frame, origin = capture_worker.read_latest_observed()
+                if (
+                    frame is None
+                    or frame_id == capture_last_id
+                    or (origin is not None and getattr(origin, "generation_id", None) != video_gen_id)
+                ):
                     frame = None
                     time.sleep(0.001)
                     waited_ms += 1.0
+            if origin:
+                lifecycle_manager.last_capture_mono_ns = origin.arrival_mono_ns
             t_sel_wait_end = time.monotonic_ns()
             if m0_runtime.enabled:
                 m0_runtime.telemetry.sample("video.select_wait_ms", (t_sel_wait_end - t_sel_wait_start) / 1_000_000)
@@ -3104,6 +3296,10 @@ def main():
                 stop_and_accumulate_capture()
                 cap.release()
                 cap = None
+                lifecycle_manager.invalidate("CAMERA_DISCONNECT")
+                primary_coordinator.reset()
+                if heavy_assist_worker is not None:
+                    heavy_assist_worker.reset()
                 continue
             observed_gap = 0
             if capture_last_id != -1 and frame_id > capture_last_id:
@@ -3158,55 +3354,100 @@ def main():
                 ptimeout = float(cfg.get("privacy_timeout", 3.0))
                 is_absent = (now - framer.last_face_time) > ptimeout
 
-            fade_enabled = cfg.get("privacy_fade_enabled", True)
-            fade_step = float(cfg.get("privacy_fade_speed", 0.07)) if fade_enabled else 1.0
-
-            if is_absent:
-                privacy_fade_alpha = min(1.0, privacy_fade_alpha + fade_step)
-            else:
-                privacy_fade_alpha = max(0.0, privacy_fade_alpha - fade_step)
-
-            if privacy_fade_alpha > 0.0:
-                custom_priv = cfg.get("privacy_image", "")
-                if privacy_screen is None or custom_priv != last_privacy_path:
-                    privacy_screen = draw_privacy_screen(out_w, out_h, custom_priv)
-                    last_privacy_path = custom_priv
-
-            if privacy_fade_alpha >= 1.0:
-                if not privacy_muted and cfg.get("privacy_mute_mic", True):
-                    set_audio_mute(True)
+            if lifecycle_manager.pipeline_mode == "coherent":
+                if is_absent:
+                    lifecycle_manager.set_privacy(True, set_audio_mute_fn=set_audio_mute if cfg.get("privacy_mute_mic", True) else None)
                     privacy_muted = True
-                send_call_total += 1
-                t_snd_start = time.monotonic_ns()
-                vcam.send(privacy_screen)
-                t_snd_end = time.monotonic_ns()
-                send_success_total += 1
-                if m0_runtime.enabled:
-                    m0_runtime.telemetry.sample("video.send_call_ms", (t_snd_end - t_snd_start) / 1_000_000)
-                    m0_runtime.telemetry.emit(
-                        "video_output_frame",
-                        generation_id=video_gen_id,
-                        output_frame_id=video_frame_id,
-                        output_type="PRIVACY",
-                        dropped=False,
-                        drop_reason=None,
-                        vcam_delay_ms=0.0,
-                        selected_source_gap=0,
-                        source_frame_id=None,
-                        source_generation_id=None,
-                        arrival_to_send_ms=None,
-                        presentation_timestamp_ns=None,
-                    )
-                video_frame_id += 1
-                t_pace_start = time.monotonic_ns()
-                vcam.sleep_until_next_frame()
-                t_pace_end = time.monotonic_ns()
-                if m0_runtime.enabled:
-                    m0_runtime.telemetry.sample("video.pacing_wait_ms", (t_pace_end - t_pace_start) / 1_000_000)
-                continue
-            elif privacy_fade_alpha < 0.2 and privacy_muted:
-                set_audio_mute(False)
-                privacy_muted = False
+                    privacy_fade_alpha = 1.0
+                    custom_priv = cfg.get("privacy_image", "")
+                    if privacy_screen is None or custom_priv != last_privacy_path:
+                        privacy_screen = draw_privacy_screen(out_w, out_h, custom_priv)
+                        last_privacy_path = custom_priv
+                    safe_frame = privacy_screen if privacy_screen is not None else LifecycleManager.create_safe_screen(out_w, out_h, "Privacy Active")
+                    send_call_total += 1
+                    t_snd_start = time.monotonic_ns()
+                    vcam.send(safe_frame)
+                    t_snd_end = time.monotonic_ns()
+                    send_success_total += 1
+                    lifecycle_manager.record_safe_output()
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("video.send_call_ms", (t_snd_end - t_snd_start) / 1_000_000)
+                        m0_runtime.telemetry.emit(
+                            "video_output_frame",
+                            generation_id=video_gen_id,
+                            output_frame_id=video_frame_id,
+                            output_type="PRIVACY",
+                            dropped=False,
+                            drop_reason=None,
+                            vcam_delay_ms=None,
+                            selected_source_gap=0,
+                            source_frame_id=None,
+                            source_generation_id=None,
+                            arrival_to_send_ms=None,
+                            presentation_timestamp_ns=None,
+                        )
+                    video_frame_id += 1
+                    t_pace_start = time.monotonic_ns()
+                    vcam.sleep_until_next_frame()
+                    t_pace_end = time.monotonic_ns()
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("video.pacing_wait_ms", (t_pace_end - t_pace_start) / 1_000_000)
+                    continue
+                else:
+                    if lifecycle_manager.privacy_active:
+                        lifecycle_manager.set_privacy(False, set_audio_mute_fn=set_audio_mute if cfg.get("privacy_mute_mic", True) else None)
+                        privacy_muted = False
+                        privacy_fade_alpha = 0.0
+            else:
+                fade_enabled = cfg.get("privacy_fade_enabled", True)
+                fade_step = float(cfg.get("privacy_fade_speed", 0.07)) if fade_enabled else 1.0
+
+                if is_absent:
+                    privacy_fade_alpha = min(1.0, privacy_fade_alpha + fade_step)
+                else:
+                    privacy_fade_alpha = max(0.0, privacy_fade_alpha - fade_step)
+
+                if privacy_fade_alpha > 0.0:
+                    custom_priv = cfg.get("privacy_image", "")
+                    if privacy_screen is None or custom_priv != last_privacy_path:
+                        privacy_screen = draw_privacy_screen(out_w, out_h, custom_priv)
+                        last_privacy_path = custom_priv
+
+                if privacy_fade_alpha >= 1.0:
+                    if not privacy_muted and cfg.get("privacy_mute_mic", True):
+                        set_audio_mute(True)
+                        privacy_muted = True
+                    send_call_total += 1
+                    t_snd_start = time.monotonic_ns()
+                    vcam.send(privacy_screen)
+                    t_snd_end = time.monotonic_ns()
+                    send_success_total += 1
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("video.send_call_ms", (t_snd_end - t_snd_start) / 1_000_000)
+                        m0_runtime.telemetry.emit(
+                            "video_output_frame",
+                            generation_id=video_gen_id,
+                            output_frame_id=video_frame_id,
+                            output_type="PRIVACY",
+                            dropped=False,
+                            drop_reason=None,
+                            vcam_delay_ms=0.0,
+                            selected_source_gap=0,
+                            source_frame_id=None,
+                            source_generation_id=None,
+                            arrival_to_send_ms=None,
+                            presentation_timestamp_ns=None,
+                        )
+                    video_frame_id += 1
+                    t_pace_start = time.monotonic_ns()
+                    vcam.sleep_until_next_frame()
+                    t_pace_end = time.monotonic_ns()
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("video.pacing_wait_ms", (t_pace_end - t_pace_start) / 1_000_000)
+                    continue
+                elif privacy_fade_alpha < 0.2 and privacy_muted:
+                    set_audio_mute(False)
+                    privacy_muted = False
 
             t_filt_start = time.monotonic_ns()
             face_info = framer.get_framed_face_info() if framer else {"has_face": False}
@@ -3256,6 +3497,483 @@ def main():
             bg_path = os.path.expanduser(cfg.get("background_image", ""))
 
             if blur_enabled or bg_path:
+                if lifecycle_manager.pipeline_mode == "coherent":
+                    # --- M1 COHERENT PRIMARY PIPELINE ---
+                    # 1. Preprocess input
+                    t_prep_start = time.monotonic_ns()
+                    if is_multiclass:
+                        small = cv2.resize(framed, (256, 256))
+                        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                        blob = np.expand_dims(rgb, axis=0)
+                        model_id = "multiclass"
+                    else:
+                        small = cv2.resize(framed, (256, 144))
+                        blob = np.expand_dims(np.transpose(small.astype(np.float32) / 255.0, (2, 0, 1)), axis=0)
+                        model_id = "legacy_seg"
+                    t_prep_end = time.monotonic_ns()
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("primary.preprocess_ms", (t_prep_end - t_prep_start) / 1_000_000)
+
+                    # 2. Construct FrameContext with frozen geometry and deadlines
+                    raw_w = frame.shape[1] if frame is not None else framed.shape[1]
+                    raw_h = frame.shape[0] if frame is not None else framed.shape[0]
+                    crop_box = tuple(float(x) for x in framer.curr_box) if framer else (0.0, 0.0, float(raw_w if "raw_w" in locals() else (frame.shape[1] if "frame" in locals() and frame is not None else (framed.shape[1] if "framed" in locals() and framed is not None else 0.0))), float(raw_h if "raw_h" in locals() else (frame.shape[0] if "frame" in locals() and frame is not None else (framed.shape[0] if "framed" in locals() and framed is not None else 0.0))))
+                    frame_ctx = lifecycle_manager.create_frame_context(
+                        frame_id=origin.frame_id if origin is not None else frame_id,
+                        generation_id=origin.generation_id if origin is not None and getattr(origin, "generation_id", None) is not None else None,
+                        arrival_mono_ns=origin.arrival_mono_ns if origin is not None else (getattr(lifecycle_manager, "last_capture_mono_ns", 0) or time.monotonic_ns()),
+                        framed_pixels=framed,
+                        in_w=framed.shape[1],
+                        in_h=framed.shape[0],
+                        out_w=out_w,
+                        out_h=out_h,
+                        crop_box=crop_box,
+                        face_info=face_info,
+                        model_id=model_id,
+                        model_version="1.0",
+                        seq=primary_submit_seq,
+                    )
+                    primary_submit_seq += 1
+
+                    # 3. Exact Primary Execution
+                    stage_res = None
+                    if primary_queue is not None:
+                        if primary_coordinator.submit_async(primary_queue, frame_ctx, blob):
+                            stage_res = primary_coordinator.get_or_wait_result(frame_ctx)
+                        else:
+                            with primary_coordinator._lock:
+                                lifecycle_manager.primary_frame_dropped_total += 1
+                            stage_res = StageResult(
+                                identity=frame_ctx.identity,
+                                status=StageResultStatus.SKIPPED,
+                                validity=StageResultValidity.INVALID,
+                                t_submit_mono_ns=time.monotonic_ns(),
+                                t_complete_mono_ns=time.monotonic_ns(),
+                                drop_reason=primary_coordinator.last_submit_rejection_reason or "QUEUE_BUSY",
+                            )
+                    else:
+                        stage_res = primary_coordinator.run_sync(infer_request, frame_ctx, blob)
+
+                    # 4. exact_or_drop check
+                    if stage_res is None or stage_res.status != StageResultStatus.OK or stage_res.validity != StageResultValidity.EXACT:
+                        drop_now_ns = time.monotonic_ns()
+                        repeated_output = lifecycle_manager.create_repeated_frame(drop_now_ns, frame_ctx.identity)
+                        if repeated_output is not None:
+                            out_to_send = repeated_output.image
+                            out_type = "REPEATED"
+                        else:
+                            out_to_send = LifecycleManager.create_safe_screen(out_w, out_h)
+                            lifecycle_manager.record_safe_output()
+                            out_type = "SAFE"
+
+                        send_call_total += 1
+                        t_snd_start = time.monotonic_ns()
+                        vcam.send(out_to_send)
+                        t_snd_end = time.monotonic_ns()
+                        send_success_total += 1
+                        if m0_runtime.enabled:
+                            m0_runtime.telemetry.sample("video.send_call_ms", (t_snd_end - t_snd_start) / 1_000_000)
+                            d_reason = stage_res.drop_reason if stage_res and stage_res.drop_reason else (stage_res.status.name if stage_res else "DROP_UNKNOWN")
+                            if m0_runtime.should_trace(video_frame_id):
+                                if out_type == "REPEATED" and repeated_output is not None:
+                                    src_fid = repeated_output.source_frame_id
+                                    src_gid = repeated_output.source_generation_id
+                                    att_fid = repeated_output.attempt_frame_id or (origin.frame_id if origin else None)
+                                    src_arr = (
+                                        getattr(repeated_output, "arrival_mono_ns", None)
+                                        or getattr(repeated_output.identity, "arrival_mono_ns", None)
+                                        or lifecycle_manager.get_frame_arrival(src_fid)
+                                    )
+                                    arr_ms = ((t_snd_end - src_arr) / 1_000_000) if src_arr else None
+                                else:
+                                    src_fid = None
+                                    src_gid = None
+                                    att_fid = origin.frame_id if origin else None
+                                    arr_ms = None
+                                m0_runtime.telemetry.emit(
+                                    "video_output_frame",
+                                    generation_id=video_gen_id,
+                                    output_frame_id=video_frame_id,
+                                    output_type=out_type,
+                                    dropped=True,
+                                    drop_reason=d_reason,
+                                    vcam_delay_ms=None,
+                                    selected_source_gap=observed_gap,
+                                    source_frame_id=src_fid,
+                                    source_generation_id=src_gid,
+                                    attempt_frame_id=att_fid,
+                                    arrival_to_send_ms=arr_ms,
+                                    presentation_timestamp_ns=None,
+                                )
+                        video_frame_id += 1
+                        t_pace_start = time.monotonic_ns()
+                        vcam.sleep_until_next_frame()
+                        t_pace_end = time.monotonic_ns()
+                        if m0_runtime.enabled:
+                            m0_runtime.telemetry.sample("video.pacing_wait_ms", (t_pace_end - t_pace_start) / 1_000_000)
+                        continue
+
+                    # 5. Exact match accepted
+                    p_person = stage_res.get_mask("p_person")
+                    hand_skin = stage_res.get_mask("hand_skin")
+                    has_hands = stage_res.has_hands
+                    bg_prob = stage_res.get_mask("bg_prob")
+
+                    if m0_runtime.enabled:
+                        now_ns = time.monotonic_ns()
+                        m0_runtime.telemetry.emit(
+                            "primary_selected",
+                            reason="EXACT_COHERENT",
+                            origin_frame_id=frame_ctx.identity.frame_id,
+                            origin_generation_id=frame_ctx.identity.generation_id,
+                            selected_frame_id=frame_ctx.identity.frame_id,
+                            selected_generation_id=frame_ctx.identity.generation_id,
+                            frame_match=True,
+                            selected_is_fallback=False,
+                            selected_arrival_age_ms=((now_ns - frame_ctx.arrival_mono_ns) / 1_000_000),
+                            origin_classification="EXACT_COHERENT",
+                        )
+
+                    # 6. Handheld Object Retention (purely current frame)
+                    if cfg.get("object_retention_enabled", True) and has_hands and hand_skin is not None and bg_prob is not None:
+                        obj_str = int(cfg.get("object_retention_strength", 60))
+                        if obj_str > 0:
+                            k_sz = max(3, min(9, int(5 * (obj_str / 50.0)) * 2 + 1))
+                            k_el = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_sz, k_sz))
+                            hand_bin = (hand_skin > 0.22).astype(np.uint8)
+                            interaction_zone = cv2.dilate(hand_bin, k_el, iterations=1)
+                            closed_mask = cv2.morphologyEx(p_person, cv2.MORPH_CLOSE, k_el)
+                            retained_candidate = np.where((interaction_zone > 0) & (bg_prob < 0.65), closed_mask, p_person)
+                            p_person = np.maximum(p_person, retained_candidate)
+
+                    # 7. Auxiliaries explicitly omitted pending M3
+                    lifecycle_manager.aux_omitted_pending_m3_total += 1
+                    ha_chair = None
+                    ha_handheld = None
+                    ha_glasses = None
+
+                    # 8. Gesture Recognition & Triggers (exactly once per accepted frame)
+                    if cfg.get("gesture_detection_enabled", True) and has_hands and hand_skin is not None:
+                        g_act = cfg.get("gesture_action", "all")
+                        gesture_sample_id = ("coherent", frame_ctx.identity.frame_id)
+                        g_type, g_pos = detect_hand_gesture(hand_skin, out_w, out_h)
+
+                        if (cfg.get("gesture_debug", False)
+                                and gesture_sample_id != gesture_trigger.last_sample_id
+                                and g_type != gesture_debug_last):
+                            logging.info("GESTURE | raw=%s | sample=%s", g_type, gesture_sample_id)
+                            gesture_debug_last = g_type
+                        gesture_event = gesture_trigger.update(
+                            g_type, g_pos, time.monotonic(), gesture_sample_id
+                        )
+                        if gesture_event is not None:
+                            g_type, g_pos = gesture_event
+                            logging.info("GESTURE | confirmed=%s | sample=%s", g_type, gesture_sample_id)
+                            if g_act in ["reaction", "all"]:
+                                gesture_animation = {
+                                    "type": g_type,
+                                    "pos": g_pos,
+                                    "start_time": now,
+                                    "duration": 1.8
+                                }
+                            if g_type == "open_palm" and g_act in ["mute_toggle", "all"]:
+                                if (now - last_gesture_mute_time) > 1.8:
+                                    is_currently_muted = check_audio_muted()
+                                    set_audio_mute(not is_currently_muted)
+                                    last_gesture_mute_time = now
+                    else:
+                        gesture_trigger.reset()
+                        gesture_debug_last = "unset"
+
+                    # 9. Bypass Temporal Filter in M1 (TEMPORAL_PENDING_VALIDATION)
+                    mask_256 = p_person
+                    prev_mask = None
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("composition.temporal_filter_ms", 0.0)
+
+                    # 10. Adaptive Feathering Curve
+                    is_bg_replacement = bool(bg_path and os.path.exists(bg_path))
+                    feather_px = float(cfg.get("mask_feather", 40))
+                    feather_px = max(10.0, min(80.0, feather_px))
+
+                    if is_bg_replacement:
+                        center = 0.50
+                        half_width = 0.12 * (feather_px / 40.0)
+                        low = max(0.18, center - half_width)
+                        high = min(0.82, center + half_width)
+                    else:
+                        center = 0.35
+                        half_width = 0.18 * (feather_px / 40.0)
+                        low = max(0.08, center - half_width)
+                        high = min(0.92, center + half_width)
+
+                    u = np.clip((mask_256 - low) / (high - low), 0.0, 1.0)
+                    p_curved = u * u * (3.0 - 2.0 * u)
+
+                    # 11. Fast Guided Filter
+                    gf_size = cfg.get("guided_filter_guide_size", [640, 360])
+                    if isinstance(gf_size, (list, tuple)) and len(gf_size) == 2:
+                        gw, gh = int(gf_size[0]), int(gf_size[1])
+                    else:
+                        gw, gh = 640, 360
+                    gw = max(640, gw)
+                    gh = max(360, gh)
+
+                    gf_r = int(cfg.get("guided_filter_radius", 5))
+                    gf_eps = float(cfg.get("guided_filter_eps", 0.001))
+                    gf_color = bool(cfg.get("guided_filter_color_guide", True))
+                    gf_full = bool(cfg.get("guided_filter_full_res", True))
+
+                    if is_bg_replacement:
+                        gf_r_eff = max(2, min(gf_r, 4))
+                        gf_eps_eff = max(1e-5, min(gf_eps, 0.0003))
+                    else:
+                        gf_r_eff = gf_r
+                        gf_eps_eff = gf_eps
+
+                    if gf_color:
+                        guide_small = cv2.resize(framed, (gw, gh))
+                    else:
+                        guide_small = cv2.resize(cv2.cvtColor(framed, cv2.COLOR_BGR2GRAY), (gw, gh))
+
+                    t_gf_start = time.monotonic_ns()
+                    mask_full = fast_guided_filter(
+                        guide_small, p_curved,
+                        r=gf_r_eff, eps=gf_eps_eff,
+                        out_shape=(out_w, out_h),
+                        color_guide=gf_color,
+                        guide_full=framed if gf_full else None
+                    )
+                    t_gf_end = time.monotonic_ns()
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("composition.guided_filter_ms", (t_gf_end - t_gf_start) / 1_000_000)
+
+                    # 12. Clean Matte Clamping
+                    if is_bg_replacement:
+                        black_cut = 0.06
+                        white_cut = 0.78
+                        mask_full = np.clip(mask_full, black_cut, white_cut)
+                        mask_full = (mask_full - black_cut) * (1.0 / (white_cut - black_cut))
+                    else:
+                        mask_full = np.where(mask_full > 0.80, 1.0, mask_full)
+                        mask_full = np.where(mask_full < 0.02, 0.0, mask_full)
+
+                    # 13. Rim Light
+                    if cfg.get("rim_light_enabled", False):
+                        processed_fg = apply_rim_light(
+                            processed_fg, mask_full,
+                            color_mode=cfg.get("rim_light_color", "warm"),
+                            intensity=int(cfg.get("rim_light_intensity", 50))
+                        )
+
+                    # 14. Background prep (virtual image or blur)
+                    if bg_path and os.path.exists(bg_path):
+                        if bg_path != last_bg_path or cached_bg is None:
+                            bg_img = cv2.imread(bg_path)
+                            if bg_img is not None:
+                                cached_bg = cv2.resize(bg_img, (out_w, out_h))
+                                ow, oh = int(out_w * 1.08), int(out_h * 1.08)
+                                oversized_bg = cv2.resize(bg_img, (ow, oh))
+                                last_bg_path = bg_path
+
+                        if cfg.get("parallax_enabled", False) and face_info.get("has_face") and oversized_bg is not None:
+                            fx, fy, fw, fh = face_info["box"]
+                            cx = fx + fw / 2.0
+                            cy = fy + fh * 0.45
+                            norm_x = (cx - out_w / 2.0) / (out_w / 2.0)
+                            norm_y = (cy - out_h / 2.0) / (out_h / 2.0)
+                            if smooth_head_pos is None:
+                                smooth_head_pos = np.array([norm_x, norm_y], dtype=np.float32)
+                            else:
+                                smooth_head_pos = smooth_head_pos * 0.85 + np.array([norm_x, norm_y], dtype=np.float32) * 0.15
+
+                            p_str = int(cfg.get("parallax_strength", 40))
+                            max_shift = int((p_str / 100.0) * 45)
+                            shift_x = int(-smooth_head_pos[0] * max_shift)
+                            shift_y = int(-smooth_head_pos[1] * max_shift * 0.5)
+
+                            ow, oh = oversized_bg.shape[1], oversized_bg.shape[0]
+                            cx_bg = ow // 2 + shift_x
+                            cy_bg = oh // 2 + shift_y
+                            x1_bg = max(0, min(ow - out_w, cx_bg - out_w // 2))
+                            y1_bg = max(0, min(oh - out_h, cy_bg - out_h // 2))
+                            bg = oversized_bg[y1_bg:y1_bg + out_h, x1_bg:x1_bg + out_w]
+                        else:
+                            bg = cached_bg if cached_bg is not None else processed_fg
+                    else:
+                        blur_mode = cfg.get("blur_mode", "standard")
+                        blur_k = int(cfg.get("blur_strength", 35))
+                        blur_k = max(5, min(99, blur_k))
+
+                        if blur_mode == "portrait_depth":
+                            bk_mid = max(3, blur_k // 3)
+                            if bk_mid % 2 == 0: bk_mid += 1
+                            bk_deep = max(5, blur_k)
+                            if bk_deep % 2 == 0: bk_deep += 1
+
+                            small_w, small_h = out_w // 3, out_h // 3
+                            small_bg = cv2.resize(framed, (small_w, small_h))
+                            mask_s = cv2.resize((p_curved * 255).astype(np.uint8), (small_w, small_h))
+                            inv_m = cv2.bitwise_not(mask_s)
+                            dist = cv2.distanceTransform(inv_m, cv2.DIST_L2, 3)
+                            dist_norm = np.clip(dist / 45.0, 0.0, 1.0)
+
+                            y_coords = np.linspace(1.0, 0.2, small_h, dtype=np.float32).reshape(-1, 1)
+                            vert_grad = np.repeat(y_coords, small_w, axis=1)
+
+                            depth_s = np.clip(dist_norm * 0.70 + vert_grad * 0.30, 0.0, 1.0)
+                            depth_3c = cv2.merge([depth_s, depth_s, depth_s])
+
+                            b_mid = cv2.blur(small_bg, (bk_mid, bk_mid))
+                            b_deep = cv2.blur(small_bg, (bk_deep, bk_deep))
+                            bokeh_s = (b_mid * (1.0 - depth_3c) + b_deep * depth_3c).astype(np.uint8)
+                            bg = cv2.resize(bokeh_s, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+                        else:
+                            bk = max(3, blur_k // 2)
+                            if bk % 2 == 0:
+                                bk += 1
+
+                            small_bg = cv2.resize(framed, (out_w // 2, out_h // 2))
+                            blur_small = cv2.blur(small_bg, (bk, bk))
+                            bg = cv2.resize(blur_small, (out_w, out_h))
+
+                    # 15. Blend
+                    t_bld_start = time.monotonic_ns()
+                    output_frame = cv2.blendLinear(processed_fg, bg, mask_full, 1.0 - mask_full)
+                    t_bld_end = time.monotonic_ns()
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("composition.blend_ms", (t_bld_end - t_bld_start) / 1_000_000)
+
+                    # 16. Post-processing filters (color grading, artistic)
+                    color_f = cfg.get("color_filter", "none")
+                    if color_f != "none":
+                        output_frame = apply_color_grading(output_frame, mode=color_f, strength=int(cfg.get("color_strength", 70)))
+                    art_f = cfg.get("artistic_filter", "off")
+                    if art_f != "off":
+                        output_frame = apply_artistic_filter(output_frame, mode=art_f, strength=int(cfg.get("artistic_strength", 70)))
+
+                    # 17. Gesture reaction animation
+                    if gesture_animation is not None:
+                        g_prog = (now - gesture_animation["start_time"]) / gesture_animation["duration"]
+                        if g_prog < 1.0:
+                            output_frame = draw_gesture_reaction_fast(
+                                output_frame,
+                                gesture_animation["type"],
+                                gesture_animation["pos"],
+                                g_prog
+                            )
+                        else:
+                            gesture_animation = None
+
+                    if privacy_fade_alpha > 0.0 and privacy_screen is not None:
+                        output_frame = cv2.addWeighted(privacy_screen, privacy_fade_alpha, output_frame, 1.0 - privacy_fade_alpha, 0)
+
+                    # 18. Commit and send frame via lifecycle authority
+                    now_mono_ns = time.monotonic_ns()
+                    output_frame_obj = OutputFrame(
+                        image=output_frame,
+                        identity=frame_ctx.identity,
+                        commit_mono_ns=now_mono_ns,
+                        output_type="LIVE",
+                        applied_results=["primary_exact"],
+                        quality_flags=dict(frame_ctx.quality_flags),
+                    )
+                    committed = lifecycle_manager.commit_live_frame(
+                        output_frame_obj,
+                        deadline_mono_ns=frame_ctx.frame_deadline_mono_ns,
+                        now_mono_ns=now_mono_ns,
+                    )
+                    if not committed:
+                        miss_now_ns = time.monotonic_ns()
+                        repeated_output = lifecycle_manager.create_repeated_frame(miss_now_ns, frame_ctx.identity)
+                        if repeated_output is not None:
+                            out_to_send = repeated_output.image
+                            out_type = "REPEATED"
+                        else:
+                            out_to_send = LifecycleManager.create_safe_screen(out_w, out_h)
+                            lifecycle_manager.record_safe_output()
+                            out_type = "SAFE"
+
+                        send_call_total += 1
+                        t_snd_start = time.monotonic_ns()
+                        vcam.send(out_to_send)
+                        t_snd_end = time.monotonic_ns()
+                        send_success_total += 1
+                        if m0_runtime.enabled:
+                            m0_runtime.telemetry.sample("video.send_call_ms", (t_snd_end - t_snd_start) / 1_000_000)
+                            d_reason = "COMPOSE_DEADLINE_MISS" if miss_now_ns > frame_ctx.frame_deadline_mono_ns else "COMMIT_REJECTED"
+                            if m0_runtime.should_trace(video_frame_id):
+                                if out_type == "REPEATED" and repeated_output is not None:
+                                    src_fid = repeated_output.source_frame_id
+                                    src_gid = repeated_output.source_generation_id
+                                    att_fid = repeated_output.attempt_frame_id or (origin.frame_id if origin else None)
+                                    src_arr = (
+                                        getattr(repeated_output, "arrival_mono_ns", None)
+                                        or getattr(repeated_output.identity, "arrival_mono_ns", None)
+                                        or lifecycle_manager.get_frame_arrival(src_fid)
+                                    )
+                                    arr_ms = ((t_snd_end - src_arr) / 1_000_000) if src_arr else None
+                                else:
+                                    src_fid = None
+                                    src_gid = None
+                                    att_fid = origin.frame_id if origin else None
+                                    arr_ms = None
+                                m0_runtime.telemetry.emit(
+                                    "video_output_frame",
+                                    generation_id=video_gen_id,
+                                    output_frame_id=video_frame_id,
+                                    output_type=out_type,
+                                    dropped=True,
+                                    drop_reason=d_reason,
+                                    vcam_delay_ms=None,
+                                    selected_source_gap=observed_gap,
+                                    source_frame_id=src_fid,
+                                    source_generation_id=src_gid,
+                                    attempt_frame_id=att_fid,
+                                    arrival_to_send_ms=arr_ms,
+                                    presentation_timestamp_ns=None,
+                                )
+                        video_frame_id += 1
+                        t_pace_start = time.monotonic_ns()
+                        vcam.sleep_until_next_frame()
+                        t_pace_end = time.monotonic_ns()
+                        if m0_runtime.enabled:
+                            m0_runtime.telemetry.sample("video.pacing_wait_ms", (t_pace_end - t_pace_start) / 1_000_000)
+                        continue
+
+                    # Committed successfully -> Send live frame!
+                    send_call_total += 1
+                    t_snd_start = time.monotonic_ns()
+                    vcam.send(output_frame)
+                    t_snd_end = time.monotonic_ns()
+                    send_success_total += 1
+                    source_frame_new_send_total += 1
+                    processed_frame_total += 1
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("video.send_call_ms", (t_snd_end - t_snd_start) / 1_000_000)
+                        if m0_runtime.should_trace(video_frame_id):
+                            m0_runtime.telemetry.emit(
+                                "video_output_frame",
+                                generation_id=video_gen_id,
+                                output_frame_id=video_frame_id,
+                                output_type="LIVE",
+                                dropped=False,
+                                drop_reason=None,
+                                vcam_delay_ms=None,
+                                selected_source_gap=observed_gap,
+                                source_frame_id=origin.frame_id if origin else None,
+                                source_generation_id=origin.generation_id if origin else None,
+                                arrival_to_send_ms=((t_snd_end - origin.arrival_mono_ns) / 1_000_000) if origin else None,
+                                presentation_timestamp_ns=None,
+                            )
+                    video_frame_id += 1
+                    t_pace_start = time.monotonic_ns()
+                    vcam.sleep_until_next_frame()
+                    t_pace_end = time.monotonic_ns()
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("video.pacing_wait_ms", (t_pace_end - t_pace_start) / 1_000_000)
+                    continue
+
                 # Passo 7.2: mascaras de cadeira/objetos COCO da thread heavy-assist.
                 # Inicializadas aqui para valer tambem no caminho legacy/sincrono.
                 ha_chair = None
@@ -3900,6 +4618,187 @@ def main():
                 art_f = cfg.get("artistic_filter", "off")
                 if art_f != "off":
                     output_frame = apply_artistic_filter(output_frame, mode=art_f, strength=int(cfg.get("artistic_strength", 70)))
+
+                # ---------------------------------------------------------
+                # M1 Coherent Pipeline - Bypass Mode
+                # ---------------------------------------------------------
+                if lifecycle_manager.pipeline_mode == "safe":
+                    out_to_send = LifecycleManager.create_safe_screen(out_w, out_h)
+                    lifecycle_manager.record_safe_output()
+                    send_call_total += 1
+                    t_snd_start = time.monotonic_ns()
+                    vcam.send(out_to_send)
+                    t_snd_end = time.monotonic_ns()
+                    send_success_total += 1
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("video.send_call_ms", (t_snd_end - t_snd_start) / 1_000_000)
+                        if m0_runtime.should_trace(video_frame_id):
+                            m0_runtime.telemetry.emit(
+                                "video_output_frame",
+                                generation_id=video_gen_id if 'video_gen_id' in locals() else lifecycle_manager.generation_id,
+                                output_frame_id=video_frame_id,
+                                output_type="SAFE",
+                                dropped=True,
+                                drop_reason="SAFE_MODE",
+                                vcam_delay_ms=None,
+                                selected_source_gap=observed_gap if 'observed_gap' in locals() else 0,
+                                source_frame_id=None,
+                                source_generation_id=None,
+                                attempt_frame_id=origin.frame_id if origin else None,
+                                arrival_to_send_ms=None,
+                                presentation_timestamp_ns=None,
+                            )
+                    video_frame_id += 1
+                    t_pace_start = time.monotonic_ns()
+                    vcam.sleep_until_next_frame()
+                    t_pace_end = time.monotonic_ns()
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("video.pacing_wait_ms", (t_pace_end - t_pace_start) / 1_000_000)
+                    continue
+
+                if lifecycle_manager.pipeline_mode == "coherent":
+                    if gesture_animation is not None:
+                        g_prog = (now - gesture_animation["start_time"]) / gesture_animation["duration"]
+                        if g_prog < 1.0:
+                            output_frame = draw_gesture_reaction_fast(
+                                output_frame,
+                                gesture_animation["type"],
+                                gesture_animation["pos"],
+                                g_prog
+                            )
+                        else:
+                            gesture_animation = None
+
+                    if privacy_fade_alpha > 0.0 and privacy_screen is not None:
+                        output_frame = cv2.addWeighted(privacy_screen, privacy_fade_alpha, output_frame, 1.0 - privacy_fade_alpha, 0)
+
+                    now_mono_ns = time.monotonic_ns()
+                    bypass_arr_ns = origin.arrival_mono_ns if (origin and getattr(origin, "arrival_mono_ns", None) is not None) else None
+                    bypass_gen_id = origin.generation_id if (origin and getattr(origin, "generation_id", None) is not None) else lifecycle_manager.generation_id
+
+                    bypass_identity = FrameIdentity(
+                        session_id=lifecycle_manager.session_id,
+                        generation_id=origin.generation_id if (origin and getattr(origin, "generation_id", None) is not None) else lifecycle_manager.generation_id,
+                        frame_id=origin.frame_id if origin else frame_id,
+                        processing_config_epoch=lifecycle_manager.current_epoch,
+                        model_id="bypass",
+                        model_version="1.0",
+                        geometry_id=f"{out_w}x{out_h}",
+                        seq=primary_submit_seq,
+                        arrival_mono_ns=origin.arrival_mono_ns if (origin and getattr(origin, "arrival_mono_ns", None) is not None) else None,
+                    )
+                    primary_submit_seq += 1
+
+                    arr_ns = bypass_arr_ns if bypass_arr_ns is not None else now_mono_ns
+                    budget_ns = lifecycle_manager.m1_config.frame_deadline_ms * 1_000_000
+                    f_deadline = arr_ns + budget_ns
+
+                    bypass_output_frame = OutputFrame(
+                        image=output_frame,
+                        identity=bypass_identity,
+                        commit_mono_ns=now_mono_ns,
+                        output_type="LIVE",
+                        applied_results=["bypass"],
+                        quality_flags={"bypass": True},
+                        arrival_mono_ns=bypass_arr_ns,
+                    )
+
+                    committed = lifecycle_manager.commit_live_frame(
+                        bypass_output_frame,
+                        deadline_mono_ns=f_deadline,
+                        now_mono_ns=now_mono_ns,
+                    )
+
+                    if not committed:
+                        miss_now_ns = time.monotonic_ns()
+                        repeated_output = lifecycle_manager.create_repeated_frame(miss_now_ns, bypass_identity)
+                        if repeated_output is not None:
+                            out_to_send = repeated_output.image
+                            out_type = "REPEATED"
+                        else:
+                            out_to_send = LifecycleManager.create_safe_screen(out_w, out_h)
+                            lifecycle_manager.record_safe_output()
+                            out_type = "SAFE"
+
+                        send_call_total += 1
+                        t_snd_start = time.monotonic_ns()
+                        vcam.send(out_to_send)
+                        t_snd_end = time.monotonic_ns()
+                        send_success_total += 1
+                        if m0_runtime.enabled:
+                            m0_runtime.telemetry.sample("video.send_call_ms", (t_snd_end - t_snd_start) / 1_000_000)
+                            d_reason = "COMPOSE_DEADLINE_MISS" if miss_now_ns > f_deadline else "COMMIT_REJECTED"
+                            if m0_runtime.should_trace(video_frame_id):
+                                if out_type == "REPEATED" and repeated_output is not None:
+                                    src_fid = repeated_output.source_frame_id
+                                    src_gid = repeated_output.source_generation_id
+                                    att_fid = repeated_output.attempt_frame_id or (origin.frame_id if origin else None)
+                                    src_arr = (
+                                        getattr(repeated_output, "arrival_mono_ns", None)
+                                        or getattr(repeated_output.identity, "arrival_mono_ns", None)
+                                        or lifecycle_manager.get_frame_arrival(src_fid)
+                                    )
+                                    arr_ms = ((t_snd_end - src_arr) / 1_000_000) if src_arr else None
+                                else:
+                                    src_fid = None
+                                    src_gid = None
+                                    att_fid = origin.frame_id if origin else None
+                                    arr_ms = None
+                                m0_runtime.telemetry.emit(
+                                    "video_output_frame",
+                                    generation_id=video_gen_id,
+                                    output_frame_id=video_frame_id,
+                                    output_type=out_type,
+                                    dropped=True,
+                                    drop_reason=d_reason,
+                                    vcam_delay_ms=None,
+                                    selected_source_gap=observed_gap,
+                                    source_frame_id=src_fid,
+                                    source_generation_id=src_gid,
+                                    attempt_frame_id=att_fid,
+                                    arrival_to_send_ms=arr_ms,
+                                    presentation_timestamp_ns=None,
+                                )
+                        video_frame_id += 1
+                        t_pace_start = time.monotonic_ns()
+                        vcam.sleep_until_next_frame()
+                        t_pace_end = time.monotonic_ns()
+                        if m0_runtime.enabled:
+                            m0_runtime.telemetry.sample("video.pacing_wait_ms", (t_pace_end - t_pace_start) / 1_000_000)
+                        continue
+
+                    # Committed successfully -> Send live bypass frame!
+                    send_call_total += 1
+                    t_snd_start = time.monotonic_ns()
+                    vcam.send(output_frame)
+                    t_snd_end = time.monotonic_ns()
+                    send_success_total += 1
+                    source_frame_new_send_total += 1
+                    processed_frame_total += 1
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("video.send_call_ms", (t_snd_end - t_snd_start) / 1_000_000)
+                        if m0_runtime.should_trace(video_frame_id):
+                            m0_runtime.telemetry.emit(
+                                "video_output_frame",
+                                generation_id=video_gen_id,
+                                output_frame_id=video_frame_id,
+                                output_type="LIVE",
+                                dropped=False,
+                                drop_reason=None,
+                                vcam_delay_ms=None,
+                                selected_source_gap=observed_gap,
+                                source_frame_id=origin.frame_id if origin else None,
+                                source_generation_id=origin.generation_id if origin else None,
+                                arrival_to_send_ms=((t_snd_end - origin.arrival_mono_ns) / 1_000_000) if origin else None,
+                                presentation_timestamp_ns=None,
+                            )
+                    video_frame_id += 1
+                    t_pace_start = time.monotonic_ns()
+                    vcam.sleep_until_next_frame()
+                    t_pace_end = time.monotonic_ns()
+                    if m0_runtime.enabled:
+                        m0_runtime.telemetry.sample("video.pacing_wait_ms", (t_pace_end - t_pace_start) / 1_000_000)
+                    continue
 
             # Render Gesture Reaction Animation if active
             if gesture_animation is not None:

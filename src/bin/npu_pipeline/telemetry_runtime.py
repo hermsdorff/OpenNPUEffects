@@ -536,6 +536,8 @@ class TelemetryRuntime:
         with self._lock:
             self._owner_counters[name] = getter
 
+    register_authoritative_counter = register_owner_counter
+
     def update_config(self, raw_cfg: Optional[Dict[str, Any]]):
         """Hot reload M0 telemetry configuration without restarting media pipelines.
 

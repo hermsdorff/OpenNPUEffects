@@ -78,6 +78,12 @@
     "guided_filter_full_res": true,
     "primary_async_same_frame": true,
     "primary_async_same_frame_timeout_ms": 40.0,
+    "pipeline_mode": "legacy",
+    "m1": {
+      "frame_deadline_ms": 250.0,
+      "compose_reserve_ms": 90.0,
+      "safety_margin_ms": 10.0
+    },
     "m0_telemetry": {
       "enabled": false,
       "trace_enabled": false,
