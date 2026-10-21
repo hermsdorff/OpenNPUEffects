@@ -13,6 +13,16 @@ from .lifecycle import LifecycleManager
 from .primary import CoherentPrimaryCoordinator
 from .telemetry import BoundedTelemetry, ObservationOrigin, NullTelemetry
 from .telemetry_runtime import TelemetryRuntime
+from .audio_capture import (
+    CaptureReadStatus,
+    AudioCaptureState,
+    CaptureBlockResult,
+    WriteResult,
+    AudioCaptureReader,
+    AudioOutputWriter,
+    CaptureRetryPolicy,
+    AudioSwitchCoordinator,
+)
 
 __all__ = [
     "FrameIdentity",
@@ -28,4 +38,12 @@ __all__ = [
     "ObservationOrigin",
     "NullTelemetry",
     "TelemetryRuntime",
+    "CaptureReadStatus",
+    "AudioCaptureState",
+    "CaptureBlockResult",
+    "WriteResult",
+    "AudioCaptureReader",
+    "AudioOutputWriter",
+    "CaptureRetryPolicy",
+    "AudioSwitchCoordinator",
 ]
